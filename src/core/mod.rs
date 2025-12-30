@@ -1,15 +1,12 @@
-//! Core trading logic module
-//! 
-//! Contains:
-//! - Lossless algorithms (support/resistance, trend, momentum)
-//! - Agent implementation
-//! - Coordinator
-//! - Risk guardian
+//! Core Module
+//!
+//! Core trading logic and types.
 
+pub mod types;
 pub mod lossless;
 pub mod agent;
 pub mod coordinator;
 pub mod guardian;
-pub mod types;
+pub mod strategy;
 
 pub use types::*;
