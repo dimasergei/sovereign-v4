@@ -3,6 +3,7 @@
 use anyhow::Result;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
+use tokio::sync::mpsc;
 use rust_decimal_macros::dec;
 
 mod core;
@@ -10,9 +11,12 @@ mod broker;
 mod data;
 mod comms;
 
-use crate::core::types::*;
 use crate::core::lossless::MarketObserver;
-use crate::core::guardian::{RiskGuardian, RiskConfig};
+use crate::core::types::Candle;
+use crate::data::mt5_bridge::{self, BridgeMessage};
+
+const VPS_HOST: &str = "213.136.76.40";
+const VPS_PORT: u16 = 5555;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,44 +32,58 @@ async fn main() -> Result<()> {
     info!("═══════════════════════════════════════════════════════════");
     info!("  SOVEREIGN v4.0 - Perpetual Autonomous Trading System");
     info!("═══════════════════════════════════════════════════════════");
-    info!("  Philosophy: Build once, run forever.");
-    info!("═══════════════════════════════════════════════════════════");
     
-    // Initialize components
-    let mut observer = MarketObserver::new(dec!(0.01), true); // Gold, forex mode
-    let guardian = RiskGuardian::new(RiskConfig::default());
+    // Create channel for bridge messages
+    let (tx, mut rx) = mpsc::channel::<BridgeMessage>(100);
     
-    info!("Market Observer initialized for XAUUSD");
-    info!("Risk Guardian: {}", guardian.status());
+    // Initialize market observer
+    let mut observer = MarketObserver::new(dec!(0.01), true);
+    let mut tick_count = 0u64;
     
-    // Simulate some candles to test the lossless algorithms
-    let test_candles = vec![
-        Candle::new(chrono::Utc::now(), dec!(2650.00), dec!(2652.00), dec!(2648.00), dec!(2651.00), dec!(1000)),
-        Candle::new(chrono::Utc::now(), dec!(2651.00), dec!(2655.00), dec!(2650.00), dec!(2654.00), dec!(1200)),
-        Candle::new(chrono::Utc::now(), dec!(2654.00), dec!(2658.00), dec!(2653.00), dec!(2657.00), dec!(1500)),
-        Candle::new(chrono::Utc::now(), dec!(2657.00), dec!(2660.00), dec!(2655.00), dec!(2656.00), dec!(1100)),
-        Candle::new(chrono::Utc::now(), dec!(2656.00), dec!(2658.00), dec!(2652.00), dec!(2653.00), dec!(1300)),
-    ];
+    // Spawn bridge connection
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = mt5_bridge::connect(VPS_HOST, VPS_PORT, tx.clone()).await {
+                info!("Bridge error: {}. Reconnecting in 5s...", e);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+    });
     
-    info!("Processing {} test candles...", test_candles.len());
+    info!("Waiting for market data...");
     
-    for (i, candle) in test_candles.iter().enumerate() {
-        observer.update(candle);
-        let obs = observer.observe(candle.close);
-        
-        info!(
-            "Candle {}: Close={} | Trend={} | Momentum={} | Volume={:?}",
-            i + 1,
-            candle.close,
-            obs.trend,
-            obs.momentum,
-            obs.volume_state
-        );
+    // Process incoming data
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            BridgeMessage::Tick(tick) => {
+                tick_count += 1;
+                if tick_count % 100 == 0 {
+                    info!("Tick #{}: bid={} ask={} spread={}", 
+                        tick_count, tick.bid, tick.ask, tick.ask - tick.bid);
+                }
+            }
+            BridgeMessage::Candle(candle) => {
+                let c = Candle::new(
+                    chrono::Utc::now(),
+                    candle.open,
+                    candle.high,
+                    candle.low,
+                    candle.close,
+                    candle.volume,
+                );
+                
+                observer.update(&c);
+                let obs = observer.observe(candle.close);
+                
+                info!("═══════════════════════════════════════════════════════════");
+                info!("NEW CANDLE: O={} H={} L={} C={}", 
+                    candle.open, candle.high, candle.low, candle.close);
+                info!("Trend: {} | Momentum: {} | Volume: {:?}", 
+                    obs.trend, obs.momentum, obs.volume_state);
+                info!("═══════════════════════════════════════════════════════════");
+            }
+        }
     }
-    
-    info!("═══════════════════════════════════════════════════════════");
-    info!("  Lossless algorithms working. Ready for real data.");
-    info!("═══════════════════════════════════════════════════════════");
     
     Ok(())
 }
