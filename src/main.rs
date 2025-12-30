@@ -13,6 +13,7 @@ mod core;
 mod broker;
 mod data;
 mod comms;
+mod config;
 
 use crate::core::types::Candle;
 use crate::core::coordinator::Coordinator;
@@ -20,13 +21,17 @@ use crate::core::strategy::SignalDirection;
 use crate::data::mt5_bridge::{self, BridgeMessage, BridgeWriter};
 use crate::data::database::TradeDb;
 use crate::comms::telegram;
+use crate::config::Config;
 
-const VPS_HOST: &str = "213.136.76.40";
-const VPS_PORT: u16 = 5555;
 const SEP: &str = "===========================================================";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cfg = Config::load("config.toml").unwrap_or_else(|e| {
+        eprintln!("Failed to load config.toml: {}. Using defaults.", e);
+        std::process::exit(1);
+    });
+    
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .with_target(false)
@@ -36,7 +41,7 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
     
     info!("{}", SEP);
-    info!("  SOVEREIGN v4.0 - Perpetual Autonomous Trading System");
+    info!("  {} - Perpetual Autonomous Trading System", cfg.system.name);
     info!("{}", SEP);
     
     let db = TradeDb::new("sovereign_trades.db")?;
@@ -48,12 +53,19 @@ async fn main() -> Result<()> {
         }
     }
     
-    let mut coordinator = Coordinator::new();
-    coordinator.add_agent("XAUUSD", dec!(0.01), true);
+    let risk_config = cfg.risk.to_guardian_config();
+    let mut coordinator = Coordinator::with_config(cfg.risk.max_positions, risk_config);
+    
+    for sym in &cfg.symbols {
+        coordinator.add_agent(&sym.name, sym.tick_size_decimal(), sym.is_forex);
+        info!("Agent: {} (tick={}, forex={})", sym.name, sym.tick_size, sym.is_forex);
+    }
     
     info!("Agents: {} symbols loaded", coordinator.agent_count());
     
-    telegram::send_startup().await;
+    if cfg.telegram.enabled {
+        telegram::send_startup().await;
+    }
     
     let (tx, mut rx) = mpsc::channel::<BridgeMessage>(100);
     let writer: BridgeWriter = Arc::new(Mutex::new(None));
@@ -70,19 +82,34 @@ async fn main() -> Result<()> {
     let mut trade_count = 0u32;
     let mut current_balance = dec!(10000);
     let mut current_equity = dec!(10000);
-    let current_symbol = "XAUUSD".to_string();
+    
+    let current_symbol = cfg.symbols.first()
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "XAUUSD".to_string());
+    
+    let point_value = cfg.symbols.first()
+        .map(|s| s.point_value_decimal())
+        .unwrap_or(dec!(100));
+    
+    let bridge_host = cfg.bridge.host.clone();
+    let bridge_port = cfg.bridge.port;
+    let max_positions = cfg.risk.max_positions;
+    let min_conviction = cfg.strategy.min_conviction;
+    let risk_reward = cfg.strategy.risk_reward_ratio;
+    let telegram_enabled = cfg.telegram.enabled;
     
     tokio::spawn(async move {
         loop {
-            if let Err(e) = mt5_bridge::connect(VPS_HOST, VPS_PORT, tx.clone(), writer_clone.clone()).await {
+            if let Err(e) = mt5_bridge::connect(&bridge_host, bridge_port, tx.clone(), writer_clone.clone()).await {
                 info!("Bridge error: {}. Reconnecting in 5s...", e);
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     });
     
-    info!("Strategy: min_conviction=60, risk_reward=1:2");
+    info!("Strategy: min_conviction={}, risk_reward=1:{}", min_conviction, risk_reward);
     info!("Guardian: {}", coordinator.guardian_status());
+    info!("Bridge: {}:{}", cfg.bridge.host, cfg.bridge.port);
     info!("Waiting for market data...");
     
     let writer_for_account = writer.clone();
@@ -122,8 +149,7 @@ async fn main() -> Result<()> {
                         candle_count, current_symbol, candle.open, candle.high, candle.low, candle.close);
                     info!("Trend: {} | Momentum: {} | Volume: {:?}", 
                         obs.trend, obs.momentum, obs.volume_state);
-                    info!("Positions: {}/{} | Guardian: {}", 
-                        coordinator.active_position_count(), 3, coordinator.guardian_status());
+                    info!("Positions: {}/{}", coordinator.active_position_count(), max_positions);
                 }
                 
                 let signals = coordinator.collect_signals(current_balance, current_equity);
@@ -144,13 +170,15 @@ async fn main() -> Result<()> {
                         info!("{}", SEP);
                         
                         let dir_str = format!("{:?}", best.direction);
-                        telegram::send_signal(
-                            &dir_str,
-                            &best.price.to_string(),
-                            &best.stop_loss.to_string(),
-                            &best.take_profit.to_string(),
-                            best.conviction,
-                        ).await;
+                        if telegram_enabled {
+                            telegram::send_signal(
+                                &dir_str,
+                                &best.price.to_string(),
+                                &best.stop_loss.to_string(),
+                                &best.take_profit.to_string(),
+                                best.conviction,
+                            ).await;
+                        }
                         
                         last_direction = dir_str;
                         last_sl = best.stop_loss;
@@ -158,7 +186,7 @@ async fn main() -> Result<()> {
                         last_conviction = best.conviction;
                         
                         let sl_distance = (best.price - best.stop_loss).abs();
-                        let lots = coordinator.calculate_lots(current_balance, sl_distance, dec!(100));
+                        let lots = coordinator.calculate_lots(current_balance, sl_distance, point_value);
                         last_lots = lots;
                         
                         info!("  Lots: {} (risk-adjusted)", lots);
@@ -184,7 +212,9 @@ async fn main() -> Result<()> {
             BridgeMessage::OrderResult { success, ticket, price, error } => {
                 if success {
                     info!("ORDER FILLED: ticket={} price={}", ticket, price);
-                    telegram::send_fill(&last_direction, ticket, &price.to_string()).await;
+                    if telegram_enabled {
+                        telegram::send_fill(&last_direction, ticket, &price.to_string()).await;
+                    }
                     
                     let side = if last_direction == "Buy" { SignalDirection::Buy } else { SignalDirection::Sell };
                     coordinator.position_opened(&current_symbol, ticket, side);
@@ -203,7 +233,9 @@ async fn main() -> Result<()> {
                     }
                 } else {
                     warn!("ORDER FAILED: {}", error);
-                    let _ = telegram::send(&format!("Order failed: {}", error)).await;
+                    if telegram_enabled {
+                        let _ = telegram::send(&format!("Order failed: {}", error)).await;
+                    }
                 }
             }
             BridgeMessage::PositionOpen(pos) => {
@@ -219,7 +251,9 @@ async fn main() -> Result<()> {
                 info!("POSITION CLOSED: {}", current_symbol);
                 info!("{}", SEP);
                 coordinator.position_closed(&current_symbol, Decimal::ZERO);
-                let _ = telegram::send("Position closed by SL/TP").await;
+                if telegram_enabled {
+                    let _ = telegram::send("Position closed by SL/TP").await;
+                }
             }
             BridgeMessage::CloseResult { success, ticket, profit, error } => {
                 if success {
@@ -235,8 +269,10 @@ async fn main() -> Result<()> {
                         info!("Today: {} trades | W:{} L:{} | ${:.2}", total, wins, losses, pnl);
                     }
                     
-                    let _ = telegram::send(&format!("Closed {} | P&L: ${} | Total: ${}", 
-                        current_symbol, profit, total_pnl)).await;
+                    if telegram_enabled {
+                        let _ = telegram::send(&format!("Closed {} | P&L: ${} | Total: ${}", 
+                            current_symbol, profit, total_pnl)).await;
+                    }
                 } else {
                     warn!("Close failed: {}", error);
                 }
@@ -247,7 +283,7 @@ async fn main() -> Result<()> {
                 info!("{}", SEP);
                 info!("ACCOUNT: Balance=${} Equity=${} Profit=${}", balance, equity, profit);
                 info!("Session: {} trades | Total P&L: ${}", trade_count, total_pnl);
-                info!("Active: {}/{} positions", coordinator.active_position_count(), 3);
+                info!("Active: {}/{} positions", coordinator.active_position_count(), max_positions);
                 info!("{}", SEP);
             }
         }
