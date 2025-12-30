@@ -17,6 +17,7 @@ use crate::core::lossless::MarketObserver;
 use crate::core::types::Candle;
 use crate::core::strategy::{Strategy, SignalDirection};
 use crate::data::mt5_bridge::{self, BridgeMessage, BridgeWriter};
+use crate::comms::telegram;
 
 const VPS_HOST: &str = "213.136.76.40";
 const VPS_PORT: u16 = 5555;
@@ -35,19 +36,20 @@ async fn main() -> Result<()> {
     info!("  SOVEREIGN v4.0 - Perpetual Autonomous Trading System");
     info!("═══════════════════════════════════════════════════════════");
     
+    telegram::send_startup().await;
+    
     let (tx, mut rx) = mpsc::channel::<BridgeMessage>(100);
     let writer: BridgeWriter = Arc::new(Mutex::new(None));
     let writer_clone = writer.clone();
     
-    // Initialize components
     let mut observer = MarketObserver::new(dec!(0.01), true);
     let strategy = Strategy::default();
     
     let mut tick_count = 0u64;
     let mut candle_count = 0u64;
     let mut in_position = false;
+    let mut last_direction = String::new();
     
-    // Spawn bridge connection
     tokio::spawn(async move {
         loop {
             if let Err(e) = mt5_bridge::connect(VPS_HOST, VPS_PORT, tx.clone(), writer_clone.clone()).await {
@@ -60,7 +62,6 @@ async fn main() -> Result<()> {
     info!("Strategy: min_conviction=60, risk_reward=1:2");
     info!("Waiting for market data...");
     
-    // Request account info after connection
     let writer_for_account = writer.clone();
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -89,8 +90,6 @@ async fn main() -> Result<()> {
                 
                 observer.update(&c);
                 let obs = observer.observe(candle.close);
-                
-                // Run strategy
                 let signal = strategy.analyze(&obs, candle.close);
                 
                 info!("═══════════════════════════════════════════════════════════");
@@ -104,7 +103,6 @@ async fn main() -> Result<()> {
                     info!("  → {}", reason);
                 }
                 
-                // Execute trade if signal is strong and not in position
                 if !in_position && signal.direction != SignalDirection::Hold {
                     info!("═══════════════════════════════════════════════════════════");
                     info!("🚨 TRADE SIGNAL: {:?}", signal.direction);
@@ -114,8 +112,18 @@ async fn main() -> Result<()> {
                     info!("   Conviction: {}%", signal.conviction);
                     info!("═══════════════════════════════════════════════════════════");
                     
-                    // Send order
-                    let lots = dec!(0.01); // Minimum lot for testing
+                    let dir_str = format!("{:?}", signal.direction);
+                    telegram::send_signal(
+                        &dir_str,
+                        &candle.close.to_string(),
+                        &signal.stop_loss.to_string(),
+                        &signal.take_profit.to_string(),
+                        signal.conviction,
+                    ).await;
+                    
+                    last_direction = dir_str.clone();
+                    
+                    let lots = dec!(0.01);
                     
                     match signal.direction {
                         SignalDirection::Buy => {
@@ -141,8 +149,10 @@ async fn main() -> Result<()> {
             BridgeMessage::OrderResult { success, ticket, price, error } => {
                 if success {
                     info!("✅ ORDER FILLED: ticket={} price={}", ticket, price);
+                    telegram::send_fill(&last_direction, ticket, &price.to_string()).await;
                 } else {
                     warn!("❌ ORDER FAILED: {}", error);
+                    telegram::send(&format!("❌ Order failed: {}", error)).await;
                     in_position = false;
                 }
             }
