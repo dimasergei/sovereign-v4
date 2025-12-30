@@ -4,6 +4,7 @@ use anyhow::Result;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 use tokio::sync::mpsc;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -48,7 +49,10 @@ async fn main() -> Result<()> {
     let mut tick_count = 0u64;
     let mut candle_count = 0u64;
     let mut in_position = false;
+    let mut current_ticket: u64 = 0;
     let mut last_direction = String::new();
+    let mut total_pnl = Decimal::ZERO;
+    let mut trade_count = 0u32;
     
     tokio::spawn(async move {
         loop {
@@ -85,7 +89,7 @@ async fn main() -> Result<()> {
                     candle.high,
                     candle.low,
                     candle.close,
-                    candle.volume,
+                    candle.volume.into(),
                 );
                 
                 observer.update(&c);
@@ -97,7 +101,8 @@ async fn main() -> Result<()> {
                     candle_count, candle.open, candle.high, candle.low, candle.close);
                 info!("Trend: {} | Momentum: {} | Volume: {:?}", 
                     obs.trend, obs.momentum, obs.volume_state);
-                info!("Signal: {:?} | Conviction: {}%", signal.direction, signal.conviction);
+                info!("Signal: {:?} | Conviction: {}% | In Position: {}", 
+                    signal.direction, signal.conviction, in_position);
                 
                 for reason in &signal.reasons {
                     info!("  → {}", reason);
@@ -129,15 +134,11 @@ async fn main() -> Result<()> {
                         SignalDirection::Buy => {
                             if let Err(e) = mt5_bridge::send_buy(&writer, lots, signal.stop_loss, signal.take_profit).await {
                                 warn!("Failed to send buy: {}", e);
-                            } else {
-                                in_position = true;
                             }
                         }
                         SignalDirection::Sell => {
                             if let Err(e) = mt5_bridge::send_sell(&writer, lots, signal.stop_loss, signal.take_profit).await {
                                 warn!("Failed to send sell: {}", e);
-                            } else {
-                                in_position = true;
                             }
                         }
                         SignalDirection::Hold => {}
@@ -150,15 +151,49 @@ async fn main() -> Result<()> {
                 if success {
                     info!("✅ ORDER FILLED: ticket={} price={}", ticket, price);
                     telegram::send_fill(&last_direction, ticket, &price.to_string()).await;
+                    in_position = true;
+                    current_ticket = ticket;
+                    trade_count += 1;
                 } else {
                     warn!("❌ ORDER FAILED: {}", error);
                     telegram::send(&format!("❌ Order failed: {}", error)).await;
+                }
+            }
+            BridgeMessage::PositionOpen(pos) => {
+                info!("📊 Position Open: ticket={} side={} profit={}", 
+                    pos.ticket, if pos.side == 0 { "BUY" } else { "SELL" }, pos.profit);
+                in_position = true;
+                current_ticket = pos.ticket;
+            }
+            BridgeMessage::PositionUpdate { ticket, profit } => {
+                if tick_count % 50 == 0 {
+                    info!("📊 Position {}: P&L ${}", ticket, profit);
+                }
+            }
+            BridgeMessage::PositionClosed => {
+                info!("═══════════════════════════════════════════════════════════");
+                info!("📊 POSITION CLOSED");
+                info!("═══════════════════════════════════════════════════════════");
+                telegram::send("📊 Position closed by SL/TP").await;
+                in_position = false;
+                current_ticket = 0;
+            }
+            BridgeMessage::CloseResult { success, ticket, profit, error } => {
+                if success {
+                    info!("✅ CLOSED: ticket={} profit=${}", ticket, profit);
+                    total_pnl += profit;
+                    telegram::send(&format!("✅ Closed ticket {} | P&L: ${} | Total: ${}", 
+                        ticket, profit, total_pnl)).await;
                     in_position = false;
+                    current_ticket = 0;
+                } else {
+                    warn!("❌ Close failed: {}", error);
                 }
             }
             BridgeMessage::AccountInfo { balance, equity, profit } => {
                 info!("═══════════════════════════════════════════════════════════");
                 info!("ACCOUNT: Balance=${} Equity=${} Profit=${}", balance, equity, profit);
+                info!("Session: {} trades | Total P&L: ${}", trade_count, total_pnl);
                 info!("═══════════════════════════════════════════════════════════");
             }
         }
