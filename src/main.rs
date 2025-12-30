@@ -19,6 +19,7 @@ use crate::core::types::Candle;
 use crate::core::strategy::{Strategy, SignalDirection};
 use crate::core::guardian::{RiskGuardian, RiskConfig};
 use crate::data::mt5_bridge::{self, BridgeMessage, BridgeWriter};
+use crate::data::database::TradeDb;
 use crate::comms::telegram;
 
 const VPS_HOST: &str = "213.136.76.40";
@@ -38,6 +39,17 @@ async fn main() -> Result<()> {
     info!("  SOVEREIGN v4.0 - Perpetual Autonomous Trading System");
     info!("═══════════════════════════════════════════════════════════");
     
+    // Initialize database
+    let db = TradeDb::new("sovereign_trades.db")?;
+    
+    // Show historical stats
+    if let Ok((total, wins, losses, pnl)) = db.get_total_stats() {
+        if total > 0 {
+            let win_rate = (wins as f64 / total as f64) * 100.0;
+            info!("Historical: {} trades | {:.1}% win rate | ${:.2} P&L", total, win_rate, pnl);
+        }
+    }
+    
     telegram::send_startup().await;
     
     let (tx, mut rx) = mpsc::channel::<BridgeMessage>(100);
@@ -54,6 +66,11 @@ async fn main() -> Result<()> {
     let mut in_position = false;
     let mut current_ticket: u64 = 0;
     let mut last_direction = String::new();
+    let mut last_lots = dec!(0.01);
+    let mut last_entry = Decimal::ZERO;
+    let mut last_sl = Decimal::ZERO;
+    let mut last_tp = Decimal::ZERO;
+    let mut last_conviction: u8 = 0;
     let mut total_pnl = Decimal::ZERO;
     let mut trade_count = 0u32;
     let mut current_balance = dec!(10000);
@@ -89,7 +106,6 @@ async fn main() -> Result<()> {
             BridgeMessage::Candle(candle) => {
                 candle_count += 1;
                 
-                // Check daily reset
                 guardian.check_daily_reset(current_balance);
                 
                 let c = Candle::new(
@@ -117,7 +133,6 @@ async fn main() -> Result<()> {
                     info!("  → {}", reason);
                 }
                 
-                // Check emergency close conditions
                 let (emergency, emergency_reason) = guardian.check_emergency_close(current_balance, current_equity);
                 if emergency && in_position {
                     warn!("🚨 EMERGENCY CLOSE: {}", emergency_reason);
@@ -127,12 +142,11 @@ async fn main() -> Result<()> {
                     }
                 }
                 
-                // Check if we should trade
                 if !in_position && signal.direction != SignalDirection::Hold {
                     let (can_trade, reject_reason) = guardian.can_trade(
                         current_balance,
                         current_equity,
-                        1, // current positions
+                        1,
                     );
                     
                     if can_trade {
@@ -154,18 +168,22 @@ async fn main() -> Result<()> {
                         ).await;
                         
                         last_direction = dir_str.clone();
+                        last_entry = candle.close;
+                        last_sl = signal.stop_loss;
+                        last_tp = signal.take_profit;
+                        last_conviction = signal.conviction;
                         
-                        // Calculate position size based on risk
                         let sl_distance = (candle.close - signal.stop_loss).abs();
                         let lots = guardian.calculate_position_size(
                             current_balance,
                             sl_distance,
-                            dec!(100),   // point value for gold
-                            dec!(0.01),  // min lot
-                            dec!(10.0),  // max lot
-                            dec!(0.01),  // lot step
-                            dec!(1.0),   // contract size multiplier
+                            dec!(100),
+                            dec!(0.01),
+                            dec!(10.0),
+                            dec!(0.01),
+                            dec!(1.0),
                         );
+                        last_lots = lots;
                         
                         info!("   Lots: {} (risk-adjusted)", lots);
                         
@@ -197,6 +215,19 @@ async fn main() -> Result<()> {
                     current_ticket = ticket;
                     trade_count += 1;
                     guardian.record_trade_opened();
+                    
+                    // Record to database
+                    if let Err(e) = db.record_open(
+                        ticket,
+                        &last_direction,
+                        last_lots,
+                        price,
+                        last_sl,
+                        last_tp,
+                        last_conviction,
+                    ) {
+                        warn!("DB error recording open: {}", e);
+                    }
                 } else {
                     warn!("❌ ORDER FAILED: {}", error);
                     let _ = telegram::send(&format!("❌ Order failed: {}", error)).await;
@@ -226,6 +257,17 @@ async fn main() -> Result<()> {
                     info!("✅ CLOSED: ticket={} profit=${}", ticket, profit);
                     total_pnl += profit;
                     guardian.record_trade_closed(profit);
+                    
+                    // Record to database
+                    if let Err(e) = db.record_close(ticket, last_entry, profit) {
+                        warn!("DB error recording close: {}", e);
+                    }
+                    
+                    // Show updated stats
+                    if let Ok((total, wins, losses, pnl)) = db.get_today_stats() {
+                        info!("Today: {} trades | W:{} L:{} | ${:.2}", total, wins, losses, pnl);
+                    }
+                    
                     let _ = telegram::send(&format!("✅ Closed ticket {} | P&L: ${} | Total: ${}", 
                         ticket, profit, total_pnl)).await;
                     in_position = false;
