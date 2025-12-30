@@ -1,63 +1,84 @@
 //! Broker Module
 //!
-//! Abstractions for broker connections.
-//! Currently supports: MT5 (via bridge)
-//! Future: IBKR, Alpaca
+//! Unified interface for multiple brokers.
 
 pub mod mt5;
+pub mod alpaca;
+pub mod ibkr;
 
+use rust_decimal::Decimal;
 use async_trait::async_trait;
-use anyhow::Result;
 
-use crate::core::types::*;
-
-/// Broker trait - all broker implementations must implement this
+/// Unified broker interface
 #[async_trait]
 pub trait Broker: Send + Sync {
-    /// Connect to the broker
-    async fn connect(&mut self) -> Result<()>;
-    
-    /// Disconnect from the broker
-    async fn disconnect(&mut self) -> Result<()>;
-    
-    /// Check if connected
-    fn is_connected(&self) -> bool;
-    
-    /// Get account information
-    async fn get_account(&self) -> Result<AccountInfo>;
-    
-    /// Get current tick for a symbol
-    async fn get_tick(&self, symbol: &str) -> Result<Tick>;
-    
-    /// Get candles for a symbol
-    async fn get_candles(&self, symbol: &str, timeframe: u32, count: usize) -> Result<Vec<Candle>>;
+    /// Get account balance and equity
+    async fn get_account(&self) -> anyhow::Result<AccountState>;
     
     /// Get open positions
-    async fn get_positions(&self) -> Result<Vec<Position>>;
+    async fn get_positions(&self) -> anyhow::Result<Vec<BrokerPosition>>;
     
-    /// Place an order
-    async fn place_order(&self, order: OrderRequest) -> Result<OrderResult>;
+    /// Submit buy order
+    async fn buy(&self, symbol: &str, qty: Decimal, sl: Decimal, tp: Decimal) 
+        -> anyhow::Result<OrderResult>;
     
-    /// Close a position
-    async fn close_position(&self, ticket: u64) -> Result<()>;
+    /// Submit sell order
+    async fn sell(&self, symbol: &str, qty: Decimal, sl: Decimal, tp: Decimal) 
+        -> anyhow::Result<OrderResult>;
+    
+    /// Close position
+    async fn close(&self, symbol: &str) -> anyhow::Result<OrderResult>;
 }
 
-/// Order request
 #[derive(Debug, Clone)]
-pub struct OrderRequest {
+pub struct AccountState {
+    pub balance: Decimal,
+    pub equity: Decimal,
+    pub margin_used: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrokerPosition {
     pub symbol: String,
     pub side: PositionSide,
-    pub volume: rust_decimal::Decimal,
-    pub stop_loss: Option<rust_decimal::Decimal>,
-    pub take_profit: Option<rust_decimal::Decimal>,
-    pub comment: String,
+    pub quantity: Decimal,
+    pub entry_price: Decimal,
+    pub current_price: Decimal,
+    pub unrealized_pnl: Decimal,
 }
 
-/// Order result
 #[derive(Debug, Clone)]
+pub enum PositionSide {
+    Long,
+    Short,
+}
+
+pub struct OrderRequest {
+    pub symbol: String,
+    pub side: OrderSide,
+    pub quantity: Decimal,
+    pub order_type: OrderType,
+    pub stop_loss: Option<Decimal>,
+    pub take_profit: Option<Decimal>,
+}
+
+#[derive(Debug, Clone)]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone)]
+pub enum OrderType {
+    Market,
+    Limit(Decimal),
+    Stop(Decimal),
+}
+
 pub struct OrderResult {
     pub success: bool,
-    pub ticket: Option<u64>,
-    pub price: Option<rust_decimal::Decimal>,
+    pub order_id: String,
+    pub filled_price: Option<Decimal>,
+    pub filled_qty: Option<Decimal>,
     pub error: Option<String>,
 }

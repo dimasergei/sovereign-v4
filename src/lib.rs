@@ -6,3 +6,4 @@ pub mod data;
 pub mod comms;
 pub mod config;
 pub mod backtest;
+pub mod status;
