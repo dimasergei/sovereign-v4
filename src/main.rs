@@ -14,16 +14,16 @@ mod broker;
 mod data;
 mod comms;
 
-use crate::core::lossless::MarketObserver;
 use crate::core::types::Candle;
-use crate::core::strategy::{Strategy, SignalDirection};
-use crate::core::guardian::{RiskGuardian, RiskConfig};
+use crate::core::coordinator::Coordinator;
+use crate::core::strategy::SignalDirection;
 use crate::data::mt5_bridge::{self, BridgeMessage, BridgeWriter};
 use crate::data::database::TradeDb;
 use crate::comms::telegram;
 
 const VPS_HOST: &str = "213.136.76.40";
 const VPS_PORT: u16 = 5555;
+const SEP: &str = "===========================================================";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,20 +35,23 @@ async fn main() -> Result<()> {
     
     tracing::subscriber::set_global_default(subscriber)?;
     
-    info!("═══════════════════════════════════════════════════════════");
+    info!("{}", SEP);
     info!("  SOVEREIGN v4.0 - Perpetual Autonomous Trading System");
-    info!("═══════════════════════════════════════════════════════════");
+    info!("{}", SEP);
     
-    // Initialize database
     let db = TradeDb::new("sovereign_trades.db")?;
     
-    // Show historical stats
-    if let Ok((total, wins, losses, pnl)) = db.get_total_stats() {
+    if let Ok((total, wins, _losses, pnl)) = db.get_total_stats() {
         if total > 0 {
             let win_rate = (wins as f64 / total as f64) * 100.0;
             info!("Historical: {} trades | {:.1}% win rate | ${:.2} P&L", total, win_rate, pnl);
         }
     }
+    
+    let mut coordinator = Coordinator::new();
+    coordinator.add_agent("XAUUSD", dec!(0.01), true);
+    
+    info!("Agents: {} symbols loaded", coordinator.agent_count());
     
     telegram::send_startup().await;
     
@@ -56,18 +59,10 @@ async fn main() -> Result<()> {
     let writer: BridgeWriter = Arc::new(Mutex::new(None));
     let writer_clone = writer.clone();
     
-    // Initialize components
-    let mut observer = MarketObserver::new(dec!(0.01), true);
-    let strategy = Strategy::default();
-    let mut guardian = RiskGuardian::new(RiskConfig::default());
-    
     let mut tick_count = 0u64;
     let mut candle_count = 0u64;
-    let mut in_position = false;
-    let mut current_ticket: u64 = 0;
     let mut last_direction = String::new();
     let mut last_lots = dec!(0.01);
-    let mut last_entry = Decimal::ZERO;
     let mut last_sl = Decimal::ZERO;
     let mut last_tp = Decimal::ZERO;
     let mut last_conviction: u8 = 0;
@@ -75,6 +70,7 @@ async fn main() -> Result<()> {
     let mut trade_count = 0u32;
     let mut current_balance = dec!(10000);
     let mut current_equity = dec!(10000);
+    let current_symbol = "XAUUSD".to_string();
     
     tokio::spawn(async move {
         loop {
@@ -86,7 +82,7 @@ async fn main() -> Result<()> {
     });
     
     info!("Strategy: min_conviction=60, risk_reward=1:2");
-    info!("Risk Guardian: {}", guardian.status());
+    info!("Guardian: {}", coordinator.guardian_status());
     info!("Waiting for market data...");
     
     let writer_for_account = writer.clone();
@@ -99,14 +95,15 @@ async fn main() -> Result<()> {
         match msg {
             BridgeMessage::Tick(tick) => {
                 tick_count += 1;
+                coordinator.update_tick(&current_symbol, tick.bid, tick.ask);
+                
                 if tick_count % 100 == 0 {
                     info!("Tick #{}: bid={} ask={}", tick_count, tick.bid, tick.ask);
                 }
             }
             BridgeMessage::Candle(candle) => {
                 candle_count += 1;
-                
-                guardian.check_daily_reset(current_balance);
+                coordinator.check_daily_reset(current_balance);
                 
                 let c = Candle::new(
                     chrono::Utc::now(),
@@ -117,106 +114,82 @@ async fn main() -> Result<()> {
                     candle.volume.into(),
                 );
                 
-                observer.update(&c);
-                let obs = observer.observe(candle.close);
-                let signal = strategy.analyze(&obs, candle.close);
+                coordinator.update_candle(&current_symbol, &c);
                 
-                info!("═══════════════════════════════════════════════════════════");
-                info!("CANDLE #{}: O={} H={} L={} C={}", 
-                    candle_count, candle.open, candle.high, candle.low, candle.close);
-                info!("Trend: {} | Momentum: {} | Volume: {:?}", 
-                    obs.trend, obs.momentum, obs.volume_state);
-                info!("Signal: {:?} | Conviction: {}% | In Position: {}", 
-                    signal.direction, signal.conviction, in_position);
-                
-                for reason in &signal.reasons {
-                    info!("  → {}", reason);
+                if let Some(obs) = coordinator.get_observation(&current_symbol) {
+                    info!("{}", SEP);
+                    info!("CANDLE #{}: {} | O={} H={} L={} C={}", 
+                        candle_count, current_symbol, candle.open, candle.high, candle.low, candle.close);
+                    info!("Trend: {} | Momentum: {} | Volume: {:?}", 
+                        obs.trend, obs.momentum, obs.volume_state);
+                    info!("Positions: {}/{} | Guardian: {}", 
+                        coordinator.active_position_count(), 3, coordinator.guardian_status());
                 }
                 
-                let (emergency, emergency_reason) = guardian.check_emergency_close(current_balance, current_equity);
-                if emergency && in_position {
-                    warn!("🚨 EMERGENCY CLOSE: {}", emergency_reason);
-                    let _ = telegram::send(&format!("🚨 EMERGENCY: {}", emergency_reason)).await;
-                    if current_ticket > 0 {
-                        let _ = mt5_bridge::send_close(&writer, current_ticket).await;
+                let signals = coordinator.collect_signals(current_balance, current_equity);
+                
+                if signals.is_empty() {
+                    info!("Signal: HOLD | No opportunities");
+                } else {
+                    for signal in &signals {
+                        info!("Signal #{}: {} {:?} | Conviction: {}%", 
+                            signal.rank, signal.symbol, signal.direction, signal.conviction);
                     }
-                }
-                
-                if !in_position && signal.direction != SignalDirection::Hold {
-                    let (can_trade, reject_reason) = guardian.can_trade(
-                        current_balance,
-                        current_equity,
-                        1,
-                    );
                     
-                    if can_trade {
-                        info!("═══════════════════════════════════════════════════════════");
-                        info!("🚨 TRADE SIGNAL: {:?}", signal.direction);
-                        info!("   Entry: {}", candle.close);
-                        info!("   SL: {}", signal.stop_loss);
-                        info!("   TP: {}", signal.take_profit);
-                        info!("   Conviction: {}%", signal.conviction);
-                        info!("═══════════════════════════════════════════════════════════");
+                    if let Some(best) = signals.first() {
+                        info!("{}", SEP);
+                        info!("EXECUTING: {} {:?}", best.symbol, best.direction);
+                        info!("  Entry: {} | SL: {} | TP: {}", best.price, best.stop_loss, best.take_profit);
+                        info!("  Conviction: {}%", best.conviction);
+                        info!("{}", SEP);
                         
-                        let dir_str = format!("{:?}", signal.direction);
+                        let dir_str = format!("{:?}", best.direction);
                         telegram::send_signal(
                             &dir_str,
-                            &candle.close.to_string(),
-                            &signal.stop_loss.to_string(),
-                            &signal.take_profit.to_string(),
-                            signal.conviction,
+                            &best.price.to_string(),
+                            &best.stop_loss.to_string(),
+                            &best.take_profit.to_string(),
+                            best.conviction,
                         ).await;
                         
-                        last_direction = dir_str.clone();
-                        last_entry = candle.close;
-                        last_sl = signal.stop_loss;
-                        last_tp = signal.take_profit;
-                        last_conviction = signal.conviction;
+                        last_direction = dir_str;
+                        last_sl = best.stop_loss;
+                        last_tp = best.take_profit;
+                        last_conviction = best.conviction;
                         
-                        let sl_distance = (candle.close - signal.stop_loss).abs();
-                        let lots = guardian.calculate_position_size(
-                            current_balance,
-                            sl_distance,
-                            dec!(100),
-                            dec!(0.01),
-                            dec!(10.0),
-                            dec!(0.01),
-                            dec!(1.0),
-                        );
+                        let sl_distance = (best.price - best.stop_loss).abs();
+                        let lots = coordinator.calculate_lots(current_balance, sl_distance, dec!(100));
                         last_lots = lots;
                         
-                        info!("   Lots: {} (risk-adjusted)", lots);
+                        info!("  Lots: {} (risk-adjusted)", lots);
                         
-                        match signal.direction {
+                        match best.direction {
                             SignalDirection::Buy => {
-                                if let Err(e) = mt5_bridge::send_buy(&writer, lots, signal.stop_loss, signal.take_profit).await {
+                                if let Err(e) = mt5_bridge::send_buy(&writer, lots, best.stop_loss, best.take_profit).await {
                                     warn!("Failed to send buy: {}", e);
                                 }
                             }
                             SignalDirection::Sell => {
-                                if let Err(e) = mt5_bridge::send_sell(&writer, lots, signal.stop_loss, signal.take_profit).await {
+                                if let Err(e) = mt5_bridge::send_sell(&writer, lots, best.stop_loss, best.take_profit).await {
                                     warn!("Failed to send sell: {}", e);
                                 }
                             }
                             SignalDirection::Hold => {}
                         }
-                    } else {
-                        info!("⛔ Trade blocked by Risk Guardian: {}", reject_reason);
                     }
                 }
                 
-                info!("═══════════════════════════════════════════════════════════");
+                info!("{}", SEP);
             }
             BridgeMessage::OrderResult { success, ticket, price, error } => {
                 if success {
-                    info!("✅ ORDER FILLED: ticket={} price={}", ticket, price);
+                    info!("ORDER FILLED: ticket={} price={}", ticket, price);
                     telegram::send_fill(&last_direction, ticket, &price.to_string()).await;
-                    in_position = true;
-                    current_ticket = ticket;
-                    trade_count += 1;
-                    guardian.record_trade_opened();
                     
-                    // Record to database
+                    let side = if last_direction == "Buy" { SignalDirection::Buy } else { SignalDirection::Sell };
+                    coordinator.position_opened(&current_symbol, ticket, side);
+                    trade_count += 1;
+                    
                     if let Err(e) = db.record_open(
                         ticket,
                         &last_direction,
@@ -226,64 +199,56 @@ async fn main() -> Result<()> {
                         last_tp,
                         last_conviction,
                     ) {
-                        warn!("DB error recording open: {}", e);
+                        warn!("DB error: {}", e);
                     }
                 } else {
-                    warn!("❌ ORDER FAILED: {}", error);
-                    let _ = telegram::send(&format!("❌ Order failed: {}", error)).await;
+                    warn!("ORDER FAILED: {}", error);
+                    let _ = telegram::send(&format!("Order failed: {}", error)).await;
                 }
             }
             BridgeMessage::PositionOpen(pos) => {
-                info!("📊 Position Open: ticket={} side={} profit={}", 
-                    pos.ticket, if pos.side == 0 { "BUY" } else { "SELL" }, pos.profit);
-                in_position = true;
-                current_ticket = pos.ticket;
+                info!("Position Open: {} ticket={} profit={}", current_symbol, pos.ticket, pos.profit);
             }
             BridgeMessage::PositionUpdate { ticket, profit } => {
                 if tick_count % 50 == 0 {
-                    info!("📊 Position {}: P&L ${}", ticket, profit);
+                    info!("Position {}: P&L ${}", ticket, profit);
                 }
             }
             BridgeMessage::PositionClosed => {
-                info!("═══════════════════════════════════════════════════════════");
-                info!("📊 POSITION CLOSED");
-                info!("═══════════════════════════════════════════════════════════");
-                let _ = telegram::send("📊 Position closed by SL/TP").await;
-                in_position = false;
-                current_ticket = 0;
+                info!("{}", SEP);
+                info!("POSITION CLOSED: {}", current_symbol);
+                info!("{}", SEP);
+                coordinator.position_closed(&current_symbol, Decimal::ZERO);
+                let _ = telegram::send("Position closed by SL/TP").await;
             }
             BridgeMessage::CloseResult { success, ticket, profit, error } => {
                 if success {
-                    info!("✅ CLOSED: ticket={} profit=${}", ticket, profit);
+                    info!("CLOSED: ticket={} profit=${}", ticket, profit);
                     total_pnl += profit;
-                    guardian.record_trade_closed(profit);
+                    coordinator.position_closed(&current_symbol, profit);
                     
-                    // Record to database
-                    if let Err(e) = db.record_close(ticket, last_entry, profit) {
-                        warn!("DB error recording close: {}", e);
+                    if let Err(e) = db.record_close(ticket, Decimal::ZERO, profit) {
+                        warn!("DB error: {}", e);
                     }
                     
-                    // Show updated stats
                     if let Ok((total, wins, losses, pnl)) = db.get_today_stats() {
                         info!("Today: {} trades | W:{} L:{} | ${:.2}", total, wins, losses, pnl);
                     }
                     
-                    let _ = telegram::send(&format!("✅ Closed ticket {} | P&L: ${} | Total: ${}", 
-                        ticket, profit, total_pnl)).await;
-                    in_position = false;
-                    current_ticket = 0;
+                    let _ = telegram::send(&format!("Closed {} | P&L: ${} | Total: ${}", 
+                        current_symbol, profit, total_pnl)).await;
                 } else {
-                    warn!("❌ Close failed: {}", error);
+                    warn!("Close failed: {}", error);
                 }
             }
             BridgeMessage::AccountInfo { balance, equity, profit } => {
                 current_balance = balance;
                 current_equity = equity;
-                info!("═══════════════════════════════════════════════════════════");
+                info!("{}", SEP);
                 info!("ACCOUNT: Balance=${} Equity=${} Profit=${}", balance, equity, profit);
                 info!("Session: {} trades | Total P&L: ${}", trade_count, total_pnl);
-                info!("Guardian: {}", guardian.status());
-                info!("═══════════════════════════════════════════════════════════");
+                info!("Active: {}/{} positions", coordinator.active_position_count(), 3);
+                info!("{}", SEP);
             }
         }
     }
