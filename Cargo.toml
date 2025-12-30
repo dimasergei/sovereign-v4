@@ -1,0 +1,79 @@
+[package]
+name = "sovereign"
+version = "4.0.0"
+edition = "2021"
+authors = ["Sovereign Trading System"]
+description = "Institutional-grade autonomous trading system"
+license = "Proprietary"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "chrono", "rust_decimal"] }
+redis = { version = "0.24", features = ["tokio-comp"] }
+
+# HTTP & WebSocket
+reqwest = { version = "0.11", features = ["json"] }
+tokio-tungstenite = "0.21"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Configuration
+config = "0.14"
+
+# Error Handling
+anyhow = "1"
+thiserror = "1"
+
+# Time & Decimal
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1", features = ["serde"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "sovereign"
+path = "src/main.rs"
+
+[[bin]]
+name = "watchdog"
+path = "src/bin/watchdog.rs"
+
+# ============================================================================
+# EXERCISES - Learning Rust through trading
+# ============================================================================
+
+[[bin]]
+name = "day01"
+path = "exercises/day01_variables.rs"
+
+[[bin]]
+name = "day02"
+path = "exercises/day02_functions.rs"
+
+[[bin]]
+name = "day04"
+path = "exercises/day04_ownership.rs"
+
+[[bin]]
+name = "week1_project"
+path = "exercises/week1_project.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
