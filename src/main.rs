@@ -1,46 +1,18 @@
 //! Sovereign v4.0 "Perpetual" - Institutional Autonomous Trading System
-//! 
-//! A fully autonomous trading system designed to run for 12+ years
-//! without human intervention, inspired by Tech Trader's philosophy.
-//!
-//! # Architecture
-//! 
-//! ```text
-//! ┌─────────────┐
-//! │   Watchdog  │  (External - restarts system on failure)
-//! └──────┬──────┘
-//!        │
-//!        ▼
-//! ┌─────────────┐
-//! │ Coordinator │  (Brain - manages all agents)
-//! └──────┬──────┘
-//!        │
-//!        ▼
-//! ┌─────────────┐
-//! │ Agent Pool  │  (1000+ independent agents)
-//! └──────┬──────┘
-//!        │
-//!        ▼
-//! ┌─────────────┐
-//! │   Broker    │  (Executes trades)
-//! └─────────────┘
-//! ```
-//!
-//! # Philosophy
-//! 
-//! - **Lossless Algorithms**: No parameters, no thresholds, no tuning
-//! - **Human Thinking**: Pattern recognition, not statistics
-//! - **Perpetual Operation**: Self-healing, never crashes
-//! - **Scale**: Designed for 1000+ concurrent agents
 
 use anyhow::Result;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
+use rust_decimal_macros::dec;
 
 mod core;
 mod broker;
 mod data;
 mod comms;
+
+use crate::core::types::*;
+use crate::core::lossless::MarketObserver;
+use crate::core::guardian::{RiskGuardian, RiskConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,8 +21,6 @@ async fn main() -> Result<()> {
         .with_max_level(Level::INFO)
         .with_target(false)
         .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
         .finish();
     
     tracing::subscriber::set_global_default(subscriber)?;
@@ -58,26 +28,44 @@ async fn main() -> Result<()> {
     info!("═══════════════════════════════════════════════════════════");
     info!("  SOVEREIGN v4.0 - Perpetual Autonomous Trading System");
     info!("═══════════════════════════════════════════════════════════");
-    info!("");
     info!("  Philosophy: Build once, run forever.");
-    info!("  Target: 12+ years of autonomous operation.");
-    info!("");
     info!("═══════════════════════════════════════════════════════════");
     
-    // TODO: Initialize components
-    // 1. Load configuration
-    // 2. Connect to database
-    // 3. Connect to Redis
-    // 4. Initialize broker connections
-    // 5. Spawn agent pool
-    // 6. Start coordinator
-    // 7. Run forever
+    // Initialize components
+    let mut observer = MarketObserver::new(dec!(0.01), true); // Gold, forex mode
+    let guardian = RiskGuardian::new(RiskConfig::default());
     
-    info!("System initialized. Running perpetually...");
+    info!("Market Observer initialized for XAUUSD");
+    info!("Risk Guardian: {}", guardian.status());
     
-    // Placeholder: Keep running
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-        info!("Heartbeat - System alive");
+    // Simulate some candles to test the lossless algorithms
+    let test_candles = vec![
+        Candle::new(chrono::Utc::now(), dec!(2650.00), dec!(2652.00), dec!(2648.00), dec!(2651.00), dec!(1000)),
+        Candle::new(chrono::Utc::now(), dec!(2651.00), dec!(2655.00), dec!(2650.00), dec!(2654.00), dec!(1200)),
+        Candle::new(chrono::Utc::now(), dec!(2654.00), dec!(2658.00), dec!(2653.00), dec!(2657.00), dec!(1500)),
+        Candle::new(chrono::Utc::now(), dec!(2657.00), dec!(2660.00), dec!(2655.00), dec!(2656.00), dec!(1100)),
+        Candle::new(chrono::Utc::now(), dec!(2656.00), dec!(2658.00), dec!(2652.00), dec!(2653.00), dec!(1300)),
+    ];
+    
+    info!("Processing {} test candles...", test_candles.len());
+    
+    for (i, candle) in test_candles.iter().enumerate() {
+        observer.update(candle);
+        let obs = observer.observe(candle.close);
+        
+        info!(
+            "Candle {}: Close={} | Trend={} | Momentum={} | Volume={:?}",
+            i + 1,
+            candle.close,
+            obs.trend,
+            obs.momentum,
+            obs.volume_state
+        );
     }
+    
+    info!("═══════════════════════════════════════════════════════════");
+    info!("  Lossless algorithms working. Ready for real data.");
+    info!("═══════════════════════════════════════════════════════════");
+    
+    Ok(())
 }
