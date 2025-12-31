@@ -32,10 +32,12 @@ fn is_market_open() -> bool {
     let now = Utc::now();
     let weekday = now.weekday();
     
+    // Market closed on weekends
     if weekday == Weekday::Sat || weekday == Weekday::Sun {
         return false;
     }
     
+    // Market hours: 9:30 AM - 4:00 PM ET (14:30 - 21:00 UTC)
     let hour = now.hour();
     let minute = now.minute();
     let time_minutes = hour * 60 + minute;
@@ -44,21 +46,26 @@ fn is_market_open() -> bool {
     time_minutes >= 870 && time_minutes < 1260
 }
 
-/// Smart alerting - reduces spam
+/// Smart alerting - only alert on significant events
 struct AlertManager {
     last_gap_alert: std::time::Instant,
     gap_alert_interval: std::time::Duration,
+    consecutive_gaps: u32,
 }
 
 impl AlertManager {
     fn new() -> Self {
         Self {
             last_gap_alert: std::time::Instant::now(),
-            gap_alert_interval: std::time::Duration::from_secs(300),
+            gap_alert_interval: std::time::Duration::from_secs(300), // 5 min between alerts
+            consecutive_gaps: 0,
         }
     }
     
-    fn should_alert_gap(&mut self) -> bool {
+    fn should_alert_gap(&mut self, gap_count: u32) -> bool {
+        self.consecutive_gaps = gap_count;
+        
+        // Only alert every 5 minutes, and only if market should be open
         if self.last_gap_alert.elapsed() >= self.gap_alert_interval && is_market_open() {
             self.last_gap_alert = std::time::Instant::now();
             true
@@ -68,7 +75,7 @@ impl AlertManager {
     }
     
     fn reset(&mut self) {
-        // Reset alert timer when data flows
+        self.consecutive_gaps = 0;
     }
 }
 
@@ -91,6 +98,9 @@ async fn main() -> Result<()> {
     info!("  {} - Perpetual Autonomous Trading System", cfg.system.name);
     info!("{}", SEP);
     
+    // Require Alpaca config
+    let alpaca_cfg = cfg.alpaca.clone().expect("Alpaca config required");
+    
     let db = TradeDb::new("sovereign_trades.db")?;
     
     if let Ok((total, wins, _losses, pnl)) = db.get_total_stats() {
@@ -99,8 +109,6 @@ async fn main() -> Result<()> {
             info!("Historical: {} trades | {:.1}% win rate | ${:.2} P&L", total, win_rate, pnl);
         }
     }
-    
-    let alpaca_cfg = cfg.alpaca.clone().expect("Alpaca config required");
     
     let risk_config = cfg.risk.to_guardian_config();
     let mut coordinator = Coordinator::with_config(cfg.risk.max_positions, risk_config);
@@ -114,14 +122,22 @@ async fn main() -> Result<()> {
     
     info!("Agents: {} symbols loaded", coordinator.agent_count());
     
+    // Initialize Alpaca broker
     let broker = AlpacaBroker::new(
         alpaca_cfg.api_key.clone(),
         alpaca_cfg.secret_key.clone(),
         cfg.broker.paper,
     );
     
+    // Initialize state variables
+    let mut current_balance = dec!(100000);
+    let mut current_equity = dec!(100000);
+    
+    // Get initial account info and UPDATE balance
     match broker.get_account().await {
         Ok(account) => {
+            current_balance = Decimal::from_str(&account.equity).unwrap_or(dec!(100000));
+            current_equity = current_balance;
             info!("Alpaca Account: ${} equity, ${} cash, ${} buying power", 
                 account.equity, account.cash, account.buying_power);
         }
@@ -130,7 +146,7 @@ async fn main() -> Result<()> {
         }
     }
     
-    // Position recovery
+    // POSITION RECOVERY: Query and register existing positions
     match broker.get_positions().await {
         Ok(positions) => {
             if !positions.is_empty() {
@@ -139,6 +155,7 @@ async fn main() -> Result<()> {
                 for pos in &positions {
                     info!("  {} {} shares @ ${} | P&L: ${}", 
                         pos.symbol, pos.qty, pos.avg_entry_price, pos.unrealized_pl);
+                    // Register with coordinator so it knows we have an open position
                     let side = if pos.side == "long" { SignalDirection::Buy } else { SignalDirection::Sell };
                     coordinator.position_opened(&pos.symbol, 0, side);
                 }
@@ -158,18 +175,23 @@ async fn main() -> Result<()> {
     
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
     
+    // Health monitor
     let mut health = HealthMonitor::new();
     let mut last_health_check = std::time::Instant::now();
+    
+    // Smart alert manager (reduces spam)
     let mut alert_manager = AlertManager::new();
     
     let mut tick_count = 0u64;
     let mut candle_count = 0u64;
-    let mut current_balance = dec!(100000);
-    let mut current_equity = dec!(100000);
+    let mut total_pnl = Decimal::ZERO;
+    let mut trade_count = 0u32;
     
     let max_positions = cfg.risk.max_positions;
+    let min_conviction = cfg.strategy.min_conviction;
     let telegram_enabled = cfg.telegram.enabled;
     
+    // Spawn Alpaca WebSocket connection
     let api_key = alpaca_cfg.api_key.clone();
     let api_secret = alpaca_cfg.secret_key.clone();
     let symbols_clone = symbols.clone();
@@ -184,7 +206,7 @@ async fn main() -> Result<()> {
         }
     });
     
-    info!("Strategy: min_conviction={}, risk_reward=1:{}", cfg.strategy.min_conviction, cfg.strategy.risk_reward_ratio);
+    info!("Strategy: min_conviction={}, risk_reward=1:{}", min_conviction, cfg.strategy.risk_reward_ratio);
     info!("Guardian: {}", coordinator.guardian_status());
     info!("Broker: Alpaca (paper={})", cfg.broker.paper);
     info!("Health: Monitoring enabled (90s bar timeout)");
@@ -192,32 +214,46 @@ async fn main() -> Result<()> {
     info!("Waiting for market data...");
     
     loop {
-        // Health check every 10 seconds
+        // Check health every 10 seconds
         if last_health_check.elapsed().as_secs() >= 10 {
             last_health_check = std::time::Instant::now();
             
-            health.set_market_open(is_market_open());
-            
-            match health.check() {
-                HealthStatus::Healthy { gaps: _ } => {
+health.set_market_open(is_market_open());
+
+match health.check() {
+    HealthStatus::Healthy { gaps: _ } => {
+        alert_manager.reset();
+    }
+    HealthStatus::MarketClosed => {
+        // No warnings when market closed
+    }
+    HealthStatus::StaleData { seconds, gaps } => {            match health.check() {
+                HealthStatus::Healthy => {
                     alert_manager.reset();
                 }
-                HealthStatus::MarketClosed => {
-                    // No warnings when market closed
-                }
                 HealthStatus::StaleData { seconds, gaps } => {
-                    warn!("HEALTH: No bars for {}s (gap #{})", seconds, gaps);
-                    
-                    if alert_manager.should_alert_gap() && telegram_enabled {
-                        let _ = telegram::send(&format!(
-                            "⚠️ Data gap: {}s without bars (gap #{}) - Market: {}",
-                            seconds, gaps, if is_market_open() { "OPEN" } else { "CLOSED" }
-                        )).await;
+                    // Only warn if market should be open
+                    if is_market_open() {
+                        warn!("HEALTH: No bars for {}s (gap #{})", seconds, gaps);
+                        
+                        // Smart alerting: only send telegram every 5 min
+                        if alert_manager.should_alert_gap(gaps) && telegram_enabled {
+                            let _ = telegram::send(&format!(
+                                "⚠️ Data gap: {}s without ticks (gap #{}) - Market: {}",
+                                seconds, gaps, if is_market_open() { "OPEN" } else { "CLOSED" }
+                            )).await;
+                        }
+                    }
+                }
+                HealthStatus::MissingCandles { seconds } => {
+                    if is_market_open() {
+                        warn!("HEALTH: No candles for {}s", seconds);
                     }
                 }
             }
         }
         
+        // Non-blocking receive with timeout
         match tokio::time::timeout(
             tokio::time::Duration::from_millis(100),
             rx.recv()
@@ -225,11 +261,12 @@ async fn main() -> Result<()> {
             Ok(Some(msg)) => {
                 match msg {
                     AlpacaMessage::Connected => {
-                        info!("Connected to Alpaca WebSocket");
+                        info!("Connected to Alpaca stream!");
                     }
                     AlpacaMessage::Tick(tick) => {
                         tick_count += 1;
-                        // Ticks don't reset health - only bars do
+                        // ticks dont reset health
+                        alert_manager.reset();
                         coordinator.update_tick(&tick.symbol, tick.bid, tick.ask);
                         
                         if tick_count % 100 == 0 {
@@ -263,6 +300,7 @@ async fn main() -> Result<()> {
                                 coordinator.active_position_count(), max_positions, health.gap_count());
                         }
                         
+                        // Only generate signals if market is open
                         if !is_market_open() {
                             info!("Signal: HOLD | Market closed");
                             info!("{}", SEP);
@@ -297,13 +335,15 @@ async fn main() -> Result<()> {
                                     ).await;
                                 }
                                 
-                                let qty = dec!(1);
+                                // Calculate quantity (shares for stocks)
+                                let qty = dec!(1); // Start with 1 share for testing
                                 
                                 match best.direction {
                                     SignalDirection::Buy => {
                                         match broker.buy(&best.symbol, qty, Some(best.stop_loss), Some(best.take_profit)).await {
                                             Ok(order) => {
                                                 info!("BUY ORDER: {} status={}", order.id, order.status);
+                                                trade_count += 1;
                                                 coordinator.position_opened(&best.symbol, 0, SignalDirection::Buy);
                                             }
                                             Err(e) => warn!("Buy failed: {}", e),
@@ -313,6 +353,7 @@ async fn main() -> Result<()> {
                                         match broker.sell(&best.symbol, qty, Some(best.stop_loss), Some(best.take_profit)).await {
                                             Ok(order) => {
                                                 info!("SELL ORDER: {} status={}", order.id, order.status);
+                                                trade_count += 1;
                                                 coordinator.position_opened(&best.symbol, 0, SignalDirection::Sell);
                                             }
                                             Err(e) => warn!("Sell failed: {}", e),
@@ -335,7 +376,7 @@ async fn main() -> Result<()> {
                 break;
             }
             Err(_) => {
-                // Timeout - continue loop for health checks
+                // Timeout - no message, continue loop for health checks
             }
         }
     }
