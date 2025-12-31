@@ -2,9 +2,13 @@
 name = "Sovereign v4"
 log_level = "info"
 
-[bridge]
-host = "213.136.76.40"
-port = 5555
+[broker]
+type = "alpaca"
+paper = true
+
+[alpaca]
+api_key = "PK6EKLWAERUJ65TSHB2WL43GL4"
+secret_key = "4G3EpmNRnLaFarKnnsfXCeNnFgZJxibvH1RtgdYt48Nq"
 
 [telegram]
 enabled = true
@@ -25,7 +29,13 @@ min_conviction = 60
 risk_reward_ratio = 2.0
 
 [[symbols]]
-name = "XAUUSD"
+name = "SPY"
 tick_size = 0.01
-is_forex = true
-point_value = 100
+is_forex = false
+point_value = 1
+
+[[symbols]]
+name = "QQQ"
+tick_size = 0.01
+is_forex = false
+point_value = 1

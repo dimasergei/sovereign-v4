@@ -1,5 +1,4 @@
 //! Configuration loader
-
 use anyhow::Result;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -9,7 +8,12 @@ use std::str::FromStr;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub system: SystemConfig,
-    pub bridge: BridgeConfig,
+    #[serde(default)]
+    pub broker: BrokerConfig,
+    #[serde(default)]
+    pub alpaca: Option<AlpacaConfig>,
+    #[serde(default)]
+    pub bridge: Option<BridgeConfig>,
     pub telegram: TelegramConfig,
     pub risk: RiskConfig,
     pub strategy: StrategyConfig,
@@ -20,6 +24,24 @@ pub struct Config {
 pub struct SystemConfig {
     pub name: String,
     pub log_level: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct BrokerConfig {
+    #[serde(default = "default_broker_type")]
+    pub broker_type: String,
+    #[serde(default)]
+    pub paper: bool,
+}
+
+fn default_broker_type() -> String {
+    "alpaca".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AlpacaConfig {
+    pub api_key: String,
+    pub secret_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +87,14 @@ impl Config {
         let contents = fs::read_to_string(path)?;
         let config: Config = toml::from_str(&contents)?;
         Ok(config)
+    }
+    
+    pub fn is_alpaca(&self) -> bool {
+        self.alpaca.is_some()
+    }
+    
+    pub fn alpaca_config(&self) -> Option<&AlpacaConfig> {
+        self.alpaca.as_ref()
     }
 }
 
