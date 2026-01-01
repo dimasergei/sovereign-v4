@@ -1,10 +1,8 @@
 //! Broker Module
 //!
-//! Unified interface for multiple brokers.
+//! Alpaca broker integration.
 
-pub mod mt5;
 pub mod alpaca;
-pub mod ibkr;
 
 use rust_decimal::Decimal;
 use async_trait::async_trait;

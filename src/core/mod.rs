@@ -15,12 +15,5 @@ pub mod agent;
 pub mod health;
 
 // Re-export commonly used types
-pub use types::{Candle, Tick};
-pub use sr::{SRLevels, PriceRange};
-pub use capitulation::{VolumeTracker, CapitulationSignal};
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position};
 pub use health::HealthMonitor;
-
-// Keep guardian for risk management (this is NOT strategy parameters)
-pub mod guardian;
-pub use guardian::{RiskGuardian, RiskConfig};

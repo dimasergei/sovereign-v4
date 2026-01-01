@@ -56,30 +56,6 @@ tokio-test = "0.4"
 name = "sovereign"
 path = "src/main.rs"
 
-[[bin]]
-name = "watchdog"
-path = "src/bin/watchdog.rs"
-
-# ============================================================================
-# EXERCISES - Learning Rust through trading
-# ============================================================================
-
-[[bin]]
-name = "day01"
-path = "exercises/day01_variables.rs"
-
-[[bin]]
-name = "day02"
-path = "exercises/day02_functions.rs"
-
-[[bin]]
-name = "day04"
-path = "exercises/day04_ownership.rs"
-
-[[bin]]
-name = "week1_project"
-path = "exercises/week1_project.rs"
-
 [profile.release]
 opt-level = 3
 lto = true
