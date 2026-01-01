@@ -2,3 +2,4 @@
 Cargo.lock
 .env
 sovereign.log
+config.toml

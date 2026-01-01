@@ -1,0 +1,42 @@
+# Sovereign v4.0 - Lossless Autonomous Trading System
+#
+# NOTE: This config contains NO strategy parameters.
+# The strategy has NO parameters - that's the lossless philosophy.
+#
+# Only infrastructure settings are configured here:
+# - Broker credentials
+# - Notification settings
+# - Trading universe
+
+[system]
+name = "Sovereign v4"
+log_level = "info"
+
+[broker]
+type = "alpaca"
+paper = true
+
+[alpaca]
+api_key = ""
+secret_key = ""
+
+[telegram]
+enabled = true
+bot_token = "8570067655:AAHezpMffYJIc6oHkhmAX-MwXIpI91TvzR8"
+chat_id = "7898079111"
+
+# Portfolio settings (NOT strategy parameters - these are account protection)
+[portfolio]
+initial_balance = 100000
+
+# Trading universe - each symbol is traded by an independent agent
+# Limited to 30 symbols for Alpaca IEX feed
+[universe]
+symbols = [
+    # Mega Cap (10)
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "UNH",
+    # Large Cap (10)
+    "XOM", "JNJ", "WMT", "PG", "HD", "BAC", "KO", "PFE", "MRK", "ABBV",
+    # ETFs (10)
+    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "GLD", "TLT"
+]
