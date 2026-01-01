@@ -21,6 +21,8 @@ redis = { version = "0.24", features = ["tokio-comp"] }
 # HTTP & WebSocket
 reqwest = { version = "0.11", features = ["json"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 
 # Logging & Tracing
 tracing = "0.1"
@@ -40,6 +42,7 @@ rust_decimal = { version = "1", features = ["serde"] }
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
+base64 = "0.22"
 async-trait = "0.1"
 rust_decimal_macros = "1.39.0"
 toml = "0.9.10"
