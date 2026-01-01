@@ -30,20 +30,13 @@ chat_id = "7898079111"
 initial_balance = 100000
 
 # Trading universe - each symbol is traded by an independent agent
+# Limited to 30 symbols for Alpaca IEX feed
 [universe]
 symbols = [
-    # Large Cap Tech
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AVGO", "ORCL", "CRM",
-    # Finance
-    "JPM", "BAC", "GS", "WFC", "MS", "C", "BLK", "SCHW",
-    # Healthcare
-    "JNJ", "UNH", "PFE", "MRK", "ABBV", "LLY", "TMO",
-    # Consumer
-    "PG", "KO", "PEP", "WMT", "HD", "MCD", "NKE", "SBUX",
-    # Energy
-    "XOM", "CVX", "COP", "SLB",
-    # Industrial
-    "CAT", "BA", "GE", "HON", "UPS", "RTX",
-    # ETFs
-    "SPY", "QQQ", "IWM", "DIA"
+    # Mega Cap (10)
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "UNH",
+    # Large Cap (10)
+    "XOM", "JNJ", "WMT", "PG", "HD", "BAC", "KO", "PFE", "MRK", "ABBV",
+    # ETFs (10)
+    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "GLD", "TLT"
 ]

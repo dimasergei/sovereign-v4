@@ -189,8 +189,9 @@ impl AlpacaBroker {
     /// Fetch all available daily bars for a symbol
     /// Alpaca returns up to 10000 bars - we take whatever they give
     pub async fn get_all_daily_bars(&self, symbol: &str) -> Result<Vec<HistoricalBar>> {
+        // Use 1900-01-01 to mean "give me everything" - Alpaca returns from their actual start (~2016)
         let url = format!(
-            "https://data.alpaca.markets/v2/stocks/{}/bars?timeframe=1Day&limit=10000",
+            "https://data.alpaca.markets/v2/stocks/{}/bars?timeframe=1Day&start=1900-01-01&limit=10000",
             symbol
         );
 
