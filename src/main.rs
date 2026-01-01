@@ -667,11 +667,11 @@ async fn process_bar_signal(
         if let Some(sig) = signal {
             if portfolio.should_execute(&sig) {
                 info!("{}", SEP);
-                info!("SIGNAL: {} {} @ {:.2}", sig.signal, sig.symbol, sig.price);
+                info!("SIGNAL: {} {} @ {:.2} (volume rank #{})", sig.signal, sig.symbol, sig.price, sig.volume_rank);
                 info!("Reason: {}", sig.reason);
                 info!("{}", SEP);
 
-                let qty = portfolio.calculate_position_size(sig.price, sig.volume_ratio);
+                let qty = portfolio.calculate_position_size(sig.price, sig.volume_rank);
                 execute_alpaca_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
             } else {
                 info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
@@ -727,11 +727,11 @@ async fn process_bar_signal_ibkr(
         if let Some(sig) = signal {
             if portfolio.should_execute(&sig) {
                 info!("{}", SEP);
-                info!("SIGNAL: {} {} @ {:.2}", sig.signal, sig.symbol, sig.price);
+                info!("SIGNAL: {} {} @ {:.2} (volume rank #{})", sig.signal, sig.symbol, sig.price, sig.volume_rank);
                 info!("Reason: {}", sig.reason);
                 info!("{}", SEP);
 
-                let qty = portfolio.calculate_position_size(sig.price, sig.volume_ratio);
+                let qty = portfolio.calculate_position_size(sig.price, sig.volume_rank);
                 execute_ibkr_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
             } else {
                 info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
