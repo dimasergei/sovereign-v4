@@ -1,8 +1,9 @@
 //! Broker Module
 //!
-//! Alpaca broker integration.
+//! Broker integrations: IBKR and Alpaca.
 
 pub mod alpaca;
+pub mod ibkr;
 
 use rust_decimal::Decimal;
 use async_trait::async_trait;

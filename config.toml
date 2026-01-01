@@ -13,9 +13,13 @@ name = "Sovereign v4"
 log_level = "info"
 
 [broker]
-type = "alpaca"
-paper = true
+type = "ibkr"
 
+[ibkr]
+gateway_url = "https://localhost:5000"
+account_id = "DUN286302"
+
+# Alpaca config (kept for reference, not active)
 [alpaca]
 api_key = "PK6EKLWAERUJ65TSHB2WL43GL4"
 secret_key = "4G3EpmNRnLaFarKnnsfXCeNnFgZJxibvH1RtgdYt48Nq"
@@ -30,13 +34,43 @@ chat_id = "7898079111"
 initial_balance = 100000
 
 # Trading universe - each symbol is traded by an independent agent
-# Limited to 30 symbols for Alpaca IEX feed
+# No symbol limit with IBKR - expanded to 100+ liquid stocks
 [universe]
 symbols = [
-    # Mega Cap (10)
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "UNH",
-    # Large Cap (10)
-    "XOM", "JNJ", "WMT", "PG", "HD", "BAC", "KO", "PFE", "MRK", "ABBV",
-    # ETFs (10)
-    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "GLD", "TLT"
+    # === MEGA CAP (20) ===
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK.B", "JPM", "V",
+    "UNH", "XOM", "JNJ", "WMT", "MA", "PG", "HD", "CVX", "MRK", "ABBV",
+
+    # === LARGE CAP TECH (15) ===
+    "AVGO", "ORCL", "CRM", "ADBE", "AMD", "CSCO", "INTC", "QCOM", "TXN", "IBM",
+    "NOW", "INTU", "AMAT", "MU", "LRCX",
+
+    # === FINANCE (15) ===
+    "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW", "AXP", "SPGI", "CB",
+    "MMC", "PGR", "AON", "TRV", "MET",
+
+    # === HEALTHCARE (15) ===
+    "LLY", "PFE", "TMO", "ABT", "DHR", "BMY", "AMGN", "GILD", "VRTX", "REGN",
+    "ISRG", "MDT", "SYK", "ZTS", "BDX",
+
+    # === CONSUMER (15) ===
+    "KO", "PEP", "COST", "MCD", "NKE", "SBUX", "TGT", "LOW", "TJX", "EL",
+    "CL", "KMB", "GIS", "K", "HSY",
+
+    # === INDUSTRIALS (15) ===
+    "CAT", "BA", "GE", "HON", "UPS", "RTX", "LMT", "DE", "UNP", "MMM",
+    "FDX", "EMR", "ITW", "ETN", "PH",
+
+    # === ENERGY (10) ===
+    "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY", "KMI", "WMB", "HAL",
+
+    # === MATERIALS (5) ===
+    "LIN", "APD", "SHW", "ECL", "NEM",
+
+    # === REITS (5) ===
+    "PLD", "AMT", "EQIX", "CCI", "PSA",
+
+    # === ETFS (15) ===
+    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "XLI", "XLP",
+    "XLY", "XLU", "XLB", "GLD", "TLT"
 ]

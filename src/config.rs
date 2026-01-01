@@ -17,6 +17,8 @@ pub struct Config {
     #[serde(default)]
     pub alpaca: Option<AlpacaConfig>,
     #[serde(default)]
+    pub ibkr: Option<IbkrConfig>,
+    #[serde(default)]
     pub telegram: TelegramConfig,
     #[serde(default)]
     pub portfolio: PortfolioConfig,
@@ -50,6 +52,12 @@ fn default_broker_type() -> String {
 pub struct AlpacaConfig {
     pub api_key: String,
     pub secret_key: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct IbkrConfig {
+    pub gateway_url: String,
+    pub account_id: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -88,11 +96,19 @@ impl Config {
     }
 
     pub fn is_alpaca(&self) -> bool {
-        self.alpaca.is_some()
+        self.broker.broker_type == "alpaca"
+    }
+
+    pub fn is_ibkr(&self) -> bool {
+        self.broker.broker_type == "ibkr"
     }
 
     pub fn alpaca_config(&self) -> Option<&AlpacaConfig> {
         self.alpaca.as_ref()
+    }
+
+    pub fn ibkr_config(&self) -> Option<&IbkrConfig> {
+        self.ibkr.as_ref()
     }
 }
 

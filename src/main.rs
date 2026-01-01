@@ -14,6 +14,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rust_decimal::prelude::{ToPrimitive, FromPrimitive};
 use std::collections::HashMap;
+use std::sync::Arc;
 use chrono::{Utc, Weekday, Timelike, Datelike};
 
 mod core;
@@ -31,6 +32,7 @@ use crate::portfolio::{Portfolio, PortfolioPosition};
 use crate::data::alpaca_stream::{self, AlpacaMessage};
 use crate::data::database::TradeDb;
 use crate::broker::alpaca::AlpacaBroker;
+use crate::broker::ibkr::IbkrBroker;
 use crate::comms::telegram;
 use crate::config::Config;
 
@@ -81,6 +83,12 @@ impl AlertManager {
     }
 }
 
+/// Broker type enum for runtime dispatch
+enum BrokerType {
+    Alpaca(AlpacaBroker),
+    Ibkr(Arc<IbkrBroker>),
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load configuration
@@ -111,28 +119,54 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Get Alpaca config
-    let alpaca_cfg = cfg.alpaca.clone().expect("Alpaca config required");
+    // Initialize broker based on config
+    let broker_type = if cfg.is_ibkr() {
+        let ibkr_cfg = cfg.ibkr_config().expect("IBKR config required");
+        let broker = IbkrBroker::new(
+            ibkr_cfg.gateway_url.clone(),
+            ibkr_cfg.account_id.clone(),
+        )?;
+        info!("Broker: IBKR Client Portal (account: {})", ibkr_cfg.account_id);
+        BrokerType::Ibkr(Arc::new(broker))
+    } else {
+        let alpaca_cfg = cfg.alpaca.clone().expect("Alpaca config required");
+        let broker = AlpacaBroker::new(
+            alpaca_cfg.api_key.clone(),
+            alpaca_cfg.secret_key.clone(),
+            cfg.broker.paper,
+        );
+        info!("Broker: Alpaca (paper={})", cfg.broker.paper);
+        BrokerType::Alpaca(broker)
+    };
 
-    // Initialize broker
-    let broker = AlpacaBroker::new(
-        alpaca_cfg.api_key.clone(),
-        alpaca_cfg.secret_key.clone(),
-        cfg.broker.paper,
-    );
-
-    // Get account info
+    // Get account info and initial balance
     let mut initial_balance = dec!(100000);
-    match broker.get_account().await {
-        Ok(account) => {
-            info!("Alpaca Account: ${} equity, ${} cash, ${} buying power",
-                account.equity, account.cash, account.buying_power);
-            if let Ok(eq) = account.equity.parse::<f64>() {
-                initial_balance = Decimal::from_f64(eq).unwrap_or(dec!(100000));
+    match &broker_type {
+        BrokerType::Alpaca(broker) => {
+            match broker.get_account().await {
+                Ok(account) => {
+                    info!("Account: ${} equity, ${} cash, ${} buying power",
+                        account.equity, account.cash, account.buying_power);
+                    if let Ok(eq) = account.equity.parse::<f64>() {
+                        initial_balance = Decimal::from_f64(eq).unwrap_or(dec!(100000));
+                    }
+                }
+                Err(e) => warn!("Failed to get account info: {}", e),
             }
         }
-        Err(e) => {
-            warn!("Failed to get account info: {}", e);
+        BrokerType::Ibkr(broker) => {
+            match broker.get_account().await {
+                Ok(summary) => {
+                    if let Some(nl) = &summary.net_liquidation {
+                        info!("Account: ${:.2} net liquidation", nl.amount);
+                        initial_balance = Decimal::from_f64(nl.amount).unwrap_or(dec!(100000));
+                    }
+                    if let Some(bp) = &summary.buying_power {
+                        info!("Buying Power: ${:.2}", bp.amount);
+                    }
+                }
+                Err(e) => warn!("Failed to get account info: {}", e),
+            }
         }
     }
 
@@ -144,30 +178,49 @@ async fn main() -> Result<()> {
     // Initialize agents (one per symbol)
     let mut agents: HashMap<String, SymbolAgent> = HashMap::new();
     for sym in &symbols {
-        // Start with estimated price - will be refined by historical data
         let agent = SymbolAgent::new(sym.clone(), dec!(100));
         agents.insert(sym.clone(), agent);
     }
     info!("Agents: {} created, bootstrapping with historical data...", agents.len());
 
     // Bootstrap each agent with historical S/R data
-    for sym in &symbols {
-        match broker.get_all_daily_bars(sym).await {
-            Ok(bars) => {
-                if let Some(agent) = agents.get_mut(sym) {
-                    for bar in &bars {
-                        // Feed through existing S/R algorithm - no changes to sr.rs
-                        let open = Decimal::from_f64(bar.open).unwrap_or(dec!(0));
-                        let high = Decimal::from_f64(bar.high).unwrap_or(dec!(0));
-                        let low = Decimal::from_f64(bar.low).unwrap_or(dec!(0));
-                        let close = Decimal::from_f64(bar.close).unwrap_or(dec!(0));
-                        agent.bootstrap_bar(open, high, low, close, bar.volume);
+    match &broker_type {
+        BrokerType::Alpaca(broker) => {
+            for sym in &symbols {
+                match broker.get_all_daily_bars(sym).await {
+                    Ok(bars) => {
+                        if let Some(agent) = agents.get_mut(sym) {
+                            for bar in &bars {
+                                let open = Decimal::from_f64(bar.open).unwrap_or(dec!(0));
+                                let high = Decimal::from_f64(bar.high).unwrap_or(dec!(0));
+                                let low = Decimal::from_f64(bar.low).unwrap_or(dec!(0));
+                                let close = Decimal::from_f64(bar.close).unwrap_or(dec!(0));
+                                agent.bootstrap_bar(open, high, low, close, bar.volume);
+                            }
+                            info!("{}: Bootstrapped S/R from {} historical bars", sym, bars.len());
+                        }
                     }
-                    info!("{}: Bootstrapped S/R from {} historical bars", sym, bars.len());
+                    Err(e) => warn!("{}: Failed to fetch historical bars: {}", sym, e),
                 }
             }
-            Err(e) => {
-                warn!("{}: Failed to fetch historical bars: {}", sym, e);
+        }
+        BrokerType::Ibkr(broker) => {
+            for sym in &symbols {
+                match broker.get_all_daily_bars(sym).await {
+                    Ok(bars) => {
+                        if let Some(agent) = agents.get_mut(sym) {
+                            for bar in &bars {
+                                let open = Decimal::from_f64(bar.open).unwrap_or(dec!(0));
+                                let high = Decimal::from_f64(bar.high).unwrap_or(dec!(0));
+                                let low = Decimal::from_f64(bar.low).unwrap_or(dec!(0));
+                                let close = Decimal::from_f64(bar.close).unwrap_or(dec!(0));
+                                agent.bootstrap_bar(open, high, low, close, bar.volume);
+                            }
+                            info!("{}: Bootstrapped S/R from {} historical bars", sym, bars.len());
+                        }
+                    }
+                    Err(e) => warn!("{}: Failed to fetch historical bars: {}", sym, e),
+                }
             }
         }
     }
@@ -177,6 +230,73 @@ async fn main() -> Result<()> {
     let mut portfolio = Portfolio::new(initial_balance);
 
     // Recover existing positions
+    match &broker_type {
+        BrokerType::Alpaca(broker) => {
+            recover_alpaca_positions(broker, &mut portfolio, &mut agents).await;
+        }
+        BrokerType::Ibkr(broker) => {
+            recover_ibkr_positions(broker, &mut portfolio, &mut agents).await;
+        }
+    }
+
+    // Send startup notification
+    if cfg.telegram.enabled {
+        telegram::send_startup().await;
+    }
+
+    // Initialize health monitoring
+    let mut health = HealthMonitor::new();
+    let mut last_health_check = std::time::Instant::now();
+    let mut last_tickle = std::time::Instant::now();
+    let mut alert_manager = AlertManager::new();
+
+    // Counters
+    let mut tick_count = 0u64;
+    let mut bar_count = 0u64;
+
+    let telegram_enabled = cfg.telegram.enabled;
+
+    info!("Strategy: Lossless S/R + Volume Capitulation");
+    info!("Portfolio: Max {:.0}% exposure per side, ~{:.0}% per position",
+        portfolio::MAX_EXPOSURE_PER_SIDE * 100.0,
+        portfolio::POSITION_SIZE_PCT * 100.0);
+    info!("Health: Bar-based monitoring (90s timeout)");
+    info!("Market Status: {}", if is_market_open() { "OPEN" } else { "CLOSED" });
+
+    // Run appropriate event loop based on broker
+    match broker_type {
+        BrokerType::Alpaca(broker) => {
+            run_alpaca_loop(
+                broker,
+                cfg,
+                &mut agents,
+                &mut portfolio,
+                &mut health,
+                &mut alert_manager,
+                telegram_enabled,
+            ).await
+        }
+        BrokerType::Ibkr(broker) => {
+            run_ibkr_loop(
+                broker,
+                cfg,
+                &mut agents,
+                &mut portfolio,
+                &mut health,
+                &mut alert_manager,
+                &mut last_tickle,
+                telegram_enabled,
+            ).await
+        }
+    }
+}
+
+/// Recover positions from Alpaca
+async fn recover_alpaca_positions(
+    broker: &AlpacaBroker,
+    portfolio: &mut Portfolio,
+    agents: &mut HashMap<String, SymbolAgent>,
+) {
     match broker.get_positions().await {
         Ok(positions) => {
             if !positions.is_empty() {
@@ -186,7 +306,6 @@ async fn main() -> Result<()> {
                     info!("  {} {} shares @ ${} | P&L: ${}",
                         pos.symbol, pos.qty, pos.avg_entry_price, pos.unrealized_pl);
 
-                    // Add to portfolio
                     let side = if pos.side == "long" { Side::Long } else { Side::Short };
                     let qty: Decimal = pos.qty.parse().unwrap_or(Decimal::ZERO);
                     let entry_price: Decimal = pos.avg_entry_price.parse().unwrap_or(Decimal::ZERO);
@@ -202,7 +321,6 @@ async fn main() -> Result<()> {
                         market_value,
                     });
 
-                    // Sync agent state
                     if let Some(agent) = agents.get_mut(&pos.symbol) {
                         agent.set_position(Some(Position {
                             side,
@@ -217,33 +335,80 @@ async fn main() -> Result<()> {
                 info!("No existing positions to recover");
             }
         }
-        Err(e) => {
-            warn!("Failed to get positions: {}", e);
+        Err(e) => warn!("Failed to get positions: {}", e),
+    }
+}
+
+/// Recover positions from IBKR
+async fn recover_ibkr_positions(
+    broker: &IbkrBroker,
+    portfolio: &mut Portfolio,
+    agents: &mut HashMap<String, SymbolAgent>,
+) {
+    match broker.get_positions().await {
+        Ok(positions) => {
+            if !positions.is_empty() {
+                info!("{}", SEP);
+                info!("RECOVERING {} EXISTING POSITION(S):", positions.len());
+                for pos in &positions {
+                    let symbol = pos.contract_desc.clone().unwrap_or_default();
+                    info!("  {} {:.0} shares @ ${:.2} | P&L: ${:.2}",
+                        symbol, pos.position.abs(), pos.avg_cost,
+                        pos.unrealized_pnl.unwrap_or(0.0));
+
+                    let side = if pos.position >= 0.0 { Side::Long } else { Side::Short };
+                    let qty = Decimal::from_f64(pos.position.abs()).unwrap_or(Decimal::ZERO);
+                    let entry_price = Decimal::from_f64(pos.avg_cost).unwrap_or(Decimal::ZERO);
+                    let market_value = qty * entry_price;
+
+                    portfolio.add_position(PortfolioPosition {
+                        symbol: symbol.clone(),
+                        side,
+                        quantity: qty,
+                        entry_price,
+                        current_price: entry_price,
+                        entry_time: Utc::now(),
+                        market_value,
+                    });
+
+                    if let Some(agent) = agents.get_mut(&symbol) {
+                        agent.set_position(Some(Position {
+                            side,
+                            entry_price,
+                            entry_time: Utc::now(),
+                            quantity: qty,
+                        }));
+                    }
+                }
+                info!("{}", SEP);
+            } else {
+                info!("No existing positions to recover");
+            }
         }
+        Err(e) => warn!("Failed to get positions: {}", e),
     }
+}
 
-    // Send startup notification
-    if cfg.telegram.enabled {
-        telegram::send_startup().await;
-    }
-
-    // Setup message channel
+/// Run the Alpaca event loop with WebSocket streaming
+async fn run_alpaca_loop(
+    broker: AlpacaBroker,
+    cfg: Config,
+    agents: &mut HashMap<String, SymbolAgent>,
+    portfolio: &mut Portfolio,
+    health: &mut HealthMonitor,
+    alert_manager: &mut AlertManager,
+    telegram_enabled: bool,
+) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
-    // Initialize health monitoring
-    let mut health = HealthMonitor::new();
-    let mut last_health_check = std::time::Instant::now();
-    let mut alert_manager = AlertManager::new();
-
-    // Counters
-    let mut tick_count = 0u64;
-    let mut bar_count = 0u64;
-
-    // Config copies for closures
-    let telegram_enabled = cfg.telegram.enabled;
+    let alpaca_cfg = cfg.alpaca.clone().expect("Alpaca config required");
     let api_key = alpaca_cfg.api_key.clone();
     let api_secret = alpaca_cfg.secret_key.clone();
-    let symbols_clone = symbols.clone();
+    let symbols_clone: Vec<String> = cfg.universe.symbols.clone();
+
+    let mut last_health_check = std::time::Instant::now();
+    let mut bar_count = 0u64;
+    let mut tick_count = 0u64;
 
     // Spawn WebSocket connection
     tokio::spawn(async move {
@@ -256,13 +421,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("Strategy: Lossless S/R + Volume Capitulation");
-    info!("Portfolio: Max {:.0}% exposure per side, ~{:.0}% per position",
-        portfolio::MAX_EXPOSURE_PER_SIDE * 100.0,
-        portfolio::POSITION_SIZE_PCT * 100.0);
-    info!("Broker: Alpaca (paper={})", cfg.broker.paper);
-    info!("Health: Bar-based monitoring (90s timeout)");
-    info!("Market Status: {}", if is_market_open() { "OPEN" } else { "CLOSED" });
     info!("Waiting for market data...");
 
     // Main event loop
@@ -273,15 +431,10 @@ async fn main() -> Result<()> {
             health.set_market_open(is_market_open());
 
             match health.check() {
-                HealthStatus::Healthy { gaps: _ } => {
-                    alert_manager.reset();
-                }
-                HealthStatus::MarketClosed => {
-                    // No warnings when market closed
-                }
+                HealthStatus::Healthy { gaps: _ } => alert_manager.reset(),
+                HealthStatus::MarketClosed => {}
                 HealthStatus::StaleData { seconds, gaps } => {
                     warn!("HEALTH: No bars for {}s (gap #{})", seconds, gaps);
-
                     if alert_manager.should_alert_gap() && telegram_enabled {
                         let _ = telegram::send(&format!(
                             "Data gap: {}s without bars (gap #{}) - Market: {}",
@@ -293,10 +446,7 @@ async fn main() -> Result<()> {
         }
 
         // Process messages
-        match tokio::time::timeout(
-            tokio::time::Duration::from_millis(100),
-            rx.recv()
-        ).await {
+        match tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await {
             Ok(Some(msg)) => {
                 match msg {
                     AlpacaMessage::Connected => {
@@ -304,11 +454,9 @@ async fn main() -> Result<()> {
                     }
                     AlpacaMessage::Tick(tick) => {
                         tick_count += 1;
-                        // Update portfolio prices
                         if let Some(price) = Decimal::from_f64(tick.bid.to_f64().unwrap_or(0.0)) {
                             portfolio.update_price(&tick.symbol, price);
                         }
-
                         if tick_count % 100 == 0 {
                             info!("Tick #{}: {} bid={} ask={}", tick_count, tick.symbol, tick.bid, tick.ask);
                         }
@@ -318,173 +466,19 @@ async fn main() -> Result<()> {
                         health.record_bar();
                         alert_manager.reset();
 
-                        // Log bar
-                        info!("{}", SEP);
-                        info!("BAR #{}: {} | O={} H={} L={} C={} V={}",
-                            bar_count, bar.symbol, bar.open, bar.high, bar.low, bar.close, bar.volume);
-
-                        // Process through agent
-                        if let Some(agent) = agents.get_mut(&bar.symbol) {
-                            let signal = agent.process_bar(
-                                Utc::now(),
-                                bar.open,
-                                bar.high,
-                                bar.low,
-                                bar.close,
-                                bar.volume as u64,
-                            );
-
-                            // Log S/R levels
-                            if let (Some(support), Some(resistance)) = (agent.support(), agent.resistance()) {
-                                info!("S/R: Support={:.2} | Resistance={:.2}", support, resistance);
-                            }
-                            info!("Agent: {} bars processed, {} S/R levels tracked",
-                                agent.bar_count(), agent.sr_level_count());
-                            info!("Portfolio: {} | Positions: {}",
-                                portfolio.exposure_summary(), portfolio.position_count());
-
-                            // Check for signals
-                            if !is_market_open() {
-                                info!("Signal: HOLD | Market closed");
-                                info!("{}", SEP);
-                                continue;
-                            }
-
-                            if let Some(sig) = signal {
-                                // Check portfolio constraints
-                                if portfolio.should_execute(&sig) {
-                                    info!("{}", SEP);
-                                    info!("SIGNAL: {} {} @ {:.2}", sig.signal, sig.symbol, sig.price);
-                                    info!("Reason: {}", sig.reason);
-                                    if let Some(s) = sig.support {
-                                        info!("Support: {:.2}", s);
-                                    }
-                                    if let Some(r) = sig.resistance {
-                                        info!("Resistance: {:.2}", r);
-                                    }
-                                    info!("{}", SEP);
-
-                                    // Execute trade
-                                    let qty = portfolio.calculate_position_size(sig.price);
-
-                                    match sig.signal {
-                                        Signal::Buy => {
-                                            // Use resistance as take profit
-                                            let tp = sig.resistance;
-                                            let sl = sig.support.map(|s| s - (sig.price - s) * dec!(0.5));
-
-                                            match broker.buy(&sig.symbol, qty, sl, tp).await {
-                                                Ok(order) => {
-                                                    info!("BUY ORDER: {} qty={} status={}", order.id, qty, order.status);
-
-                                                    // Add to portfolio
-                                                    portfolio.add_position(PortfolioPosition {
-                                                        symbol: sig.symbol.clone(),
-                                                        side: Side::Long,
-                                                        quantity: qty,
-                                                        entry_price: sig.price,
-                                                        current_price: sig.price,
-                                                        entry_time: Utc::now(),
-                                                        market_value: qty * sig.price,
-                                                    });
-
-                                                    if telegram_enabled {
-                                                        telegram::send_signal(
-                                                            "BUY",
-                                                            &sig.price.to_string(),
-                                                            &sl.map_or("N/A".to_string(), |s| s.to_string()),
-                                                            &tp.map_or("N/A".to_string(), |t| t.to_string()),
-                                                            100,
-                                                        ).await;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!("Buy failed: {}", e);
-                                                    // Rollback agent position
-                                                    agent.close_position();
-                                                }
-                                            }
-                                        }
-                                        Signal::Sell => {
-                                            // Close long position
-                                            match broker.close_position(&sig.symbol).await {
-                                                Ok(order) => {
-                                                    info!("SELL ORDER: {} status={}", order.id, order.status);
-                                                    portfolio.remove_position(&sig.symbol);
-
-                                                    if telegram_enabled {
-                                                        telegram::send(&format!(
-                                                            "SELL {} @ {:.2} - {}",
-                                                            sig.symbol, sig.price, sig.reason
-                                                        )).await;
-                                                    }
-                                                }
-                                                Err(e) => warn!("Sell failed: {}", e),
-                                            }
-                                        }
-                                        Signal::Short => {
-                                            // Use support as take profit
-                                            let tp = sig.support;
-                                            let sl = sig.resistance.map(|r| r + (r - sig.price) * dec!(0.5));
-
-                                            match broker.sell(&sig.symbol, qty, sl, tp).await {
-                                                Ok(order) => {
-                                                    info!("SHORT ORDER: {} qty={} status={}", order.id, qty, order.status);
-
-                                                    portfolio.add_position(PortfolioPosition {
-                                                        symbol: sig.symbol.clone(),
-                                                        side: Side::Short,
-                                                        quantity: qty,
-                                                        entry_price: sig.price,
-                                                        current_price: sig.price,
-                                                        entry_time: Utc::now(),
-                                                        market_value: qty * sig.price,
-                                                    });
-
-                                                    if telegram_enabled {
-                                                        telegram::send_signal(
-                                                            "SHORT",
-                                                            &sig.price.to_string(),
-                                                            &sl.map_or("N/A".to_string(), |s| s.to_string()),
-                                                            &tp.map_or("N/A".to_string(), |t| t.to_string()),
-                                                            100,
-                                                        ).await;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!("Short failed: {}", e);
-                                                    agent.close_position();
-                                                }
-                                            }
-                                        }
-                                        Signal::Cover => {
-                                            // Close short position
-                                            match broker.close_position(&sig.symbol).await {
-                                                Ok(order) => {
-                                                    info!("COVER ORDER: {} status={}", order.id, order.status);
-                                                    portfolio.remove_position(&sig.symbol);
-
-                                                    if telegram_enabled {
-                                                        telegram::send(&format!(
-                                                            "COVER {} @ {:.2} - {}",
-                                                            sig.symbol, sig.price, sig.reason
-                                                        )).await;
-                                                    }
-                                                }
-                                                Err(e) => warn!("Cover failed: {}", e),
-                                            }
-                                        }
-                                        Signal::Hold => {}
-                                    }
-                                } else {
-                                    info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
-                                }
-                            } else {
-                                info!("Signal: HOLD | No opportunity");
-                            }
-                        }
-
-                        info!("{}", SEP);
+                        process_bar_signal(
+                            &bar.symbol,
+                            bar.open,
+                            bar.high,
+                            bar.low,
+                            bar.close,
+                            bar.volume as u64,
+                            bar_count,
+                            agents,
+                            portfolio,
+                            &broker,
+                            telegram_enabled,
+                        ).await;
                     }
                     AlpacaMessage::Error(err) => {
                         warn!("Alpaca error: {}", err);
@@ -495,11 +489,406 @@ async fn main() -> Result<()> {
                 warn!("Channel closed. Exiting.");
                 break;
             }
-            Err(_) => {
-                // Timeout - continue loop for health checks
-            }
+            Err(_) => {}
         }
     }
 
     Ok(())
+}
+
+/// Run the IBKR event loop with polling
+async fn run_ibkr_loop(
+    broker: Arc<IbkrBroker>,
+    cfg: Config,
+    agents: &mut HashMap<String, SymbolAgent>,
+    portfolio: &mut Portfolio,
+    health: &mut HealthMonitor,
+    alert_manager: &mut AlertManager,
+    last_tickle: &mut std::time::Instant,
+    telegram_enabled: bool,
+) -> Result<()> {
+    let symbols: Vec<String> = cfg.universe.symbols.clone();
+    let mut last_health_check = std::time::Instant::now();
+    let mut last_data_poll = std::time::Instant::now();
+    let mut bar_count = 0u64;
+
+    info!("IBKR mode: Polling for market data every 60 seconds");
+    info!("Waiting for market data...");
+
+    loop {
+        // Session keep-alive every 60 seconds
+        if last_tickle.elapsed().as_secs() >= 60 {
+            *last_tickle = std::time::Instant::now();
+            if let Err(e) = broker.tickle().await {
+                warn!("Session tickle failed: {}", e);
+            }
+        }
+
+        // Health check every 10 seconds
+        if last_health_check.elapsed().as_secs() >= 10 {
+            last_health_check = std::time::Instant::now();
+            health.set_market_open(is_market_open());
+
+            match health.check() {
+                HealthStatus::Healthy { gaps: _ } => alert_manager.reset(),
+                HealthStatus::MarketClosed => {}
+                HealthStatus::StaleData { seconds, gaps } => {
+                    warn!("HEALTH: No bars for {}s (gap #{})", seconds, gaps);
+                    if alert_manager.should_alert_gap() && telegram_enabled {
+                        let _ = telegram::send(&format!(
+                            "Data gap: {}s without bars (gap #{}) - Market: {}",
+                            seconds, gaps, if is_market_open() { "OPEN" } else { "CLOSED" }
+                        )).await;
+                    }
+                }
+            }
+        }
+
+        // Poll for new data every 60 seconds during market hours
+        if last_data_poll.elapsed().as_secs() >= 60 && is_market_open() {
+            last_data_poll = std::time::Instant::now();
+
+            // Get latest bar for each symbol
+            for sym in &symbols {
+                match broker.get_historical_bars(sym, "1d", "1d").await {
+                    Ok(bars) => {
+                        if let Some(bar) = bars.last() {
+                            bar_count += 1;
+                            health.record_bar();
+                            alert_manager.reset();
+
+                            process_bar_signal_ibkr(
+                                sym,
+                                bar.open,
+                                bar.high,
+                                bar.low,
+                                bar.close,
+                                bar.volume,
+                                bar_count,
+                                agents,
+                                portfolio,
+                                &broker,
+                                telegram_enabled,
+                            ).await;
+                        }
+                    }
+                    Err(e) => warn!("{}: Failed to get latest bar: {}", sym, e),
+                }
+            }
+        }
+
+        // Small sleep to prevent busy loop
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Process a bar and generate/execute signals (Alpaca version)
+async fn process_bar_signal(
+    symbol: &str,
+    open: Decimal,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+    volume: u64,
+    bar_count: u64,
+    agents: &mut HashMap<String, SymbolAgent>,
+    portfolio: &mut Portfolio,
+    broker: &AlpacaBroker,
+    telegram_enabled: bool,
+) {
+    info!("{}", SEP);
+    info!("BAR #{}: {} | O={} H={} L={} C={} V={}",
+        bar_count, symbol, open, high, low, close, volume);
+
+    if let Some(agent) = agents.get_mut(symbol) {
+        let signal = agent.process_bar(Utc::now(), open, high, low, close, volume);
+
+        if let (Some(support), Some(resistance)) = (agent.support(), agent.resistance()) {
+            info!("S/R: Support={:.2} | Resistance={:.2}", support, resistance);
+        }
+        info!("Agent: {} bars processed, {} S/R levels tracked",
+            agent.bar_count(), agent.sr_level_count());
+        info!("Portfolio: {} | Positions: {}",
+            portfolio.exposure_summary(), portfolio.position_count());
+
+        if !is_market_open() {
+            info!("Signal: HOLD | Market closed");
+            info!("{}", SEP);
+            return;
+        }
+
+        if let Some(sig) = signal {
+            if portfolio.should_execute(&sig) {
+                info!("{}", SEP);
+                info!("SIGNAL: {} {} @ {:.2}", sig.signal, sig.symbol, sig.price);
+                info!("Reason: {}", sig.reason);
+                info!("{}", SEP);
+
+                let qty = portfolio.calculate_position_size(sig.price);
+                execute_alpaca_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
+            } else {
+                info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
+            }
+        } else {
+            info!("Signal: HOLD | No opportunity");
+        }
+    }
+
+    info!("{}", SEP);
+}
+
+/// Process a bar and generate/execute signals (IBKR version)
+async fn process_bar_signal_ibkr(
+    symbol: &str,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: u64,
+    bar_count: u64,
+    agents: &mut HashMap<String, SymbolAgent>,
+    portfolio: &mut Portfolio,
+    broker: &IbkrBroker,
+    telegram_enabled: bool,
+) {
+    let open = Decimal::from_f64(open).unwrap_or(dec!(0));
+    let high = Decimal::from_f64(high).unwrap_or(dec!(0));
+    let low = Decimal::from_f64(low).unwrap_or(dec!(0));
+    let close = Decimal::from_f64(close).unwrap_or(dec!(0));
+
+    info!("{}", SEP);
+    info!("BAR #{}: {} | O={} H={} L={} C={} V={}",
+        bar_count, symbol, open, high, low, close, volume);
+
+    if let Some(agent) = agents.get_mut(symbol) {
+        let signal = agent.process_bar(Utc::now(), open, high, low, close, volume);
+
+        if let (Some(support), Some(resistance)) = (agent.support(), agent.resistance()) {
+            info!("S/R: Support={:.2} | Resistance={:.2}", support, resistance);
+        }
+        info!("Agent: {} bars processed, {} S/R levels tracked",
+            agent.bar_count(), agent.sr_level_count());
+        info!("Portfolio: {} | Positions: {}",
+            portfolio.exposure_summary(), portfolio.position_count());
+
+        if !is_market_open() {
+            info!("Signal: HOLD | Market closed");
+            info!("{}", SEP);
+            return;
+        }
+
+        if let Some(sig) = signal {
+            if portfolio.should_execute(&sig) {
+                info!("{}", SEP);
+                info!("SIGNAL: {} {} @ {:.2}", sig.signal, sig.symbol, sig.price);
+                info!("Reason: {}", sig.reason);
+                info!("{}", SEP);
+
+                let qty = portfolio.calculate_position_size(sig.price);
+                execute_ibkr_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
+            } else {
+                info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
+            }
+        } else {
+            info!("Signal: HOLD | No opportunity");
+        }
+    }
+
+    info!("{}", SEP);
+}
+
+/// Execute a trading signal via Alpaca
+async fn execute_alpaca_signal(
+    sig: &AgentSignal,
+    qty: Decimal,
+    agent: &mut SymbolAgent,
+    portfolio: &mut Portfolio,
+    broker: &AlpacaBroker,
+    telegram_enabled: bool,
+) {
+    match sig.signal {
+        Signal::Buy => {
+            let tp = sig.resistance;
+            let sl = sig.support.map(|s| s - (sig.price - s) * dec!(0.5));
+
+            match broker.buy(&sig.symbol, qty, sl, tp).await {
+                Ok(order) => {
+                    info!("BUY ORDER: {} qty={} status={}", order.id, qty, order.status);
+
+                    portfolio.add_position(PortfolioPosition {
+                        symbol: sig.symbol.clone(),
+                        side: Side::Long,
+                        quantity: qty,
+                        entry_price: sig.price,
+                        current_price: sig.price,
+                        entry_time: Utc::now(),
+                        market_value: qty * sig.price,
+                    });
+
+                    if telegram_enabled {
+                        telegram::send_signal(
+                            "BUY", &sig.price.to_string(),
+                            &sl.map_or("N/A".to_string(), |s| s.to_string()),
+                            &tp.map_or("N/A".to_string(), |t| t.to_string()),
+                            100,
+                        ).await;
+                    }
+                }
+                Err(e) => {
+                    warn!("Buy failed: {}", e);
+                    agent.close_position();
+                }
+            }
+        }
+        Signal::Sell => {
+            match broker.close_position(&sig.symbol).await {
+                Ok(order) => {
+                    info!("SELL ORDER: {} status={}", order.id, order.status);
+                    portfolio.remove_position(&sig.symbol);
+                    if telegram_enabled {
+                        let _ = telegram::send(&format!("SELL {} @ {:.2} - {}", sig.symbol, sig.price, sig.reason)).await;
+                    }
+                }
+                Err(e) => warn!("Sell failed: {}", e),
+            }
+        }
+        Signal::Short => {
+            let tp = sig.support;
+            let sl = sig.resistance.map(|r| r + (r - sig.price) * dec!(0.5));
+
+            match broker.sell(&sig.symbol, qty, sl, tp).await {
+                Ok(order) => {
+                    info!("SHORT ORDER: {} qty={} status={}", order.id, qty, order.status);
+
+                    portfolio.add_position(PortfolioPosition {
+                        symbol: sig.symbol.clone(),
+                        side: Side::Short,
+                        quantity: qty,
+                        entry_price: sig.price,
+                        current_price: sig.price,
+                        entry_time: Utc::now(),
+                        market_value: qty * sig.price,
+                    });
+
+                    if telegram_enabled {
+                        telegram::send_signal(
+                            "SHORT", &sig.price.to_string(),
+                            &sl.map_or("N/A".to_string(), |s| s.to_string()),
+                            &tp.map_or("N/A".to_string(), |t| t.to_string()),
+                            100,
+                        ).await;
+                    }
+                }
+                Err(e) => {
+                    warn!("Short failed: {}", e);
+                    agent.close_position();
+                }
+            }
+        }
+        Signal::Cover => {
+            match broker.close_position(&sig.symbol).await {
+                Ok(order) => {
+                    info!("COVER ORDER: {} status={}", order.id, order.status);
+                    portfolio.remove_position(&sig.symbol);
+                    if telegram_enabled {
+                        let _ = telegram::send(&format!("COVER {} @ {:.2} - {}", sig.symbol, sig.price, sig.reason)).await;
+                    }
+                }
+                Err(e) => warn!("Cover failed: {}", e),
+            }
+        }
+        Signal::Hold => {}
+    }
+}
+
+/// Execute a trading signal via IBKR
+async fn execute_ibkr_signal(
+    sig: &AgentSignal,
+    qty: Decimal,
+    agent: &mut SymbolAgent,
+    portfolio: &mut Portfolio,
+    broker: &IbkrBroker,
+    telegram_enabled: bool,
+) {
+    match sig.signal {
+        Signal::Buy => {
+            match broker.buy(&sig.symbol, qty).await {
+                Ok(order) => {
+                    info!("BUY ORDER: {:?} qty={}", order.order_id, qty);
+
+                    portfolio.add_position(PortfolioPosition {
+                        symbol: sig.symbol.clone(),
+                        side: Side::Long,
+                        quantity: qty,
+                        entry_price: sig.price,
+                        current_price: sig.price,
+                        entry_time: Utc::now(),
+                        market_value: qty * sig.price,
+                    });
+
+                    if telegram_enabled {
+                        telegram::send_signal(
+                            "BUY", &sig.price.to_string(), "N/A", "N/A", 100,
+                        ).await;
+                    }
+                }
+                Err(e) => {
+                    warn!("Buy failed: {}", e);
+                    agent.close_position();
+                }
+            }
+        }
+        Signal::Sell => {
+            match broker.close_position(&sig.symbol).await {
+                Ok(order) => {
+                    info!("SELL ORDER: {:?}", order.order_id);
+                    portfolio.remove_position(&sig.symbol);
+                    if telegram_enabled {
+                        let _ = telegram::send(&format!("SELL {} @ {:.2} - {}", sig.symbol, sig.price, sig.reason)).await;
+                    }
+                }
+                Err(e) => warn!("Sell failed: {}", e),
+            }
+        }
+        Signal::Short => {
+            match broker.sell(&sig.symbol, qty).await {
+                Ok(order) => {
+                    info!("SHORT ORDER: {:?} qty={}", order.order_id, qty);
+
+                    portfolio.add_position(PortfolioPosition {
+                        symbol: sig.symbol.clone(),
+                        side: Side::Short,
+                        quantity: qty,
+                        entry_price: sig.price,
+                        current_price: sig.price,
+                        entry_time: Utc::now(),
+                        market_value: qty * sig.price,
+                    });
+
+                    if telegram_enabled {
+                        telegram::send_signal(
+                            "SHORT", &sig.price.to_string(), "N/A", "N/A", 100,
+                        ).await;
+                    }
+                }
+                Err(e) => {
+                    warn!("Short failed: {}", e);
+                    agent.close_position();
+                }
+            }
+        }
+        Signal::Cover => {
+            match broker.close_position(&sig.symbol).await {
+                Ok(order) => {
+                    info!("COVER ORDER: {:?}", order.order_id);
+                    portfolio.remove_position(&sig.symbol);
+                    if telegram_enabled {
+                        let _ = telegram::send(&format!("COVER {} @ {:.2} - {}", sig.symbol, sig.price, sig.reason)).await;
+                    }
+                }
+                Err(e) => warn!("Cover failed: {}", e),
+            }
+        }
+        Signal::Hold => {}
+    }
 }
