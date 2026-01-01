@@ -70,6 +70,7 @@ pub struct AgentSignal {
     pub reason: String,
     pub support: Option<Decimal>,
     pub resistance: Option<Decimal>,
+    pub volume_ratio: f64,  // Signal strength derived from observed volume
 }
 
 /// Independent trading agent for a single symbol
@@ -215,10 +216,11 @@ impl SymbolAgent {
         let support = self.sr.get_support(close);
         let resistance = self.sr.get_resistance(close);
         let avg_volume = self.volume.average();
+        let volume_ratio = self.volume.ratio(volume);
         let price_change = close - open;
 
         // Check for capitulation
-        let is_volume_spike = volume as f64 > avg_volume * 2.0;
+        let is_volume_spike = volume_ratio > 2.0;
         let is_down_day = price_change < Decimal::ZERO;
         let is_up_day = price_change > Decimal::ZERO;
         let is_buy_capitulation = is_volume_spike && is_down_day;
@@ -239,11 +241,12 @@ impl SymbolAgent {
                         signal: Signal::Buy,
                         price: close,
                         reason: format!(
-                            "Volume capitulation at support (vol: {:.0}x avg)",
-                            volume as f64 / avg_volume
+                            "Volume capitulation at support (vol: {:.1}x avg)",
+                            volume_ratio
                         ),
                         support,
                         resistance,
+                        volume_ratio,
                     };
 
                     // Record position
@@ -264,11 +267,12 @@ impl SymbolAgent {
                         signal: Signal::Short,
                         price: close,
                         reason: format!(
-                            "Volume capitulation at resistance (vol: {:.0}x avg)",
-                            volume as f64 / avg_volume
+                            "Volume capitulation at resistance (vol: {:.1}x avg)",
+                            volume_ratio
                         ),
                         support,
                         resistance,
+                        volume_ratio,
                     };
 
                     self.position = Some(Position {
@@ -296,6 +300,7 @@ impl SymbolAgent {
                                 reason: "Price at support level".to_string(),
                                 support,
                                 resistance,
+                                volume_ratio,  // Non-capitulation entry uses current ratio
                             };
 
                             self.position = Some(Position {
@@ -327,6 +332,7 @@ impl SymbolAgent {
                                 ),
                                 support,
                                 resistance,
+                                volume_ratio,  // Exit signal - ratio for reference only
                             };
 
                             self.position = None;
@@ -347,6 +353,7 @@ impl SymbolAgent {
                                 ),
                                 support,
                                 resistance,
+                                volume_ratio,  // Exit signal - ratio for reference only
                             };
 
                             self.position = None;
