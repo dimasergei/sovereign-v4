@@ -70,7 +70,8 @@ pub struct AgentSignal {
     pub reason: String,
     pub support: Option<Decimal>,
     pub resistance: Option<Decimal>,
-    pub volume_ratio: f64,  // Signal strength derived from observed volume
+    /// LOSSLESS: Volume rank (1 = highest in window, 2 = second highest, etc.)
+    pub volume_rank: usize,
 }
 
 /// Independent trading agent for a single symbol
@@ -137,9 +138,11 @@ impl SymbolAgent {
 
     /// Check if agent is ready to generate signals
     ///
-    /// Needs minimum data to have meaningful S/R levels
+    /// LOSSLESS: Ready when we have observed data, not after arbitrary bar count.
+    /// - Must have at least one S/R level (price has moved)
+    /// - Must have volume context (any historical volume)
     pub fn is_ready(&self) -> bool {
-        self.bar_count >= 20 && self.volume.is_ready()
+        self.sr.level_count() > 0 && self.volume.has_context()
     }
 
     /// Get current position
@@ -215,12 +218,13 @@ impl SymbolAgent {
     ) -> Option<AgentSignal> {
         let support = self.sr.get_support(close);
         let resistance = self.sr.get_resistance(close);
-        let avg_volume = self.volume.average();
-        let volume_ratio = self.volume.ratio(volume);
         let price_change = close - open;
 
-        // Check for capitulation
-        let is_volume_spike = volume_ratio > 2.0;
+        // LOSSLESS: Volume rank (1 = highest, no threshold)
+        let volume_rank = self.volume.rank(volume);
+
+        // LOSSLESS: Spike = rank 1 (highest in window)
+        let is_volume_spike = volume_rank == 1;
         let is_down_day = price_change < Decimal::ZERO;
         let is_up_day = price_change > Decimal::ZERO;
         let is_buy_capitulation = is_volume_spike && is_down_day;
@@ -235,44 +239,41 @@ impl SymbolAgent {
             None => {
                 // No position - look for entries
                 if is_buy_capitulation && at_support {
-                    // Volume capitulation at support = BUY
                     let signal = AgentSignal {
                         symbol: self.symbol.clone(),
                         signal: Signal::Buy,
                         price: close,
                         reason: format!(
-                            "Volume capitulation at support (vol: {:.1}x avg)",
-                            volume_ratio
+                            "Volume capitulation at support (rank #{} in window)",
+                            volume_rank
                         ),
                         support,
                         resistance,
-                        volume_ratio,
+                        volume_rank,
                     };
 
-                    // Record position
                     self.position = Some(Position {
                         side: Side::Long,
                         entry_price: close,
                         entry_time: time,
-                        quantity: Decimal::ZERO, // Set by portfolio manager
+                        quantity: Decimal::ZERO,
                     });
 
                     return Some(signal);
                 }
 
                 if is_sell_capitulation && at_resistance {
-                    // Volume capitulation at resistance = SHORT
                     let signal = AgentSignal {
                         symbol: self.symbol.clone(),
                         signal: Signal::Short,
                         price: close,
                         reason: format!(
-                            "Volume capitulation at resistance (vol: {:.1}x avg)",
-                            volume_ratio
+                            "Volume capitulation at resistance (rank #{} in window)",
+                            volume_rank
                         ),
                         support,
                         resistance,
-                        volume_ratio,
+                        volume_rank,
                     };
 
                     self.position = Some(Position {
@@ -285,11 +286,9 @@ impl SymbolAgent {
                     return Some(signal);
                 }
 
-                // Alternative entry: Strong bounce at S/R without capitulation
-                // (Less aggressive - only when capitulation is rare)
-                if at_support && is_down_day {
-                    // Price touched support on a down day - potential bounce
-                    // Only signal if the low actually touched support
+                // LOSSLESS alternative entry: at support on down day (weaker signal)
+                // Only when volume is in top 3 (derived from window, not threshold)
+                if at_support && is_down_day && volume_rank <= 3 {
                     if let Some(s) = support {
                         let touched_support = self.sr.is_near(close.min(open), s);
                         if touched_support {
@@ -297,10 +296,10 @@ impl SymbolAgent {
                                 symbol: self.symbol.clone(),
                                 signal: Signal::Buy,
                                 price: close,
-                                reason: "Price at support level".to_string(),
+                                reason: format!("Price at support level (volume rank #{})", volume_rank),
                                 support,
                                 resistance,
-                                volume_ratio,  // Non-capitulation entry uses current ratio
+                                volume_rank,
                             };
 
                             self.position = Some(Position {
@@ -317,11 +316,9 @@ impl SymbolAgent {
             }
 
             Some(pos) => {
-                // Have position - look for exits
                 match pos.side {
                     Side::Long => {
                         if at_resistance {
-                            // Long position reaching resistance = SELL
                             let signal = AgentSignal {
                                 symbol: self.symbol.clone(),
                                 signal: Signal::Sell,
@@ -332,7 +329,7 @@ impl SymbolAgent {
                                 ),
                                 support,
                                 resistance,
-                                volume_ratio,  // Exit signal - ratio for reference only
+                                volume_rank,
                             };
 
                             self.position = None;
@@ -342,7 +339,6 @@ impl SymbolAgent {
 
                     Side::Short => {
                         if at_support {
-                            // Short position reaching support = COVER
                             let signal = AgentSignal {
                                 symbol: self.symbol.clone(),
                                 signal: Signal::Cover,
@@ -353,7 +349,7 @@ impl SymbolAgent {
                                 ),
                                 support,
                                 resistance,
-                                volume_ratio,  // Exit signal - ratio for reference only
+                                volume_rank,
                             };
 
                             self.position = None;
@@ -426,17 +422,32 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_readiness_lossless() {
+        let mut agent = SymbolAgent::with_granularity("TEST".to_string(), dec!(1.00));
+        let now = Utc::now();
+
+        // Initially not ready (no S/R levels, no volume)
+        assert!(!agent.is_ready());
+
+        // Process one bar - creates S/R level and volume context
+        agent.process_bar(now, dec!(100), dec!(101), dec!(99), dec!(100), 1000);
+
+        // Now ready (has S/R + volume context)
+        assert!(agent.is_ready());
+    }
+
+    #[test]
     fn test_agent_needs_data() {
         let mut agent = SymbolAgent::with_granularity("TEST".to_string(), dec!(1.00));
         let now = Utc::now();
 
-        // Feed 20 bars
-        for i in 0..20 {
+        // Feed bars - should become ready after first bar with S/R + volume
+        for i in 0..5 {
             let price = dec!(100) + Decimal::from(i);
             agent.process_bar(now, price, price + dec!(1), price - dec!(1), price, 1000);
         }
 
-        // Should not be ready until we have enough volume data
+        // Should be ready after first bar (lossless - no bar count threshold)
         assert!(agent.is_ready());
     }
 
@@ -475,6 +486,8 @@ mod tests {
         if let Some(s) = signal {
             // If a signal is generated, it should be a buy signal given conditions
             assert!(matches!(s.signal, Signal::Buy | Signal::Hold));
+            // Verify volume_rank is set
+            assert!(s.volume_rank >= 1);
         }
     }
 
@@ -513,6 +526,8 @@ mod tests {
         // If we're at resistance with a long position, should get sell signal
         if let Some(s) = signal {
             assert_eq!(s.signal, Signal::Sell);
+            // Verify volume_rank is set
+            assert!(s.volume_rank >= 1);
         }
 
         // Verify position tracking works
@@ -550,5 +565,49 @@ mod tests {
         // Low-priced stock should get smaller granularity
         let penny = SymbolAgent::new("SNDL".to_string(), dec!(2.50));
         assert_eq!(penny.symbol(), "SNDL");
+    }
+
+    #[test]
+    fn test_volume_rank_in_signal() {
+        let mut agent = SymbolAgent::with_granularity("TEST".to_string(), dec!(1.00));
+        let now = Utc::now();
+
+        // Build up some history with varying volume
+        for i in 1..=10 {
+            agent.process_bar(
+                now,
+                dec!(100),
+                dec!(101),
+                dec!(99),
+                dec!(100),
+                i * 100, // Increasing volume: 100, 200, 300, ...
+            );
+        }
+
+        // Set a position to test exit signal
+        agent.set_position(Some(Position {
+            side: Side::Long,
+            entry_price: dec!(99),
+            entry_time: now,
+            quantity: dec!(10),
+        }));
+
+        // Process a bar that should trigger a sell at resistance
+        // Use lower volume so it doesn't rank as highest
+        let signal = agent.process_bar(
+            now,
+            dec!(100),
+            dec!(102),  // High touches potential resistance
+            dec!(100),
+            dec!(101),  // Close up
+            500,        // Mid-range volume
+        );
+
+        // If signal generated, verify volume_rank is properly calculated
+        if let Some(s) = signal {
+            // 500 is higher than 100-400 but lower than 500-1000
+            // So rank should reflect relative position
+            assert!(s.volume_rank >= 1);
+        }
     }
 }

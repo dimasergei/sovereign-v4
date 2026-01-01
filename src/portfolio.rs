@@ -199,19 +199,22 @@ impl Portfolio {
     }
 
     /// Calculate position size for a new trade
-    /// Scales with volume ratio (signal strength derived from market data)
-    pub fn calculate_position_size(&self, price: Decimal, volume_ratio: f64) -> Decimal {
+    ///
+    /// LOSSLESS: Scales with volume rank (derived from data, not threshold)
+    /// Rank 1 = highest volume = maximum size
+    /// Lower ranks = proportionally smaller
+    pub fn calculate_position_size(&self, price: Decimal, volume_rank: usize) -> Decimal {
         if price.is_zero() {
             return Decimal::ZERO;
         }
 
-        // Base position value = 7% of equity
+        // Base position value = 7% of equity (portfolio management, not strategy)
         let base_pct = POSITION_SIZE_PCT;
 
-        // Scale based on volume ratio (derived from observed data, not a parameter)
-        // 2x volume = 1.0x base, 4x volume = 1.5x base, 6x volume = 2.0x base
-        // Formula: scale = 1 + (ratio - 2) * 0.25, clamped to [1.0, 2.0]
-        let scale = (1.0 + (volume_ratio - 2.0) * 0.25).clamp(1.0, 2.0);
+        // LOSSLESS: Scale based on rank (derived from data)
+        // Rank 1 = 2.0x, Rank 2 = 1.75x, Rank 3 = 1.5x, Rank 4 = 1.25x, Rank 5+ = 1.0x
+        // Formula: scale = 2.0 - (rank - 1) * 0.25, clamped to [1.0, 2.0]
+        let scale = (2.0 - (volume_rank as f64 - 1.0) * 0.25).clamp(1.0, 2.0);
 
         let position_value = self.equity * Decimal::from_f64(base_pct * scale).unwrap_or(dec!(0.07));
 
@@ -267,27 +270,37 @@ mod tests {
     }
 
     #[test]
-    fn test_position_sizing() {
+    fn test_position_sizing_lossless() {
         let portfolio = Portfolio::new(dec!(100000));
 
-        // Base case: 2x volume ratio = 1.0x scale
-        // 7% of $100k = $7000, at $100/share = 70 shares
-        let size = portfolio.calculate_position_size(dec!(100), 2.0);
-        assert_eq!(size, dec!(70));
+        // Rank 1 (highest) = 2.0x scale
+        // 7% * 2.0 = 14% of $100k = $14000, at $100/share = 140 shares
+        let size_rank1 = portfolio.calculate_position_size(dec!(100), 1);
+        assert_eq!(size_rank1, dec!(140));
 
-        // 4x volume ratio = 1.5x scale
+        // Rank 2 = 1.75x scale
+        // 7% * 1.75 = 12.25% of $100k = $12250, at $100/share = 122.5 shares (rounds to 122)
+        let size_rank2 = portfolio.calculate_position_size(dec!(100), 2);
+        assert_eq!(size_rank2, dec!(122));
+
+        // Rank 3 = 1.5x scale
         // 7% * 1.5 = 10.5% of $100k = $10500, at $100/share = 105 shares
-        let size_high = portfolio.calculate_position_size(dec!(100), 4.0);
-        assert_eq!(size_high, dec!(105));
+        let size_rank3 = portfolio.calculate_position_size(dec!(100), 3);
+        assert_eq!(size_rank3, dec!(105));
 
-        // 6x volume ratio = 2.0x scale (max)
-        // 7% * 2 = 14% of $100k = $14000, at $100/share = 140 shares
-        let size_max = portfolio.calculate_position_size(dec!(100), 6.0);
-        assert_eq!(size_max, dec!(140));
+        // Rank 4 = 1.25x scale
+        // 7% * 1.25 = 8.75% of $100k = $8750, at $100/share = 88 shares (rounded)
+        let size_rank4 = portfolio.calculate_position_size(dec!(100), 4);
+        assert_eq!(size_rank4, dec!(88));
 
-        // Low volume ratio (< 2x) = 1.0x scale (min)
-        let size_low = portfolio.calculate_position_size(dec!(100), 1.0);
-        assert_eq!(size_low, dec!(70));
+        // Rank 5+ = 1.0x scale (minimum)
+        // 7% * 1.0 = 7% of $100k = $7000, at $100/share = 70 shares
+        let size_rank5 = portfolio.calculate_position_size(dec!(100), 5);
+        assert_eq!(size_rank5, dec!(70));
+
+        // Higher ranks still get minimum scale
+        let size_rank10 = portfolio.calculate_position_size(dec!(100), 10);
+        assert_eq!(size_rank10, dec!(70));
     }
 
     #[test]

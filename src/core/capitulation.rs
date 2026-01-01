@@ -18,14 +18,14 @@ use rust_decimal::prelude::ToPrimitive;
 
 /// Volume tracker for capitulation detection
 ///
-/// Maintains a simple moving average of volume to detect spikes.
-/// Uses a 20-bar lookback (standard viewing window on a chart).
+/// LOSSLESS: No thresholds. Uses ranking instead of ratios.
+/// A volume "spike" is simply the highest volume in the lookback window.
 #[derive(Debug, Clone)]
 pub struct VolumeTracker {
-    /// Recent volume values
+    /// Recent volume values (rolling window)
     volumes: Vec<u64>,
-    /// Running sum for efficient SMA calculation
-    sum: u64,
+    /// Window size - derived from standard chart view (not a strategy parameter)
+    window_size: usize,
 }
 
 impl VolumeTracker {
@@ -33,42 +33,53 @@ impl VolumeTracker {
     pub fn new() -> Self {
         Self {
             volumes: Vec::with_capacity(20),
-            sum: 0,
+            window_size: 20, // Standard chart lookback - infrastructure, not strategy
         }
     }
 
     /// Update with new volume
     pub fn update(&mut self, volume: u64) {
-        // Remove oldest if at capacity
-        if self.volumes.len() >= 20 {
-            if let Some(oldest) = self.volumes.first() {
-                self.sum = self.sum.saturating_sub(*oldest);
-            }
+        if self.volumes.len() >= self.window_size {
             self.volumes.remove(0);
         }
-
         self.volumes.push(volume);
-        self.sum += volume;
     }
 
-    /// Get the 20-bar simple moving average of volume
+    /// LOSSLESS: Check if this volume is the highest in the window
+    /// No threshold - pure observation
+    pub fn is_highest(&self, volume: u64) -> bool {
+        if self.volumes.is_empty() {
+            return false;
+        }
+        self.volumes.iter().all(|&v| volume > v)
+    }
+
+    /// LOSSLESS: Get the rank of this volume (1 = highest)
+    /// Pure counting - no thresholds
+    pub fn rank(&self, volume: u64) -> usize {
+        self.volumes.iter().filter(|&&v| v > volume).count() + 1
+    }
+
+    /// LOSSLESS: Check if this volume is in the top N
+    /// N is derived from window size (top 10% = top 2 of 20)
+    pub fn is_top_n(&self, volume: u64, n: usize) -> bool {
+        self.rank(volume) <= n
+    }
+
+    /// Check if we have any context (no fixed minimum)
+    pub fn has_context(&self) -> bool {
+        !self.volumes.is_empty()
+    }
+
+    /// Get the 20-bar simple moving average of volume (for logging only)
     pub fn average(&self) -> f64 {
         if self.volumes.is_empty() {
             return 0.0;
         }
-        self.sum as f64 / self.volumes.len() as f64
+        self.volumes.iter().sum::<u64>() as f64 / self.volumes.len() as f64
     }
 
-    /// Check if the given volume is a spike (> 2x average)
-    pub fn is_spike(&self, volume: u64) -> bool {
-        let avg = self.average();
-        if avg <= 0.0 {
-            return false;
-        }
-        volume as f64 > avg * 2.0
-    }
-
-    /// Get the volume ratio (current / average)
+    /// Get the volume ratio (for logging/display only, NOT for signals)
     pub fn ratio(&self, volume: u64) -> f64 {
         let avg = self.average();
         if avg <= 0.0 {
@@ -77,9 +88,9 @@ impl VolumeTracker {
         volume as f64 / avg
     }
 
-    /// Check if we have enough data for reliable signals
-    pub fn is_ready(&self) -> bool {
-        self.volumes.len() >= 5 // Minimum 5 bars for context
+    /// Get window fill percentage (for logging)
+    pub fn fill_pct(&self) -> f64 {
+        self.volumes.len() as f64 / self.window_size as f64 * 100.0
     }
 }
 
@@ -100,6 +111,49 @@ pub enum CapitulationSignal {
     None,
 }
 
+/// LOSSLESS: Check for volume capitulation using ranking
+/// No thresholds - spike = highest in window
+pub fn check_capitulation_lossless(
+    volume: u64,
+    tracker: &VolumeTracker,
+    price_change: Decimal,
+) -> CapitulationSignal {
+    // LOSSLESS: Spike = highest volume in window
+    if !tracker.is_highest(volume) {
+        return CapitulationSignal::None;
+    }
+
+    // Check price direction
+    if price_change < Decimal::ZERO {
+        CapitulationSignal::BuyCapitulation
+    } else if price_change > Decimal::ZERO {
+        CapitulationSignal::SellCapitulation
+    } else {
+        CapitulationSignal::None
+    }
+}
+
+/// LOSSLESS helper: buy capitulation = highest volume + down day
+pub fn is_buy_capitulation_lossless(
+    volume: u64,
+    tracker: &VolumeTracker,
+    open: Decimal,
+    close: Decimal,
+) -> bool {
+    tracker.is_highest(volume) && close < open
+}
+
+/// LOSSLESS helper: sell capitulation = highest volume + up day
+pub fn is_sell_capitulation_lossless(
+    volume: u64,
+    tracker: &VolumeTracker,
+    open: Decimal,
+    close: Decimal,
+) -> bool {
+    tracker.is_highest(volume) && close > open
+}
+
+#[deprecated(note = "Use check_capitulation_lossless instead - no 2x threshold")]
 /// Check for volume capitulation
 ///
 /// # Arguments
@@ -136,6 +190,7 @@ pub fn check_capitulation(
     }
 }
 
+#[deprecated(note = "Use is_buy_capitulation_lossless instead")]
 /// Simple helper to detect capitulation from a bar
 pub fn is_buy_capitulation(
     volume: u64,
@@ -144,12 +199,14 @@ pub fn is_buy_capitulation(
     close: Decimal,
 ) -> bool {
     let change = close - open;
+    #[allow(deprecated)]
     matches!(
         check_capitulation(volume, avg_volume, change),
         CapitulationSignal::BuyCapitulation
     )
 }
 
+#[deprecated(note = "Use is_sell_capitulation_lossless instead")]
 /// Simple helper to detect sell capitulation from a bar
 pub fn is_sell_capitulation(
     volume: u64,
@@ -158,6 +215,7 @@ pub fn is_sell_capitulation(
     close: Decimal,
 ) -> bool {
     let change = close - open;
+    #[allow(deprecated)]
     matches!(
         check_capitulation(volume, avg_volume, change),
         CapitulationSignal::SellCapitulation
@@ -170,6 +228,61 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
+    fn test_volume_tracker_ranking() {
+        let mut tracker = VolumeTracker::new();
+
+        // Add volumes: 1000, 2000, 3000, 4000, 5000
+        for i in 1..=5 {
+            tracker.update(i * 1000);
+        }
+
+        // 6000 is highest -> rank 1
+        assert_eq!(tracker.rank(6000), 1);
+        assert!(tracker.is_highest(6000));
+
+        // 5000 ties highest -> rank 1 (not strictly greater)
+        assert_eq!(tracker.rank(5000), 1);
+
+        // 4500 is second highest -> rank 2
+        assert_eq!(tracker.rank(4500), 2);
+
+        // 1000 is lowest -> rank 5
+        assert_eq!(tracker.rank(1000), 5);
+    }
+
+    #[test]
+    fn test_lossless_capitulation() {
+        let mut tracker = VolumeTracker::new();
+
+        // Build history
+        for _ in 0..10 {
+            tracker.update(1000);
+        }
+
+        // Highest volume + down day = buy capitulation
+        assert!(is_buy_capitulation_lossless(2000, &tracker, dec!(100), dec!(95)));
+
+        // NOT highest = no capitulation
+        assert!(!is_buy_capitulation_lossless(500, &tracker, dec!(100), dec!(95)));
+
+        // Highest + up day = sell capitulation, not buy
+        assert!(!is_buy_capitulation_lossless(2000, &tracker, dec!(100), dec!(105)));
+        assert!(is_sell_capitulation_lossless(2000, &tracker, dec!(100), dec!(105)));
+    }
+
+    #[test]
+    fn test_has_context() {
+        let mut tracker = VolumeTracker::new();
+
+        // Empty = no context
+        assert!(!tracker.has_context());
+
+        // Any data = has context
+        tracker.update(1000);
+        assert!(tracker.has_context());
+    }
+
+    #[test]
     fn test_volume_tracker_average() {
         let mut tracker = VolumeTracker::new();
 
@@ -180,43 +293,6 @@ mod tests {
 
         // Average should be (1000+2000+3000+4000+5000)/5 = 3000
         assert!((tracker.average() - 3000.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_volume_spike_detection() {
-        let mut tracker = VolumeTracker::new();
-
-        // Normal volume around 1000
-        for _ in 0..10 {
-            tracker.update(1000);
-        }
-
-        // 2100 is just over 2x average - should be a spike
-        assert!(tracker.is_spike(2100));
-
-        // 1900 is under 2x - not a spike
-        assert!(!tracker.is_spike(1900));
-    }
-
-    #[test]
-    fn test_buy_capitulation() {
-        // High volume on a down day = buy capitulation
-        let signal = check_capitulation(3000, 1000.0, dec!(-5.0));
-        assert_eq!(signal, CapitulationSignal::BuyCapitulation);
-    }
-
-    #[test]
-    fn test_sell_capitulation() {
-        // High volume on an up day = sell capitulation
-        let signal = check_capitulation(3000, 1000.0, dec!(5.0));
-        assert_eq!(signal, CapitulationSignal::SellCapitulation);
-    }
-
-    #[test]
-    fn test_no_capitulation_low_volume() {
-        // Volume not high enough - no signal
-        let signal = check_capitulation(1500, 1000.0, dec!(-5.0));
-        assert_eq!(signal, CapitulationSignal::None);
     }
 
     #[test]
@@ -240,11 +316,22 @@ mod tests {
     }
 
     #[test]
-    fn test_helper_functions() {
-        assert!(is_buy_capitulation(3000, 1000.0, dec!(100), dec!(95)));
-        assert!(!is_buy_capitulation(3000, 1000.0, dec!(100), dec!(105)));
+    fn test_is_top_n() {
+        let mut tracker = VolumeTracker::new();
 
-        assert!(is_sell_capitulation(3000, 1000.0, dec!(100), dec!(105)));
-        assert!(!is_sell_capitulation(3000, 1000.0, dec!(100), dec!(95)));
+        // Add volumes: 1000, 2000, 3000, 4000, 5000
+        for i in 1..=5 {
+            tracker.update(i * 1000);
+        }
+
+        // 6000 should be in top 1, top 2, top 3
+        assert!(tracker.is_top_n(6000, 1));
+        assert!(tracker.is_top_n(6000, 2));
+        assert!(tracker.is_top_n(6000, 3));
+
+        // 4500 is rank 2, should be in top 2 and 3 but not top 1
+        assert!(!tracker.is_top_n(4500, 1));
+        assert!(tracker.is_top_n(4500, 2));
+        assert!(tracker.is_top_n(4500, 3));
     }
 }
