@@ -73,3 +73,25 @@ pub async fn send_startup() {
     let msg = "🚀 <b>Sovereign v4</b> started\n\nListening for signals...";
     let _ = send(msg).await;
 }
+
+pub async fn send_daily_summary(
+    positions: usize,
+    long_exposure: f64,
+    short_exposure: f64,
+    unrealized_pnl: rust_decimal::Decimal,
+    total_bars: u64,
+) {
+    let msg = format!(
+        "📊 <b>Daily Summary</b>\n\n\
+        Positions: {}\n\
+        Exposure: {:.0}% long / {:.0}% short\n\
+        Unrealized P&L: ${:.2}\n\
+        Bars Processed: {}",
+        positions,
+        long_exposure * 100.0,
+        short_exposure * 100.0,
+        unrealized_pnl,
+        total_bars
+    );
+    let _ = send(&msg).await;
+}

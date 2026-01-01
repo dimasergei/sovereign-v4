@@ -55,6 +55,15 @@ fn is_market_open() -> bool {
     time_minutes >= 870 && time_minutes < 1260
 }
 
+/// Check if market is open for a given symbol
+/// Crypto trades 24/7, stocks follow US market hours
+fn is_market_open_for_symbol(symbol: &str) -> bool {
+    if crate::universe::Universe::is_crypto(symbol) {
+        return true;
+    }
+    is_market_open()
+}
+
 /// Smart alerting - reduces spam
 struct AlertManager {
     last_gap_alert: std::time::Instant,
@@ -409,6 +418,7 @@ async fn run_alpaca_loop(
     let mut last_health_check = std::time::Instant::now();
     let mut bar_count = 0u64;
     let mut tick_count = 0u64;
+    let mut last_summary_date: Option<chrono::NaiveDate> = None;
 
     // Spawn WebSocket connection
     tokio::spawn(async move {
@@ -491,6 +501,24 @@ async fn run_alpaca_loop(
             }
             Err(_) => {}
         }
+
+        // Daily summary at 21:05 UTC (5 min after market close)
+        let now = Utc::now();
+        let today = now.date_naive();
+        if now.hour() == 21 && now.minute() >= 5 && now.minute() < 15 {
+            if last_summary_date != Some(today) {
+                last_summary_date = Some(today);
+                if telegram_enabled {
+                    telegram::send_daily_summary(
+                        portfolio.position_count(),
+                        portfolio.long_exposure_pct(),
+                        portfolio.short_exposure_pct(),
+                        portfolio.unrealized_pnl(),
+                        bar_count,
+                    ).await;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -511,6 +539,7 @@ async fn run_ibkr_loop(
     let mut last_health_check = std::time::Instant::now();
     let mut last_data_poll = std::time::Instant::now();
     let mut bar_count = 0u64;
+    let mut last_summary_date: Option<chrono::NaiveDate> = None;
 
     info!("IBKR mode: Polling for market data every 60 seconds");
     info!("Waiting for market data...");
@@ -577,6 +606,24 @@ async fn run_ibkr_loop(
             }
         }
 
+        // Daily summary at 21:05 UTC (5 min after market close)
+        let now = Utc::now();
+        let today = now.date_naive();
+        if now.hour() == 21 && now.minute() >= 5 && now.minute() < 15 {
+            if last_summary_date != Some(today) {
+                last_summary_date = Some(today);
+                if telegram_enabled {
+                    telegram::send_daily_summary(
+                        portfolio.position_count(),
+                        portfolio.long_exposure_pct(),
+                        portfolio.short_exposure_pct(),
+                        portfolio.unrealized_pnl(),
+                        bar_count,
+                    ).await;
+                }
+            }
+        }
+
         // Small sleep to prevent busy loop
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
@@ -611,8 +658,8 @@ async fn process_bar_signal(
         info!("Portfolio: {} | Positions: {}",
             portfolio.exposure_summary(), portfolio.position_count());
 
-        if !is_market_open() {
-            info!("Signal: HOLD | Market closed");
+        if !is_market_open_for_symbol(symbol) {
+            info!("Signal: HOLD | Market closed for {}", symbol);
             info!("{}", SEP);
             return;
         }
@@ -624,7 +671,7 @@ async fn process_bar_signal(
                 info!("Reason: {}", sig.reason);
                 info!("{}", SEP);
 
-                let qty = portfolio.calculate_position_size(sig.price);
+                let qty = portfolio.calculate_position_size(sig.price, sig.volume_ratio);
                 execute_alpaca_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
             } else {
                 info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
@@ -671,8 +718,8 @@ async fn process_bar_signal_ibkr(
         info!("Portfolio: {} | Positions: {}",
             portfolio.exposure_summary(), portfolio.position_count());
 
-        if !is_market_open() {
-            info!("Signal: HOLD | Market closed");
+        if !is_market_open_for_symbol(symbol) {
+            info!("Signal: HOLD | Market closed for {}", symbol);
             info!("{}", SEP);
             return;
         }
@@ -684,7 +731,7 @@ async fn process_bar_signal_ibkr(
                 info!("Reason: {}", sig.reason);
                 info!("{}", SEP);
 
-                let qty = portfolio.calculate_position_size(sig.price);
+                let qty = portfolio.calculate_position_size(sig.price, sig.volume_ratio);
                 execute_ibkr_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
             } else {
                 info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
