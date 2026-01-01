@@ -1,3 +1,13 @@
+# Sovereign v4.0 - Lossless Autonomous Trading System
+#
+# NOTE: This config contains NO strategy parameters.
+# The strategy has NO parameters - that's the lossless philosophy.
+#
+# Only infrastructure settings are configured here:
+# - Broker credentials
+# - Notification settings
+# - Trading universe
+
 [system]
 name = "Sovereign v4"
 log_level = "info"
@@ -15,27 +25,35 @@ enabled = true
 bot_token = "8570067655:AAHezpMffYJIc6oHkhmAX-MwXIpI91TvzR8"
 chat_id = "7898079111"
 
-[risk]
-risk_per_trade = 0.005
-max_daily_loss = 0.02
-max_floating_loss = 0.015
-max_positions = 3
-max_trades_per_day = 6
-trade_cooldown_secs = 1800
-loss_cooldown_secs = 3600
+# Portfolio settings (NOT strategy parameters - these are account protection)
+[portfolio]
+initial_balance = 100000
+# Max positions and exposure are hardcoded in portfolio.rs:
+# - MAX_POSITIONS = 20
+# - MAX_EXPOSURE_PER_SIDE = 200%
+# - POSITION_SIZE_PCT = 7%
 
-[strategy]
-min_conviction = 60
-risk_reward_ratio = 2.0
-
+# Trading universe
+# Each symbol is traded by an independent agent
 [[symbols]]
 name = "SPY"
 tick_size = 0.01
-is_forex = false
-point_value = 1
 
 [[symbols]]
 name = "QQQ"
 tick_size = 0.01
-is_forex = false
-point_value = 1
+
+[[symbols]]
+name = "IWM"
+tick_size = 0.01
+
+[[symbols]]
+name = "GLD"
+tick_size = 0.01
+
+[[symbols]]
+name = "USO"
+tick_size = 0.01
+
+# To add more symbols, simply add more [[symbols]] entries
+# The system will automatically create an independent agent for each

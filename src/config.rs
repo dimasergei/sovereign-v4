@@ -1,4 +1,10 @@
 //! Configuration loader
+//!
+//! NOTE: This config contains NO strategy parameters.
+//! The strategy has NO parameters - that's the lossless philosophy.
+//!
+//! Only infrastructure settings are configured here.
+
 use anyhow::Result;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -13,10 +19,9 @@ pub struct Config {
     #[serde(default)]
     pub alpaca: Option<AlpacaConfig>,
     #[serde(default)]
-    pub bridge: Option<BridgeConfig>,
     pub telegram: TelegramConfig,
-    pub risk: RiskConfig,
-    pub strategy: StrategyConfig,
+    #[serde(default)]
+    pub portfolio: PortfolioConfig,
     pub symbols: Vec<SymbolConfig>,
 }
 
@@ -44,42 +49,38 @@ pub struct AlpacaConfig {
     pub secret_key: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct BridgeConfig {
-    pub host: String,
-    pub port: u16,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct TelegramConfig {
+    #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
     pub bot_token: String,
+    #[serde(default)]
     pub chat_id: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RiskConfig {
-    pub risk_per_trade: f64,
-    pub max_daily_loss: f64,
-    pub max_floating_loss: f64,
-    pub max_positions: usize,
-    pub max_trades_per_day: usize,
-    pub trade_cooldown_secs: u64,
-    pub loss_cooldown_secs: u64,
+pub struct PortfolioConfig {
+    #[serde(default = "default_initial_balance")]
+    pub initial_balance: f64,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct StrategyConfig {
-    pub min_conviction: u8,
-    pub risk_reward_ratio: f64,
+fn default_initial_balance() -> f64 {
+    100000.0
+}
+
+impl Default for PortfolioConfig {
+    fn default() -> Self {
+        Self {
+            initial_balance: default_initial_balance(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SymbolConfig {
     pub name: String,
     pub tick_size: f64,
-    pub is_forex: bool,
-    pub point_value: f64,
 }
 
 impl Config {
@@ -88,36 +89,38 @@ impl Config {
         let config: Config = toml::from_str(&contents)?;
         Ok(config)
     }
-    
+
     pub fn is_alpaca(&self) -> bool {
         self.alpaca.is_some()
     }
-    
+
     pub fn alpaca_config(&self) -> Option<&AlpacaConfig> {
         self.alpaca.as_ref()
     }
 }
 
-impl RiskConfig {
-    pub fn to_guardian_config(&self) -> crate::core::guardian::RiskConfig {
-        crate::core::guardian::RiskConfig {
-            risk_per_trade: Decimal::from_str(&self.risk_per_trade.to_string()).unwrap(),
-            max_daily_loss: Decimal::from_str(&self.max_daily_loss.to_string()).unwrap(),
-            max_floating_loss: Decimal::from_str(&self.max_floating_loss.to_string()).unwrap(),
-            max_positions: self.max_positions,
-            max_trades_per_day: self.max_trades_per_day,
-            trade_cooldown_secs: self.trade_cooldown_secs,
-            loss_cooldown_secs: self.loss_cooldown_secs,
-        }
+impl SymbolConfig {
+    pub fn tick_size_decimal(&self) -> Decimal {
+        Decimal::from_str(&self.tick_size.to_string()).unwrap_or(Decimal::new(1, 2))
     }
 }
 
-impl SymbolConfig {
-    pub fn tick_size_decimal(&self) -> Decimal {
-        Decimal::from_str(&self.tick_size.to_string()).unwrap()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_portfolio_config() {
+        let cfg = PortfolioConfig::default();
+        assert_eq!(cfg.initial_balance, 100000.0);
     }
-    
-    pub fn point_value_decimal(&self) -> Decimal {
-        Decimal::from_str(&self.point_value.to_string()).unwrap()
+
+    #[test]
+    fn test_symbol_tick_size() {
+        let sym = SymbolConfig {
+            name: "SPY".to_string(),
+            tick_size: 0.01,
+        };
+        assert_eq!(sym.tick_size_decimal(), Decimal::new(1, 2));
     }
 }
