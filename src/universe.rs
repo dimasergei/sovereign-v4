@@ -11,26 +11,32 @@ use std::path::Path;
 
 /// Default symbols for the trading universe
 ///
-/// These are commonly traded, liquid symbols observed in Tech Trader.
+/// 130 liquid symbols for IBKR mode - full universe for Tech Trader.
 pub const DEFAULT_SYMBOLS: &[&str] = &[
-    // Major Tech
+    // Major Tech (20)
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "NFLX", "AVGO", "ORCL",
     "ADBE", "CRM", "AMD", "INTC", "CSCO", "QCOM", "TXN", "AMAT", "MU", "LRCX",
-    // Finance
-    "JPM", "GS", "MS", "BAC", "WFC", "C", "SCHW", "BLK", "AXP", "V", "MA",
-    // Healthcare
+    // Tech Extended (15)
+    "NOW", "PANW", "SNOW", "CRWD", "ZS", "DDOG", "NET", "PLTR", "UBER", "ABNB",
+    "COIN", "SQ", "SHOP", "PYPL", "ROKU",
+    // Finance (15)
+    "JPM", "GS", "MS", "BAC", "WFC", "C", "SCHW", "BLK", "AXP", "V",
+    "MA", "COF", "USB", "PNC", "TFC",
+    // Healthcare (15)
     "JNJ", "PFE", "UNH", "ABBV", "MRK", "LLY", "TMO", "ABT", "AMGN", "GILD",
-    // Industrial
+    "BMY", "CVS", "CI", "HUM", "ISRG",
+    // Industrial (15)
     "BA", "CAT", "GE", "HON", "UPS", "LMT", "RTX", "DE", "MMM", "GD",
-    // Consumer
+    "FDX", "NSC", "UNP", "WM", "EMR",
+    // Consumer (15)
     "DIS", "NKE", "SBUX", "MCD", "HD", "LOW", "TGT", "COST", "WMT", "PG",
-    // Energy
+    "KO", "PEP", "CL", "EL", "LULU",
+    // Energy (15)
     "XOM", "CVX", "COP", "SLB", "EOG", "OXY", "PSX", "VLO", "MPC", "PBR",
-    // ETFs
+    "HAL", "DVN", "FANG", "HES", "BKR",
+    // ETFs (20)
     "SPY", "QQQ", "IWM", "DIA", "SMH", "XLF", "XLE", "XLK", "GLD", "SLV",
-    "USO", "UNG", "TLT", "HYG", "EEM", "EWZ", "FXI", "VXX",
-    // Crypto (Alpaca supported)
-    "BTCUSD", "ETHUSD",
+    "USO", "UNG", "TLT", "HYG", "EEM", "EWZ", "FXI", "VXX", "ARKK", "XLV",
 ];
 
 /// Trading universe containing all tradable symbols
