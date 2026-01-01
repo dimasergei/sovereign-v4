@@ -5,11 +5,44 @@
 
 use anyhow::Result;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn, debug};
+
+/// Deserialize a value that could be either a string or an integer
+/// IBKR API inconsistently returns conid as string or int
+fn deserialize_string_or_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct StringOrI64Visitor;
+
+    impl<'de> Visitor<'de> for StringOrI64Visitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or integer")
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<i64, E> {
+            Ok(value)
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<i64, E> {
+            Ok(value as i64)
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<i64, E> {
+            value.parse().map_err(de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrI64Visitor)
+}
 
 /// IBKR Broker client
 pub struct IbkrBroker {
@@ -66,7 +99,7 @@ pub struct IbkrPosition {
 
 #[derive(Debug, Deserialize)]
 pub struct ContractSearch {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_i64")]
     pub conid: i64,
     #[serde(default)]
     pub symbol: String,
