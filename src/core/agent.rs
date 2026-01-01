@@ -283,7 +283,7 @@ impl SymbolAgent {
 
                 // Alternative entry: Strong bounce at S/R without capitulation
                 // (Less aggressive - only when capitulation is rare)
-                if at_support && is_down_day && self.bar_count > 50 {
+                if at_support && is_down_day {
                     // Price touched support on a down day - potential bounce
                     // Only signal if the low actually touched support
                     if let Some(s) = support {
