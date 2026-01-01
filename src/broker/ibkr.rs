@@ -78,7 +78,8 @@ pub struct AccountSummary {
 #[derive(Debug, Deserialize)]
 pub struct AccountValue {
     pub amount: f64,
-    pub currency: String,
+    #[serde(default)]
+    pub currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,7 +121,7 @@ pub struct HistoricalBar {
     #[serde(rename = "c")]
     pub close: f64,
     #[serde(rename = "v")]
-    pub volume: u64,
+    pub volume: f64,  // IBKR returns volume as float
     #[serde(rename = "t")]
     pub time: i64,
 }

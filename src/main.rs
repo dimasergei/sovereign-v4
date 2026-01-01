@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
                                 let high = Decimal::from_f64(bar.high).unwrap_or(dec!(0));
                                 let low = Decimal::from_f64(bar.low).unwrap_or(dec!(0));
                                 let close = Decimal::from_f64(bar.close).unwrap_or(dec!(0));
-                                agent.bootstrap_bar(open, high, low, close, bar.volume);
+                                agent.bootstrap_bar(open, high, low, close, bar.volume as u64);
                             }
                             info!("{}: Bootstrapped S/R from {} historical bars", sym, bars.len());
                         }
@@ -592,7 +592,7 @@ async fn run_ibkr_loop(
                                 bar.high,
                                 bar.low,
                                 bar.close,
-                                bar.volume,
+                                bar.volume as u64,
                                 bar_count,
                                 agents,
                                 portfolio,
