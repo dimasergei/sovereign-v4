@@ -164,6 +164,52 @@ impl AlpacaBroker {
     }
 }
 
+/// Historical bar data for bootstrapping S/R levels
+#[derive(Debug, Deserialize)]
+pub struct HistoricalBar {
+    #[serde(rename = "o")]
+    pub open: f64,
+    #[serde(rename = "h")]
+    pub high: f64,
+    #[serde(rename = "l")]
+    pub low: f64,
+    #[serde(rename = "c")]
+    pub close: f64,
+    #[serde(rename = "v")]
+    pub volume: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BarsResponse {
+    bars: Vec<HistoricalBar>,
+    next_page_token: Option<String>,
+}
+
+impl AlpacaBroker {
+    /// Fetch all available daily bars for a symbol
+    /// Alpaca returns up to 10000 bars - we take whatever they give
+    pub async fn get_all_daily_bars(&self, symbol: &str) -> Result<Vec<HistoricalBar>> {
+        let url = format!(
+            "https://data.alpaca.markets/v2/stocks/{}/bars?timeframe=1Day&limit=10000",
+            symbol
+        );
+
+        let resp = self.client
+            .get(&url)
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!("Failed to fetch bars for {}: {}", symbol, resp.status()));
+        }
+
+        let bars_resp: BarsResponse = resp.json().await?;
+        Ok(bars_resp.bars)
+    }
+}
+
 // Data stream for real-time prices
 pub struct AlpacaDataStream {
     api_key: String,

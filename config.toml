@@ -28,32 +28,22 @@ chat_id = "7898079111"
 # Portfolio settings (NOT strategy parameters - these are account protection)
 [portfolio]
 initial_balance = 100000
-# Max positions and exposure are hardcoded in portfolio.rs:
-# - MAX_POSITIONS = 20
-# - MAX_EXPOSURE_PER_SIDE = 200%
-# - POSITION_SIZE_PCT = 7%
 
-# Trading universe
-# Each symbol is traded by an independent agent
-[[symbols]]
-name = "SPY"
-tick_size = 0.01
-
-[[symbols]]
-name = "QQQ"
-tick_size = 0.01
-
-[[symbols]]
-name = "IWM"
-tick_size = 0.01
-
-[[symbols]]
-name = "GLD"
-tick_size = 0.01
-
-[[symbols]]
-name = "USO"
-tick_size = 0.01
-
-# To add more symbols, simply add more [[symbols]] entries
-# The system will automatically create an independent agent for each
+# Trading universe - each symbol is traded by an independent agent
+[universe]
+symbols = [
+    # Large Cap Tech
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AVGO", "ORCL", "CRM",
+    # Finance
+    "JPM", "BAC", "GS", "WFC", "MS", "C", "BLK", "SCHW",
+    # Healthcare
+    "JNJ", "UNH", "PFE", "MRK", "ABBV", "LLY", "TMO",
+    # Consumer
+    "PG", "KO", "PEP", "WMT", "HD", "MCD", "NKE", "SBUX",
+    # Energy
+    "XOM", "CVX", "COP", "SLB",
+    # Industrial
+    "CAT", "BA", "GE", "HON", "UPS", "RTX",
+    # ETFs
+    "SPY", "QQQ", "IWM", "DIA"
+]

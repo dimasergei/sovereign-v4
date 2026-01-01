@@ -137,17 +137,39 @@ async fn main() -> Result<()> {
     }
 
     // Initialize universe
-    let symbols: Vec<String> = cfg.symbols.iter().map(|s| s.name.clone()).collect();
+    let symbols: Vec<String> = cfg.universe.symbols.clone();
     let universe = Universe::from_symbols(symbols.clone());
     info!("Universe: {} symbols loaded", universe.len());
 
     // Initialize agents (one per symbol)
     let mut agents: HashMap<String, SymbolAgent> = HashMap::new();
-    for sym in &cfg.symbols {
-        let price = sym.tick_size_decimal() * dec!(10000); // Estimate initial price
-        let agent = SymbolAgent::new(sym.name.clone(), price);
-        info!("Agent: {} (auto-granularity based on price)", sym.name);
-        agents.insert(sym.name.clone(), agent);
+    for sym in &symbols {
+        // Start with estimated price - will be refined by historical data
+        let agent = SymbolAgent::new(sym.clone(), dec!(100));
+        agents.insert(sym.clone(), agent);
+    }
+    info!("Agents: {} created, bootstrapping with historical data...", agents.len());
+
+    // Bootstrap each agent with historical S/R data
+    for sym in &symbols {
+        match broker.get_all_daily_bars(sym).await {
+            Ok(bars) => {
+                if let Some(agent) = agents.get_mut(sym) {
+                    for bar in &bars {
+                        // Feed through existing S/R algorithm - no changes to sr.rs
+                        let open = Decimal::from_f64(bar.open).unwrap_or(dec!(0));
+                        let high = Decimal::from_f64(bar.high).unwrap_or(dec!(0));
+                        let low = Decimal::from_f64(bar.low).unwrap_or(dec!(0));
+                        let close = Decimal::from_f64(bar.close).unwrap_or(dec!(0));
+                        agent.bootstrap_bar(open, high, low, close, bar.volume);
+                    }
+                    info!("{}: Bootstrapped S/R from {} historical bars", sym, bars.len());
+                }
+            }
+            Err(e) => {
+                warn!("{}: Failed to fetch historical bars: {}", sym, e);
+            }
+        }
     }
     info!("Agents: {} independent traders ready", agents.len());
 

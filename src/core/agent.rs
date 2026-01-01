@@ -379,6 +379,30 @@ impl SymbolAgent {
     pub fn avg_volume(&self) -> f64 {
         self.volume.average()
     }
+
+    /// Bootstrap S/R with historical bar data (no signal generation)
+    ///
+    /// Used at startup to pre-populate S/R levels from historical data.
+    /// Does NOT generate trading signals - only builds the S/R map.
+    pub fn bootstrap_bar(
+        &mut self,
+        open: Decimal,
+        high: Decimal,
+        low: Decimal,
+        close: Decimal,
+        volume: u64,
+    ) {
+        // Update S/R levels
+        self.sr.update_bar(open, high, low, close);
+
+        // Update volume tracker
+        self.volume.update(volume);
+
+        // Update state
+        self.last_price = close;
+        self.last_volume = volume;
+        self.bar_count += 1;
+    }
 }
 
 #[cfg(test)]

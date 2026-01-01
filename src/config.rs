@@ -6,10 +6,8 @@
 //! Only infrastructure settings are configured here.
 
 use anyhow::Result;
-use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::fs;
-use std::str::FromStr;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -22,7 +20,12 @@ pub struct Config {
     pub telegram: TelegramConfig,
     #[serde(default)]
     pub portfolio: PortfolioConfig,
-    pub symbols: Vec<SymbolConfig>,
+    pub universe: UniverseConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UniverseConfig {
+    pub symbols: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,12 +80,6 @@ impl Default for PortfolioConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SymbolConfig {
-    pub name: String,
-    pub tick_size: f64,
-}
-
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let contents = fs::read_to_string(path)?;
@@ -99,12 +96,6 @@ impl Config {
     }
 }
 
-impl SymbolConfig {
-    pub fn tick_size_decimal(&self) -> Decimal {
-        Decimal::from_str(&self.tick_size.to_string()).unwrap_or(Decimal::new(1, 2))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,14 +104,5 @@ mod tests {
     fn test_default_portfolio_config() {
         let cfg = PortfolioConfig::default();
         assert_eq!(cfg.initial_balance, 100000.0);
-    }
-
-    #[test]
-    fn test_symbol_tick_size() {
-        let sym = SymbolConfig {
-            name: "SPY".to_string(),
-            tick_size: 0.01,
-        };
-        assert_eq!(sym.tick_size_decimal(), Decimal::new(1, 2));
     }
 }
