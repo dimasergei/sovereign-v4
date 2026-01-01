@@ -13,7 +13,7 @@ name = "Sovereign v4"
 log_level = "info"
 
 [broker]
-type = "ibkr"
+broker_type = "ibkr"
 
 [ibkr]
 gateway_url = "https://localhost:5000"
