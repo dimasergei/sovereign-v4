@@ -137,8 +137,19 @@ impl IbkrBroker {
     /// Create a new IBKR broker client
     pub fn new(gateway_url: String, account_id: String) -> Result<Self> {
         // Build client that accepts self-signed certificates
+        // CRITICAL: cookie_store is required - IBKR Gateway uses session cookies
+        // Without it, every request is treated as unauthenticated (403)
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("*/*"),
+        );
+
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
+            .cookie_store(true)  // Required: IBKR uses session cookies
+            .user_agent("Mozilla/5.0 (compatible; Sovereign/4.0)")  // Required: Gateway checks User-Agent
+            .default_headers(headers)
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
 
