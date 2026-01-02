@@ -308,13 +308,19 @@ impl IbkrBroker {
             }
         }
 
-        // Search for contract
+        // Search for contract - IBKR requires POST with JSON body
         let url = format!(
-            "{}/v1/api/iserver/secdef/search?symbol={}",
-            self.gateway_url, symbol
+            "{}/v1/api/iserver/secdef/search",
+            self.gateway_url
         );
 
-        let resp = self.client.get(&url).send().await?;
+        let body = serde_json::json!({
+            "symbol": symbol,
+            "name": true,
+            "secType": "STK"
+        });
+
+        let resp = self.client.post(&url).json(&body).send().await?;
 
         if !resp.status().is_success() {
             return Err(anyhow::anyhow!("Contract search failed for {}: {}", symbol, resp.status()));
