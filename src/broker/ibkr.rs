@@ -128,9 +128,65 @@ pub struct HistoricalBar {
 
 #[derive(Debug, Deserialize)]
 pub struct HistoricalData {
+    #[serde(default)]
     pub data: Vec<HistoricalBar>,
-    #[serde(rename = "mdAvailability")]
+    /// Market data availability status
+    #[serde(rename = "mdAvailability", default)]
     pub md_availability: Option<String>,
+    /// Symbol (can be null for some instruments)
+    #[serde(default)]
+    pub symbol: Option<String>,
+    /// Descriptive text (can be null)
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Price display rule (can be null)
+    #[serde(rename = "priceDisplayRule", default)]
+    pub price_display_rule: Option<i32>,
+    /// Price display value (can be null)
+    #[serde(rename = "priceDisplayValue", default)]
+    pub price_display_value: Option<String>,
+    /// Chart annotations (can be null)
+    #[serde(rename = "chartAnnotations", default)]
+    pub chart_annotations: Option<String>,
+    /// Negative capable flag
+    #[serde(rename = "negativeCapable", default)]
+    pub negative_capable: Option<bool>,
+    /// Server ID (can be null)
+    #[serde(rename = "serverId", default)]
+    pub server_id: Option<String>,
+    /// Travel time in ms
+    #[serde(rename = "travelTime", default)]
+    pub travel_time: Option<i64>,
+    /// Number of points
+    #[serde(default)]
+    pub points: Option<i32>,
+    /// Market data delay
+    #[serde(rename = "mktDataDelay", default)]
+    pub mkt_data_delay: Option<i32>,
+    /// Outside regular trading hours flag
+    #[serde(rename = "outsideRth", default)]
+    pub outside_rth: Option<bool>,
+    /// Volume factor
+    #[serde(rename = "volumeFactor", default)]
+    pub volume_factor: Option<i32>,
+    /// Bar length setting
+    #[serde(rename = "barLength", default)]
+    pub bar_length: Option<i32>,
+    /// Start time
+    #[serde(rename = "startTime", default)]
+    pub start_time: Option<String>,
+    /// High price as string (separate from bar data)
+    #[serde(default)]
+    pub high: Option<String>,
+    /// Low price as string (separate from bar data)
+    #[serde(default)]
+    pub low: Option<String>,
+    /// Time period
+    #[serde(rename = "timePeriod", default)]
+    pub time_period: Option<String>,
+    /// Trading day duration
+    #[serde(rename = "tradingDayDuration", default)]
+    pub trading_day_duration: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
