@@ -103,7 +103,7 @@ pub struct ContractSearch {
     #[serde(default, deserialize_with = "deserialize_string_or_i64")]
     pub conid: i64,
     #[serde(default)]
-    pub symbol: String,
+    pub symbol: Option<String>,
     #[serde(rename = "companyName")]
     pub company_name: Option<String>,
     #[serde(rename = "secType")]
