@@ -1,12 +1,51 @@
 //! Broker Module
 //!
-//! Broker integrations: IBKR and Alpaca.
+//! Broker integrations: IBKR, Alpaca, and Prime Broker (FIX).
 
 pub mod alpaca;
 pub mod ibkr;
+pub mod prime_broker;
 
 use rust_decimal::Decimal;
 use async_trait::async_trait;
+use thiserror::Error;
+
+/// Broker error types
+#[derive(Error, Debug)]
+pub enum BrokerError {
+    #[error("Not connected to broker")]
+    NotConnected,
+
+    #[error("Order not found: {0}")]
+    OrderNotFound(String),
+
+    #[error("Order rejected: {0}")]
+    OrderRejected(String),
+
+    #[error("Insufficient funds")]
+    InsufficientFunds,
+
+    #[error("Invalid symbol: {0}")]
+    InvalidSymbol(String),
+
+    #[error("Connection error: {0}")]
+    ConnectionError(String),
+
+    #[error("API error: {0}")]
+    ApiError(String),
+
+    #[error("Timeout")]
+    Timeout,
+
+    #[error("Rate limited")]
+    RateLimited,
+
+    #[error("Authentication failed")]
+    AuthenticationFailed,
+
+    #[error("Unknown error: {0}")]
+    Unknown(String),
+}
 
 /// Unified broker interface
 #[async_trait]
