@@ -88,6 +88,7 @@ pub struct AgentSignal {
 /// - Monitors volume for capitulation signals
 /// - Generates buy/sell signals based on S/R + capitulation
 /// - Manages its own position state
+/// - Tracks ATR for volatility-based calculations (lossless)
 pub struct SymbolAgent {
     /// Symbol this agent is trading
     symbol: String,
@@ -103,6 +104,10 @@ pub struct SymbolAgent {
     last_volume: u64,
     /// Number of bars processed
     bar_count: u64,
+    /// Recent bars for ATR calculation (open, high, low, close)
+    recent_bars: Vec<(Decimal, Decimal, Decimal, Decimal)>,
+    /// Maximum bars to keep for ATR (operational limit)
+    max_atr_bars: usize,
 }
 
 impl SymbolAgent {
@@ -125,6 +130,8 @@ impl SymbolAgent {
             last_price: initial_price,
             last_volume: 0,
             bar_count: 0,
+            recent_bars: Vec::with_capacity(20),
+            max_atr_bars: 20, // Operational limit for ATR calculation
         }
     }
 
@@ -146,6 +153,8 @@ impl SymbolAgent {
             last_price: Decimal::ZERO,
             last_volume: 0,
             bar_count: 0,
+            recent_bars: Vec::with_capacity(20),
+            max_atr_bars: 20,
         }
     }
 
@@ -159,6 +168,8 @@ impl SymbolAgent {
             last_price: Decimal::ZERO,
             last_volume: 0,
             bar_count: 0,
+            recent_bars: Vec::with_capacity(20),
+            max_atr_bars: 20,
         }
     }
 
@@ -225,17 +236,23 @@ impl SymbolAgent {
         // 2. Update volume tracker
         self.volume.update(volume);
 
-        // 3. Update state
+        // 3. Track bars for ATR calculation
+        if self.recent_bars.len() >= self.max_atr_bars {
+            self.recent_bars.remove(0);
+        }
+        self.recent_bars.push((open, high, low, close));
+
+        // 4. Update state
         self.last_price = close;
         self.last_volume = volume;
         self.bar_count += 1;
 
-        // 4. Not ready yet - need more data
+        // 5. Not ready yet - need more data
         if !self.is_ready() {
             return None;
         }
 
-        // 5. Check for signals
+        // 6. Check for signals
         self.check_signals(time, open, close, volume)
     }
 
@@ -320,8 +337,9 @@ impl SymbolAgent {
                 }
 
                 // LOSSLESS alternative entry: at support on down day with elevated volume
-                // "Elevated" = 80th percentile (derived from data distribution)
-                if at_support && is_down_day && volume_percentile >= 80.0 {
+                // "Elevated" threshold derived from mean + 1σ of volume distribution
+                let elevated_threshold = self.volume.elevated_threshold();
+                if at_support && is_down_day && volume_percentile >= elevated_threshold {
                     if let Some(s) = support {
                         let touched_support = self.sr.is_near(close.min(open), s);
                         if touched_support {
@@ -437,10 +455,49 @@ impl SymbolAgent {
         // Update volume tracker
         self.volume.update(volume);
 
+        // Track bars for ATR calculation
+        if self.recent_bars.len() >= self.max_atr_bars {
+            self.recent_bars.remove(0);
+        }
+        self.recent_bars.push((open, high, low, close));
+
         // Update state
         self.last_price = close;
         self.last_volume = volume;
         self.bar_count += 1;
+    }
+
+    /// Calculate current ATR from recent bars (lossless - derived from data)
+    ///
+    /// Returns None if insufficient data (less than 2 bars).
+    /// Uses True Range: max(high-low, |high-prev_close|, |low-prev_close|)
+    pub fn atr(&self) -> Option<Decimal> {
+        if self.recent_bars.len() < 2 {
+            return None;
+        }
+
+        let mut true_ranges = Vec::with_capacity(self.recent_bars.len() - 1);
+
+        for i in 1..self.recent_bars.len() {
+            let (_, high, low, _) = self.recent_bars[i];
+            let (_, _, _, prev_close) = self.recent_bars[i - 1];
+
+            // True Range = max(high-low, |high-prev_close|, |low-prev_close|)
+            let hl = high - low;
+            let hpc = (high - prev_close).abs();
+            let lpc = (low - prev_close).abs();
+
+            let tr = hl.max(hpc).max(lpc);
+            true_ranges.push(tr);
+        }
+
+        if true_ranges.is_empty() {
+            return None;
+        }
+
+        // Simple average of true ranges
+        let sum: Decimal = true_ranges.iter().copied().sum();
+        Some(sum / Decimal::from(true_ranges.len()))
     }
 }
 

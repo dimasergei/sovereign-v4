@@ -26,13 +26,17 @@ use rust_decimal::prelude::ToPrimitive;
 ///
 /// Instead of fixed lookback, tracks ALL historical volume and uses
 /// percentile ranking. A "spike" is relative to all observed data.
+///
+/// LOSSLESS: All thresholds derived from the distribution itself using
+/// standard deviation (mean + Nσ), not hardcoded percentiles.
 #[derive(Debug, Clone)]
 pub struct VolumeTracker {
     /// All observed volumes (sorted for percentile calculation)
     volumes_sorted: Vec<u64>,
     /// Recent volumes for recency-weighted ranking
     recent_volumes: Vec<u64>,
-    /// Maximum recent window (operational limit, not strategy)
+    /// Maximum recent window (operational buffer limit, not strategy parameter)
+    /// Actual spike detection uses all-time percentile ranking
     max_recent: usize,
 }
 
@@ -69,10 +73,10 @@ impl VolumeTracker {
         (pos as f64 / self.volumes_sorted.len() as f64) * 100.0
     }
 
-    /// Is this volume in the top decile (90th+ percentile)?
-    /// Derived from data distribution, not hardcoded threshold
+    /// LOSSLESS: Is this volume a spike?
+    /// Threshold derived from mean + 2σ of the observed distribution
     pub fn is_spike(&self, volume: u64) -> bool {
-        self.percentile(volume) >= 90.0
+        self.percentile(volume) >= self.spike_threshold()
     }
 
     /// Is this the highest in recent memory?
@@ -80,10 +84,10 @@ impl VolumeTracker {
         self.recent_volumes.iter().all(|&v| volume >= v)
     }
 
-    /// Combined check: high percentile AND recent highest
-    /// This is the purest "capitulation" signal
+    /// LOSSLESS: Combined check - elevated volume AND recent highest
+    /// "Elevated" threshold derived from mean + 1σ of the distribution
     pub fn is_capitulation_volume(&self, volume: u64) -> bool {
-        self.percentile(volume) >= 80.0 && self.is_recent_highest(volume)
+        self.percentile(volume) >= self.elevated_threshold() && self.is_recent_highest(volume)
     }
 
     /// LOSSLESS: Check if this volume is the highest in history
@@ -123,6 +127,57 @@ impl VolumeTracker {
             return 0.0;
         }
         self.recent_volumes.iter().sum::<u64>() as f64 / self.recent_volumes.len() as f64
+    }
+
+    /// Calculate standard deviation of all observed volumes
+    fn std_dev(&self) -> f64 {
+        if self.volumes_sorted.len() < 2 {
+            return 0.0;
+        }
+        let mean = self.volumes_sorted.iter().sum::<u64>() as f64 / self.volumes_sorted.len() as f64;
+        let variance: f64 = self.volumes_sorted.iter()
+            .map(|&v| (v as f64 - mean).powi(2))
+            .sum::<f64>() / self.volumes_sorted.len() as f64;
+        variance.sqrt()
+    }
+
+    /// LOSSLESS: Derive "spike" threshold from where the distribution's tail begins
+    /// Uses the percentile where volume exceeds mean + 2σ (natural statistical boundary)
+    /// This adapts to each asset's unique volume distribution
+    pub fn spike_threshold(&self) -> f64 {
+        if self.volumes_sorted.len() < 10 {
+            return 90.0; // Bootstrap fallback - not used for signals until has_context()
+        }
+
+        let mean = self.volumes_sorted.iter().sum::<u64>() as f64 / self.volumes_sorted.len() as f64;
+        let std_dev = self.std_dev();
+
+        if std_dev <= 0.0 {
+            return 90.0; // Degenerate case - all same volume
+        }
+
+        // Spike = mean + 2σ (captures ~2.5% tail in normal distribution)
+        let spike_volume = (mean + 2.0 * std_dev) as u64;
+        self.percentile(spike_volume)
+    }
+
+    /// LOSSLESS: Derive "elevated" threshold from mean + 1σ
+    /// This is where volume becomes notably above average for this asset
+    pub fn elevated_threshold(&self) -> f64 {
+        if self.volumes_sorted.len() < 10 {
+            return 80.0; // Bootstrap fallback - not used for signals until has_context()
+        }
+
+        let mean = self.volumes_sorted.iter().sum::<u64>() as f64 / self.volumes_sorted.len() as f64;
+        let std_dev = self.std_dev();
+
+        if std_dev <= 0.0 {
+            return 80.0; // Degenerate case
+        }
+
+        // Elevated = mean + 1σ (notably above average)
+        let elevated_volume = (mean + std_dev) as u64;
+        self.percentile(elevated_volume)
     }
 
     /// Get the volume ratio (for logging/display only, NOT for signals)
@@ -324,16 +379,27 @@ mod tests {
     fn test_is_spike() {
         let mut tracker = VolumeTracker::new();
 
-        // Add 100 volumes from 100-10000
-        for i in 1..=100 {
-            tracker.update(i * 100);
+        // Add mostly "normal" volumes around 1000
+        // This creates a distribution with clear spikes
+        for _ in 0..90 {
+            tracker.update(1000);
+        }
+        // Add some slightly higher volumes
+        for _ in 0..10 {
+            tracker.update(1500);
         }
 
-        // 95th percentile volume should be a spike
-        assert!(tracker.is_spike(9500));
+        // Get the derived spike threshold (should be around mean + 2σ)
+        let threshold = tracker.spike_threshold();
+        println!("Spike threshold: {}%", threshold);
 
-        // 50th percentile volume should not be a spike
-        assert!(!tracker.is_spike(5000));
+        // Volume well above the mean should be a spike
+        // mean ≈ 1050, σ small, so 3000 should definitely be a spike
+        assert!(tracker.is_spike(3000));
+
+        // Volume at/below mean should not be a spike
+        assert!(!tracker.is_spike(1000));
+        assert!(!tracker.is_spike(500));
     }
 
     #[test]

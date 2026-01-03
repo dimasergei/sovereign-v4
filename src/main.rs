@@ -678,8 +678,8 @@ async fn process_bar_signal(
                 info!("Reason: {}", sig.reason);
                 info!("{}", SEP);
 
-                // LOSSLESS: Position size derived from support distance
-                let qty = portfolio.calculate_position_size(sig.price, sig.support);
+                // LOSSLESS: Position size derived from support distance (or ATR fallback)
+                let qty = portfolio.calculate_position_size(sig.price, sig.support, agent.atr());
                 execute_alpaca_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
             } else {
                 info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
@@ -740,8 +740,8 @@ async fn process_bar_signal_ibkr(
                 info!("Reason: {}", sig.reason);
                 info!("{}", SEP);
 
-                // LOSSLESS: Position size derived from support distance
-                let qty = portfolio.calculate_position_size(sig.price, sig.support);
+                // LOSSLESS: Position size derived from support distance (or ATR fallback)
+                let qty = portfolio.calculate_position_size(sig.price, sig.support, agent.atr());
                 execute_ibkr_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
             } else {
                 info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
