@@ -15,13 +15,14 @@
 //! # Properties
 //!
 //! - **No thresholds** - just counting
-//! - **No parameters** - granularity is the only choice (and that's aesthetic)
+//! - **No parameters** - granularity DERIVED from ATR (market data)
 //! - **No statistics** - pure 1-to-1 mapping
 //! - **Computationally light** - single subtraction per crossing
 
 use std::collections::HashMap;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal_macros::dec;
 
 /// A discretized price range
 ///
@@ -256,10 +257,77 @@ impl SRLevels {
     }
 }
 
-/// Determine appropriate granularity for a symbol
+/// Calculate ATR (Average True Range) from historical bars
 ///
-/// This is NOT a tunable parameter - it's derived from the instrument's
-/// natural tick size and typical price range.
+/// LOSSLESS: ATR is derived purely from market data - no parameters.
+/// The ATR represents the market's natural volatility/movement grid.
+///
+/// # Arguments
+/// * `bars` - Historical bars as (open, high, low, close) tuples
+///
+/// # Returns
+/// The average true range, or ZERO if insufficient data
+pub fn calculate_atr(bars: &[(Decimal, Decimal, Decimal, Decimal)]) -> Decimal {
+    if bars.len() < 2 {
+        return Decimal::ZERO;
+    }
+
+    let mut tr_sum = Decimal::ZERO;
+    for i in 1..bars.len() {
+        let (_, high, low, _) = bars[i];
+        let (_, _, _, prev_close) = bars[i - 1];
+
+        // True Range = max(H-L, |H-PC|, |L-PC|)
+        let tr = (high - low)
+            .max((high - prev_close).abs())
+            .max((low - prev_close).abs());
+        tr_sum += tr;
+    }
+
+    tr_sum / Decimal::from(bars.len() as i64 - 1)
+}
+
+/// Derive granularity from ATR (lossless - derived from market data)
+///
+/// ATR represents the market's natural price grid - how much it typically moves.
+/// Granularity = ATR / 10 gives us meaningful S/R buckets.
+///
+/// # Arguments
+/// * `atr` - Average True Range calculated from historical data
+///
+/// # Returns
+/// A "nice" granularity value rounded for readability
+pub fn granularity_from_atr(atr: Decimal) -> Decimal {
+    if atr.is_zero() {
+        return dec!(0.10); // Bootstrap fallback only
+    }
+
+    // ATR / 10 gives us ~10 S/R levels per average day's range
+    let raw = atr / dec!(10);
+
+    // Round to nearest "nice" granularity for readability (not strategy-affecting)
+    let nice_values = [
+        dec!(0.01), dec!(0.02), dec!(0.05), dec!(0.10), dec!(0.25), dec!(0.50),
+        dec!(1.00), dec!(2.50), dec!(5.00), dec!(10.00), dec!(25.00),
+        dec!(50.00), dec!(100.00),
+    ];
+
+    nice_values
+        .iter()
+        .min_by_key(|&&v| {
+            let diff = (v - raw).abs();
+            // Multiply by large factor to convert to comparable integer
+            (diff * dec!(10000)).to_i64().unwrap_or(i64::MAX)
+        })
+        .copied()
+        .unwrap_or(dec!(0.10))
+}
+
+#[deprecated(since = "4.0.0", note = "Use granularity_from_atr for lossless derivation")]
+/// Determine appropriate granularity for a symbol (legacy)
+///
+/// DEPRECATED: This uses price-based thresholds which violate lossless principles.
+/// Use `granularity_from_atr()` instead for proper lossless derivation.
 pub fn default_granularity(symbol: &str, price: Decimal) -> Decimal {
     // Crypto
     if symbol.ends_with("BTC") || symbol == "BTC" || symbol == "BTCUSD" {
@@ -423,5 +491,64 @@ mod tests {
 
         // Untraveled area at 11 stays at 0 = strongest resistance
         assert_eq!(sr.score_at(dec!(11)), 0);
+    }
+
+    #[test]
+    fn test_calculate_atr() {
+        // Test with simple bars: consistent $5 range
+        let bars = vec![
+            (dec!(100), dec!(102), dec!(98), dec!(101)),  // TR = 4 (H-L)
+            (dec!(101), dec!(105), dec!(100), dec!(103)), // TR = 5 (H-L)
+            (dec!(103), dec!(106), dec!(101), dec!(105)), // TR = 5 (H-L)
+        ];
+
+        let atr = calculate_atr(&bars);
+        // ATR should be approximately (4+5+5)/3 = 4.67 but only uses n-1 bars
+        // Actually: uses bars[1..] with prev_close from bars[i-1]
+        // Bar 1: H=105, L=100, PC=101 -> TR = max(5, 4, 1) = 5
+        // Bar 2: H=106, L=101, PC=103 -> TR = max(5, 3, 2) = 5
+        // ATR = (5+5)/2 = 5
+        assert_eq!(atr, dec!(5));
+    }
+
+    #[test]
+    fn test_calculate_atr_insufficient_data() {
+        // Single bar should return 0
+        let single_bar = vec![(dec!(100), dec!(101), dec!(99), dec!(100))];
+        assert_eq!(calculate_atr(&single_bar), Decimal::ZERO);
+
+        // Empty should return 0
+        let empty: Vec<(Decimal, Decimal, Decimal, Decimal)> = vec![];
+        assert_eq!(calculate_atr(&empty), Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_granularity_from_atr() {
+        // ATR of $10 -> raw = $1.0 -> should snap to $1.00
+        assert_eq!(granularity_from_atr(dec!(10)), dec!(1.00));
+
+        // ATR of $5 -> raw = $0.50 -> should snap to $0.50
+        assert_eq!(granularity_from_atr(dec!(5)), dec!(0.50));
+
+        // ATR of $2.5 -> raw = $0.25 -> should snap to $0.25
+        assert_eq!(granularity_from_atr(dec!(2.5)), dec!(0.25));
+
+        // ATR of $1 -> raw = $0.10 -> should snap to $0.10
+        assert_eq!(granularity_from_atr(dec!(1)), dec!(0.10));
+
+        // ATR of $100 -> raw = $10 -> should snap to $10.00
+        assert_eq!(granularity_from_atr(dec!(100)), dec!(10.00));
+
+        // Zero ATR should return default
+        assert_eq!(granularity_from_atr(Decimal::ZERO), dec!(0.10));
+    }
+
+    #[test]
+    fn test_granularity_from_atr_edge_cases() {
+        // Very small ATR (penny stock)
+        assert_eq!(granularity_from_atr(dec!(0.05)), dec!(0.01));
+
+        // Very large ATR (BTC-like)
+        assert_eq!(granularity_from_atr(dec!(1000)), dec!(100.00));
     }
 }

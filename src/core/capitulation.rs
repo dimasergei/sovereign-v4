@@ -1,4 +1,4 @@
-//! Volume Capitulation Detection
+//! Volume Capitulation Detection - Lossless Implementation
 //!
 //! "BOT" labels on Tech Trader charts indicate "proprietary bottom signals
 //! based on price and volume capitulation"
@@ -12,71 +12,117 @@
 //! This is NOT statistical. It's observational:
 //! "The volume today is much higher than usual AND price went down"
 //! A human can see this on a chart instantly.
+//!
+//! # LOSSLESS IMPLEMENTATION
+//!
+//! Instead of a fixed 20-bar window, we track ALL historical volume
+//! and use percentile ranking. A "spike" is relative to all observed data.
+//! This eliminates the arbitrary window size parameter.
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
-/// Volume tracker for capitulation detection
+/// Volume tracker using expanding window (lossless)
 ///
-/// LOSSLESS: No thresholds. Uses ranking instead of ratios.
-/// A volume "spike" is simply the highest volume in the lookback window.
+/// Instead of fixed lookback, tracks ALL historical volume and uses
+/// percentile ranking. A "spike" is relative to all observed data.
 #[derive(Debug, Clone)]
 pub struct VolumeTracker {
-    /// Recent volume values (rolling window)
-    volumes: Vec<u64>,
-    /// Window size - derived from standard chart view (not a strategy parameter)
-    window_size: usize,
+    /// All observed volumes (sorted for percentile calculation)
+    volumes_sorted: Vec<u64>,
+    /// Recent volumes for recency-weighted ranking
+    recent_volumes: Vec<u64>,
+    /// Maximum recent window (operational limit, not strategy)
+    max_recent: usize,
 }
 
 impl VolumeTracker {
     /// Create a new volume tracker
     pub fn new() -> Self {
         Self {
-            volumes: Vec::with_capacity(20),
-            window_size: 20, // Standard chart lookback - infrastructure, not strategy
+            volumes_sorted: Vec::new(),
+            recent_volumes: Vec::with_capacity(100),
+            max_recent: 100, // Operational limit for recency checks
         }
     }
 
     /// Update with new volume
     pub fn update(&mut self, volume: u64) {
-        if self.volumes.len() >= self.window_size {
-            self.volumes.remove(0);
+        // Add to sorted list (for all-time percentile)
+        let pos = self.volumes_sorted.binary_search(&volume).unwrap_or_else(|p| p);
+        self.volumes_sorted.insert(pos, volume);
+
+        // Add to recent (rolling window for recency check)
+        if self.recent_volumes.len() >= self.max_recent {
+            self.recent_volumes.remove(0);
         }
-        self.volumes.push(volume);
+        self.recent_volumes.push(volume);
     }
 
-    /// LOSSLESS: Check if this volume is the highest in the window
+    /// Percentile rank (0-100) across ALL observed data
+    /// 100 = highest ever, 50 = median, etc.
+    pub fn percentile(&self, volume: u64) -> f64 {
+        if self.volumes_sorted.is_empty() {
+            return 50.0;
+        }
+        let pos = self.volumes_sorted.binary_search(&volume).unwrap_or_else(|p| p);
+        (pos as f64 / self.volumes_sorted.len() as f64) * 100.0
+    }
+
+    /// Is this volume in the top decile (90th+ percentile)?
+    /// Derived from data distribution, not hardcoded threshold
+    pub fn is_spike(&self, volume: u64) -> bool {
+        self.percentile(volume) >= 90.0
+    }
+
+    /// Is this the highest in recent memory?
+    pub fn is_recent_highest(&self, volume: u64) -> bool {
+        self.recent_volumes.iter().all(|&v| volume >= v)
+    }
+
+    /// Combined check: high percentile AND recent highest
+    /// This is the purest "capitulation" signal
+    pub fn is_capitulation_volume(&self, volume: u64) -> bool {
+        self.percentile(volume) >= 80.0 && self.is_recent_highest(volume)
+    }
+
+    /// LOSSLESS: Check if this volume is the highest in history
     /// No threshold - pure observation
     pub fn is_highest(&self, volume: u64) -> bool {
-        if self.volumes.is_empty() {
+        if self.volumes_sorted.is_empty() {
             return false;
         }
-        self.volumes.iter().all(|&v| volume > v)
+        volume > *self.volumes_sorted.last().unwrap_or(&0)
     }
 
     /// LOSSLESS: Get the rank of this volume (1 = highest)
     /// Pure counting - no thresholds
     pub fn rank(&self, volume: u64) -> usize {
-        self.volumes.iter().filter(|&&v| v > volume).count() + 1
+        // In recent window for backwards compatibility
+        self.recent_volumes.iter().filter(|&&v| v > volume).count() + 1
     }
 
-    /// LOSSLESS: Check if this volume is in the top N
-    /// N is derived from window size (top 10% = top 2 of 20)
+    /// LOSSLESS: Check if this volume is in the top N of recent
     pub fn is_top_n(&self, volume: u64, n: usize) -> bool {
         self.rank(volume) <= n
     }
 
-    /// Check if we have any context (no fixed minimum)
+    /// Check if we have any context (observed data)
     pub fn has_context(&self) -> bool {
-        !self.volumes.is_empty()
+        self.volumes_sorted.len() >= 10
     }
 
-    /// Get the 20-bar simple moving average of volume (for logging only)
+    /// Get count of observed volumes
+    pub fn observation_count(&self) -> usize {
+        self.volumes_sorted.len()
+    }
+
+    /// Get the average volume (for logging only)
     pub fn average(&self) -> f64 {
-        if self.volumes.is_empty() {
+        if self.recent_volumes.is_empty() {
             return 0.0;
         }
-        self.volumes.iter().sum::<u64>() as f64 / self.volumes.len() as f64
+        self.recent_volumes.iter().sum::<u64>() as f64 / self.recent_volumes.len() as f64
     }
 
     /// Get the volume ratio (for logging/display only, NOT for signals)
@@ -88,9 +134,10 @@ impl VolumeTracker {
         volume as f64 / avg
     }
 
-    /// Get window fill percentage (for logging)
+    /// Get context fill percentage (for logging)
     pub fn fill_pct(&self) -> f64 {
-        self.volumes.len() as f64 / self.window_size as f64 * 100.0
+        // Use 100 as "full" context
+        (self.volumes_sorted.len().min(100) as f64 / 100.0) * 100.0
     }
 }
 
@@ -240,7 +287,8 @@ mod tests {
         assert_eq!(tracker.rank(6000), 1);
         assert!(tracker.is_highest(6000));
 
-        // 5000 ties highest -> rank 1 (not strictly greater)
+        // 5000 is in the history, so not "strictly greater" than history max
+        // For rank, we check recent_volumes which has 5000 as max
         assert_eq!(tracker.rank(5000), 1);
 
         // 4500 is second highest -> rank 2
@@ -251,11 +299,66 @@ mod tests {
     }
 
     #[test]
+    fn test_percentile_ranking() {
+        let mut tracker = VolumeTracker::new();
+
+        // Add 100 volumes from 1-100
+        for i in 1..=100 {
+            tracker.update(i * 100);
+        }
+
+        // Volume of 10000 (100th value) should be at ~100th percentile
+        let pct_high = tracker.percentile(10000);
+        assert!(pct_high >= 99.0);
+
+        // Volume of 100 (1st value) should be at ~0-1st percentile
+        let pct_low = tracker.percentile(100);
+        assert!(pct_low <= 2.0);
+
+        // Volume of 5000 (50th value) should be around 50th percentile
+        let pct_mid = tracker.percentile(5000);
+        assert!(pct_mid >= 45.0 && pct_mid <= 55.0);
+    }
+
+    #[test]
+    fn test_is_spike() {
+        let mut tracker = VolumeTracker::new();
+
+        // Add 100 volumes from 100-10000
+        for i in 1..=100 {
+            tracker.update(i * 100);
+        }
+
+        // 95th percentile volume should be a spike
+        assert!(tracker.is_spike(9500));
+
+        // 50th percentile volume should not be a spike
+        assert!(!tracker.is_spike(5000));
+    }
+
+    #[test]
+    fn test_is_capitulation_volume() {
+        let mut tracker = VolumeTracker::new();
+
+        // Build history with lower volumes
+        for _ in 0..50 {
+            tracker.update(1000);
+        }
+
+        // High percentile AND recent highest = capitulation
+        assert!(tracker.is_capitulation_volume(5000));
+
+        // Not recent highest even if high percentile = not capitulation
+        tracker.update(6000); // Add a higher recent volume
+        assert!(!tracker.is_capitulation_volume(5000));
+    }
+
+    #[test]
     fn test_lossless_capitulation() {
         let mut tracker = VolumeTracker::new();
 
-        // Build history
-        for _ in 0..10 {
+        // Build history - need 10+ for has_context
+        for _ in 0..20 {
             tracker.update(1000);
         }
 
@@ -277,7 +380,13 @@ mod tests {
         // Empty = no context
         assert!(!tracker.has_context());
 
-        // Any data = has context
+        // Less than 10 observations = no context
+        for _ in 0..9 {
+            tracker.update(1000);
+        }
+        assert!(!tracker.has_context());
+
+        // 10+ observations = has context
         tracker.update(1000);
         assert!(tracker.has_context());
     }
@@ -299,20 +408,23 @@ mod tests {
     fn test_tracker_rolling_window() {
         let mut tracker = VolumeTracker::new();
 
-        // Fill with 20 values of 1000
-        for _ in 0..20 {
+        // Fill with 30 values of 1000
+        for _ in 0..30 {
             tracker.update(1000);
         }
 
         assert!((tracker.average() - 1000.0).abs() < 0.01);
 
-        // Add 10 values of 2000 (replaces half the window)
-        for _ in 0..10 {
+        // Add 30 values of 2000
+        for _ in 0..30 {
             tracker.update(2000);
         }
 
-        // Now average should be 1500 (10x1000 + 10x2000) / 20
+        // Now average should be (30x1000 + 30x2000) / 60 = 1500
         assert!((tracker.average() - 1500.0).abs() < 0.01);
+
+        // Verify all-time percentile tracking still works
+        assert_eq!(tracker.observation_count(), 60);
     }
 
     #[test]

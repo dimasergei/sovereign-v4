@@ -8,6 +8,89 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use serde::{Deserialize, Serialize};
+
+/// Sector classification for diversification reporting
+///
+/// This is infrastructure for reporting, NOT a strategy parameter.
+/// Sector mappings are static facts about instruments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Sector {
+    Technology,
+    Finance,
+    Healthcare,
+    Industrial,
+    Consumer,
+    Energy,
+    Materials,
+    RealEstate,
+    Utilities,
+    Communications,
+    ETF,
+    Crypto,
+    Unknown,
+}
+
+impl Sector {
+    /// Get sector from symbol (static mapping)
+    pub fn from_symbol(symbol: &str) -> Self {
+        match symbol {
+            // Technology
+            "AAPL" | "MSFT" | "GOOGL" | "NVDA" | "META" | "AVGO" | "ORCL" | "CRM" |
+            "ADBE" | "AMD" | "INTC" | "CSCO" | "QCOM" | "TXN" | "AMAT" | "MU" |
+            "LRCX" | "NOW" | "INTU" | "IBM" | "PANW" | "SNOW" | "CRWD" | "ZS" |
+            "DDOG" | "NET" | "PLTR" | "SHOP" | "ROKU" => Sector::Technology,
+
+            // Finance
+            "JPM" | "BAC" | "WFC" | "GS" | "MS" | "C" | "BLK" | "SCHW" | "AXP" |
+            "V" | "MA" | "SPGI" | "CB" | "MMC" | "PGR" | "AON" | "TRV" | "MET" |
+            "COF" | "USB" | "PNC" | "TFC" | "COIN" | "SQ" | "PYPL" => Sector::Finance,
+
+            // Healthcare
+            "JNJ" | "UNH" | "PFE" | "LLY" | "ABBV" | "MRK" | "TMO" | "ABT" | "DHR" |
+            "BMY" | "AMGN" | "GILD" | "VRTX" | "REGN" | "ISRG" | "MDT" | "SYK" |
+            "ZTS" | "BDX" | "CVS" | "CI" | "HUM" => Sector::Healthcare,
+
+            // Industrial
+            "CAT" | "BA" | "GE" | "HON" | "UPS" | "RTX" | "LMT" | "DE" | "UNP" |
+            "MMM" | "FDX" | "EMR" | "ITW" | "ETN" | "PH" | "NSC" | "WM" | "GD" => Sector::Industrial,
+
+            // Consumer
+            "AMZN" | "TSLA" | "HD" | "MCD" | "NKE" | "SBUX" | "TGT" | "LOW" | "TJX" |
+            "KO" | "PEP" | "PG" | "COST" | "WMT" | "CL" | "EL" | "KMB" | "GIS" |
+            "DIS" | "NFLX" | "LULU" | "UBER" | "ABNB" => Sector::Consumer,
+
+            // Energy
+            "XOM" | "CVX" | "COP" | "SLB" | "EOG" | "MPC" | "PSX" | "VLO" | "OXY" |
+            "KMI" | "WMB" | "HAL" | "DVN" | "FANG" | "HES" | "BKR" | "PBR" => Sector::Energy,
+
+            // Communications
+            "T" | "VZ" | "TMUS" | "CHTR" | "CMCSA" => Sector::Communications,
+
+            // Real Estate
+            "AMT" | "PLD" | "CCI" | "EQIX" | "SPG" | "O" | "WELL" | "DLR" => Sector::RealEstate,
+
+            // Utilities
+            "NEE" | "DUK" | "SO" | "D" | "AEP" | "SRE" | "XEL" => Sector::Utilities,
+
+            // ETFs
+            "SPY" | "QQQ" | "IWM" | "DIA" | "SMH" | "XLF" | "XLE" | "XLK" | "XLV" |
+            "GLD" | "SLV" | "USO" | "UNG" | "TLT" | "HYG" | "EEM" | "EWZ" | "FXI" |
+            "VXX" | "ARKK" => Sector::ETF,
+
+            // Crypto
+            s if Universe::is_crypto(s) => Sector::Crypto,
+
+            _ => Sector::Unknown,
+        }
+    }
+}
+
+impl Default for Sector {
+    fn default() -> Self {
+        Sector::Unknown
+    }
+}
 
 /// Default symbols for the trading universe
 ///
@@ -274,5 +357,45 @@ mod tests {
         assert!(universe.contains("USO"));
         assert!(universe.contains("GLD"));
         assert!(!universe.contains("AAPL"));
+    }
+
+    #[test]
+    fn test_sector_mapping() {
+        // Technology
+        assert_eq!(Sector::from_symbol("AAPL"), Sector::Technology);
+        assert_eq!(Sector::from_symbol("MSFT"), Sector::Technology);
+        assert_eq!(Sector::from_symbol("NVDA"), Sector::Technology);
+
+        // Finance
+        assert_eq!(Sector::from_symbol("JPM"), Sector::Finance);
+        assert_eq!(Sector::from_symbol("GS"), Sector::Finance);
+        assert_eq!(Sector::from_symbol("V"), Sector::Finance);
+
+        // Healthcare
+        assert_eq!(Sector::from_symbol("JNJ"), Sector::Healthcare);
+        assert_eq!(Sector::from_symbol("PFE"), Sector::Healthcare);
+
+        // Industrial
+        assert_eq!(Sector::from_symbol("BA"), Sector::Industrial);
+        assert_eq!(Sector::from_symbol("CAT"), Sector::Industrial);
+
+        // Consumer
+        assert_eq!(Sector::from_symbol("AMZN"), Sector::Consumer);
+        assert_eq!(Sector::from_symbol("TSLA"), Sector::Consumer);
+
+        // Energy
+        assert_eq!(Sector::from_symbol("XOM"), Sector::Energy);
+        assert_eq!(Sector::from_symbol("CVX"), Sector::Energy);
+
+        // ETF
+        assert_eq!(Sector::from_symbol("SPY"), Sector::ETF);
+        assert_eq!(Sector::from_symbol("QQQ"), Sector::ETF);
+
+        // Crypto
+        assert_eq!(Sector::from_symbol("BTCUSD"), Sector::Crypto);
+        assert_eq!(Sector::from_symbol("BTC"), Sector::Crypto);
+
+        // Unknown
+        assert_eq!(Sector::from_symbol("UNKNOWN_SYM"), Sector::Unknown);
     }
 }

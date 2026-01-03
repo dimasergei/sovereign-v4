@@ -1,4 +1,4 @@
-//! Portfolio Management Module
+//! Portfolio Management Module - Lossless Position Sizing
 //!
 //! From Tech Trader observations:
 //! - Max exposure: 200% long OR 200% short
@@ -6,7 +6,10 @@
 //! - Both long AND short at the same time
 //! - Reports positions as "X% long by Y% short"
 //!
-//! Position sizing: ~7% per position (based on ~15 positions avg)
+//! LOSSLESS PRINCIPLE: Position size is DERIVED from:
+//! - Risk amount (1% of equity) - portfolio management, not strategy
+//! - Stop distance from S/R levels - derived from market data
+//! - NO volume scaling for size - volume affects ENTRY decision, not SIZE
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{ToPrimitive, FromPrimitive};
@@ -16,15 +19,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::core::agent::{Signal, Side, AgentSignal};
+use crate::universe::Sector;
 
 /// Maximum exposure per side (200%)
 pub const MAX_EXPOSURE_PER_SIDE: f64 = 2.0;
 
 /// Maximum number of positions
 pub const MAX_POSITIONS: usize = 20;
-
-/// Position size as percentage of account (7%)
-pub const POSITION_SIZE_PCT: f64 = 0.07;
 
 /// A position in the portfolio
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +37,8 @@ pub struct PortfolioPosition {
     pub current_price: Decimal,
     pub entry_time: DateTime<Utc>,
     pub market_value: Decimal,
+    /// Sector classification for diversification reporting
+    pub sector: Sector,
 }
 
 impl PortfolioPosition {
@@ -198,28 +201,47 @@ impl Portfolio {
         current_exposure < MAX_EXPOSURE_PER_SIDE
     }
 
-    /// Calculate position size for a new trade
+    /// Calculate position size using lossless principles
     ///
-    /// LOSSLESS: Scales with volume rank (derived from data, not threshold)
-    /// Rank 1 = highest volume = maximum size
-    /// Lower ranks = proportionally smaller
-    pub fn calculate_position_size(&self, price: Decimal, volume_rank: usize) -> Decimal {
+    /// LOSSLESS: Position size is DERIVED from:
+    /// - Risk amount (1% of equity) - portfolio management, not strategy
+    /// - Stop distance from S/R levels - derived from market data
+    /// - NO volume scaling - volume affects ENTRY decision, not SIZE
+    ///
+    /// This matches pftq's philosophy: "No tweaking, no updates"
+    pub fn calculate_position_size(&self, price: Decimal, support: Option<Decimal>) -> Decimal {
         if price.is_zero() {
             return Decimal::ZERO;
         }
 
-        // Base position value = 7% of equity (portfolio management, not strategy)
-        let base_pct = POSITION_SIZE_PCT;
+        // Portfolio risk management (not strategy parameter)
+        // 1% risk per trade is standard risk management, not a tunable strategy param
+        let risk_pct = dec!(0.01);
+        let risk_amount = self.equity * risk_pct;
 
-        // LOSSLESS: Scale based on rank (derived from data)
-        // Rank 1 = 2.0x, Rank 2 = 1.75x, Rank 3 = 1.5x, Rank 4 = 1.25x, Rank 5+ = 1.0x
-        // Formula: scale = 2.0 - (rank - 1) * 0.25, clamped to [1.0, 2.0]
-        let scale = (2.0 - (volume_rank as f64 - 1.0) * 0.25).clamp(1.0, 2.0);
+        // Stop distance DERIVED from S/R (lossless)
+        let stop_distance = match support {
+            Some(s) if s < price && !s.is_zero() => price - s,
+            _ => {
+                // No support found - use 2% of price as proxy
+                // This should rarely happen after proper bootstrap
+                price * dec!(0.02)
+            }
+        };
 
-        let position_value = self.equity * Decimal::from_f64(base_pct * scale).unwrap_or(dec!(0.07));
+        if stop_distance.is_zero() {
+            return Decimal::ZERO;
+        }
 
-        // Shares = position value / price
-        (position_value / price).round_dp(0)
+        // Position size = risk / stop distance
+        // No volume scaling - volume affects entry decision, not size
+        let shares = (risk_amount / stop_distance).round_dp(0);
+
+        // Cap at reasonable position size (max ~10% of equity)
+        let max_position_value = self.equity * dec!(0.10);
+        let max_shares = (max_position_value / price).round_dp(0);
+
+        shares.min(max_shares)
     }
 
     /// Check if a signal should be executed based on portfolio constraints
@@ -255,6 +277,59 @@ impl Portfolio {
     pub fn clear(&mut self) {
         self.positions.clear();
     }
+
+    /// Get exposure by sector (for logging/reporting only)
+    pub fn sector_exposure(&self) -> HashMap<Sector, (f64, f64)> {
+        let mut exposure: HashMap<Sector, (Decimal, Decimal)> = HashMap::new();
+
+        for pos in self.positions.values() {
+            let (long, short) = exposure.entry(pos.sector).or_insert((Decimal::ZERO, Decimal::ZERO));
+            match pos.side {
+                Side::Long => *long += pos.market_value,
+                Side::Short => *short += pos.market_value,
+            }
+        }
+
+        exposure.into_iter()
+            .map(|(sector, (long, short))| {
+                let long_pct = if self.equity.is_zero() {
+                    0.0
+                } else {
+                    (long / self.equity).to_f64().unwrap_or(0.0)
+                };
+                let short_pct = if self.equity.is_zero() {
+                    0.0
+                } else {
+                    (short / self.equity).to_f64().unwrap_or(0.0)
+                };
+                (sector, (long_pct, short_pct))
+            })
+            .collect()
+    }
+
+    /// Format sector exposure like Tech Trader: "14% short Finance, 7% long Healthcare"
+    pub fn sector_summary(&self) -> String {
+        let exposure = self.sector_exposure();
+        let mut parts: Vec<String> = exposure.into_iter()
+            .filter(|(_, (l, s))| *l > 0.01 || *s > 0.01)
+            .flat_map(|(sector, (long, short))| {
+                let mut v = vec![];
+                if long > 0.01 {
+                    v.push(format!("{:.0}% long {:?}", long * 100.0, sector));
+                }
+                if short > 0.01 {
+                    v.push(format!("{:.0}% short {:?}", short * 100.0, sector));
+                }
+                v
+            })
+            .collect();
+        parts.sort();
+        if parts.is_empty() {
+            "No sector exposure".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -273,34 +348,31 @@ mod tests {
     fn test_position_sizing_lossless() {
         let portfolio = Portfolio::new(dec!(100000));
 
-        // Rank 1 (highest) = 2.0x scale
-        // 7% * 2.0 = 14% of $100k = $14000, at $100/share = 140 shares
-        let size_rank1 = portfolio.calculate_position_size(dec!(100), 1);
-        assert_eq!(size_rank1, dec!(140));
+        // LOSSLESS: Position size derived from support distance
+        // Risk = 1% of $100k = $1000
+        // Price = $100, Support = $95 -> stop distance = $5
+        // Size = $1000 / $5 = 200 shares
+        // But capped at 10% of equity = $10000 / $100 = 100 shares
+        let size_with_support = portfolio.calculate_position_size(dec!(100), Some(dec!(95)));
+        assert_eq!(size_with_support, dec!(100)); // Capped at 10%
 
-        // Rank 2 = 1.75x scale
-        // 7% * 1.75 = 12.25% of $100k = $12250, at $100/share = 122.5 shares (rounds to 122)
-        let size_rank2 = portfolio.calculate_position_size(dec!(100), 2);
-        assert_eq!(size_rank2, dec!(122));
+        // Tighter stop = larger position (but still capped)
+        // Price = $100, Support = $98 -> stop distance = $2
+        // Size = $1000 / $2 = 500 shares (capped to 100)
+        let size_tight_stop = portfolio.calculate_position_size(dec!(100), Some(dec!(98)));
+        assert_eq!(size_tight_stop, dec!(100)); // Capped
 
-        // Rank 3 = 1.5x scale
-        // 7% * 1.5 = 10.5% of $100k = $10500, at $100/share = 105 shares
-        let size_rank3 = portfolio.calculate_position_size(dec!(100), 3);
-        assert_eq!(size_rank3, dec!(105));
+        // Wider stop = smaller position
+        // Price = $100, Support = $80 -> stop distance = $20
+        // Size = $1000 / $20 = 50 shares (under cap, so actual 50)
+        let size_wide_stop = portfolio.calculate_position_size(dec!(100), Some(dec!(80)));
+        assert_eq!(size_wide_stop, dec!(50));
 
-        // Rank 4 = 1.25x scale
-        // 7% * 1.25 = 8.75% of $100k = $8750, at $100/share = 88 shares (rounded)
-        let size_rank4 = portfolio.calculate_position_size(dec!(100), 4);
-        assert_eq!(size_rank4, dec!(88));
-
-        // Rank 5+ = 1.0x scale (minimum)
-        // 7% * 1.0 = 7% of $100k = $7000, at $100/share = 70 shares
-        let size_rank5 = portfolio.calculate_position_size(dec!(100), 5);
-        assert_eq!(size_rank5, dec!(70));
-
-        // Higher ranks still get minimum scale
-        let size_rank10 = portfolio.calculate_position_size(dec!(100), 10);
-        assert_eq!(size_rank10, dec!(70));
+        // No support = use 2% fallback
+        // Price = $100, no support -> stop distance = $2
+        // Size = $1000 / $2 = 500 shares (capped to 100)
+        let size_no_support = portfolio.calculate_position_size(dec!(100), None);
+        assert_eq!(size_no_support, dec!(100)); // Capped
     }
 
     #[test]
@@ -316,6 +388,7 @@ mod tests {
             current_price: dec!(100),
             entry_time: Utc::now(),
             market_value: dec!(50000),
+            sector: Sector::Technology,
         });
 
         assert!((portfolio.long_exposure_pct() - 0.5).abs() < 0.01);
@@ -340,6 +413,7 @@ mod tests {
                 current_price: dec!(100),
                 entry_time: Utc::now(),
                 market_value: dec!(10000), // 10% each
+                sector: Sector::Unknown,
             });
         }
 
@@ -355,6 +429,7 @@ mod tests {
             current_price: dec!(100),
             entry_time: Utc::now(),
             market_value: dec!(10000),
+            sector: Sector::Unknown,
         });
 
         // Now at 200% - can't open more longs (hit position limit of 20)
@@ -378,6 +453,7 @@ mod tests {
             current_price: dec!(110),
             entry_time: Utc::now(),
             market_value: dec!(11000),
+            sector: Sector::Technology,
         });
 
         // Should have $1000 unrealized gain
@@ -396,6 +472,7 @@ mod tests {
             current_price: dec!(100),
             entry_time: Utc::now(),
             market_value: dec!(50000),
+            sector: Sector::Technology,
         });
 
         portfolio.add_position(PortfolioPosition {
@@ -406,6 +483,7 @@ mod tests {
             current_price: dec!(100),
             entry_time: Utc::now(),
             market_value: dec!(25000),
+            sector: Sector::Finance,
         });
 
         let summary = portfolio.exposure_summary();
@@ -428,6 +506,7 @@ mod tests {
             current_price: dec!(150),
             entry_time: Utc::now(),
             market_value: dec!(15000),
+            sector: Sector::Technology,
         });
 
         assert!(portfolio.has_position(symbol));
@@ -442,5 +521,51 @@ mod tests {
         let removed = portfolio.remove_position(symbol);
         assert!(removed.is_some());
         assert!(!portfolio.has_position(symbol));
+    }
+
+    #[test]
+    fn test_sector_exposure() {
+        let mut portfolio = Portfolio::new(dec!(100000));
+
+        // Add tech long position (30% of equity)
+        portfolio.add_position(PortfolioPosition {
+            symbol: "AAPL".to_string(),
+            side: Side::Long,
+            quantity: dec!(300),
+            entry_price: dec!(100),
+            current_price: dec!(100),
+            entry_time: Utc::now(),
+            market_value: dec!(30000),
+            sector: Sector::Technology,
+        });
+
+        // Add finance short position (20% of equity)
+        portfolio.add_position(PortfolioPosition {
+            symbol: "JPM".to_string(),
+            side: Side::Short,
+            quantity: dec!(200),
+            entry_price: dec!(100),
+            current_price: dec!(100),
+            entry_time: Utc::now(),
+            market_value: dec!(20000),
+            sector: Sector::Finance,
+        });
+
+        let sector_exp = portfolio.sector_exposure();
+
+        // Check tech exposure
+        let (tech_long, tech_short) = sector_exp.get(&Sector::Technology).unwrap_or(&(0.0, 0.0));
+        assert!((*tech_long - 0.30).abs() < 0.01);
+        assert!(*tech_short < 0.01);
+
+        // Check finance exposure
+        let (fin_long, fin_short) = sector_exp.get(&Sector::Finance).unwrap_or(&(0.0, 0.0));
+        assert!(*fin_long < 0.01);
+        assert!((*fin_short - 0.20).abs() < 0.01);
+
+        // Check sector summary
+        let summary = portfolio.sector_summary();
+        assert!(summary.contains("Technology") || summary.contains("long"));
+        assert!(summary.contains("Finance") || summary.contains("short"));
     }
 }

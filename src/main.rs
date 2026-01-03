@@ -27,7 +27,7 @@ mod config;
 
 use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor};
 use crate::core::health::HealthStatus;
-use crate::universe::Universe;
+use crate::universe::{Universe, Sector};
 use crate::portfolio::{Portfolio, PortfolioPosition};
 use crate::data::alpaca_stream::{self, AlpacaMessage};
 use crate::data::database::TradeDb;
@@ -266,9 +266,9 @@ async fn main() -> Result<()> {
     let telegram_enabled = cfg.telegram.enabled;
 
     info!("Strategy: Lossless S/R + Volume Capitulation");
-    info!("Portfolio: Max {:.0}% exposure per side, ~{:.0}% per position",
-        portfolio::MAX_EXPOSURE_PER_SIDE * 100.0,
-        portfolio::POSITION_SIZE_PCT * 100.0);
+    info!("Portfolio: Max {:.0}% exposure per side, position size derived from S/R",
+        portfolio::MAX_EXPOSURE_PER_SIDE * 100.0);
+    info!("Position Sizing: 1% risk per trade, size = risk / stop distance");
     info!("Health: Bar-based monitoring (90s timeout)");
     info!("Market Status: {}", if is_market_open() { "OPEN" } else { "CLOSED" });
 
@@ -328,6 +328,7 @@ async fn recover_alpaca_positions(
                         current_price: entry_price,
                         entry_time: Utc::now(),
                         market_value,
+                        sector: Sector::from_symbol(&pos.symbol),
                     });
 
                     if let Some(agent) = agents.get_mut(&pos.symbol) {
@@ -378,6 +379,7 @@ async fn recover_ibkr_positions(
                         current_price: entry_price,
                         entry_time: Utc::now(),
                         market_value,
+                        sector: Sector::from_symbol(&symbol),
                     });
 
                     if let Some(agent) = agents.get_mut(&symbol) {
@@ -509,12 +511,14 @@ async fn run_alpaca_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
                 if telegram_enabled {
+                    let sector_info = portfolio.sector_summary();
                     telegram::send_daily_summary(
                         portfolio.position_count(),
                         portfolio.long_exposure_pct(),
                         portfolio.short_exposure_pct(),
                         portfolio.unrealized_pnl(),
                         bar_count,
+                        &sector_info,
                     ).await;
                 }
             }
@@ -613,12 +617,14 @@ async fn run_ibkr_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
                 if telegram_enabled {
+                    let sector_info = portfolio.sector_summary();
                     telegram::send_daily_summary(
                         portfolio.position_count(),
                         portfolio.long_exposure_pct(),
                         portfolio.short_exposure_pct(),
                         portfolio.unrealized_pnl(),
                         bar_count,
+                        &sector_info,
                     ).await;
                 }
             }
@@ -667,11 +673,13 @@ async fn process_bar_signal(
         if let Some(sig) = signal {
             if portfolio.should_execute(&sig) {
                 info!("{}", SEP);
-                info!("SIGNAL: {} {} @ {:.2} (volume rank #{})", sig.signal, sig.symbol, sig.price, sig.volume_rank);
+                info!("SIGNAL: {} {} @ {:.2} ({:.0}th percentile volume)",
+                    sig.signal, sig.symbol, sig.price, sig.volume_percentile);
                 info!("Reason: {}", sig.reason);
                 info!("{}", SEP);
 
-                let qty = portfolio.calculate_position_size(sig.price, sig.volume_rank);
+                // LOSSLESS: Position size derived from support distance
+                let qty = portfolio.calculate_position_size(sig.price, sig.support);
                 execute_alpaca_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
             } else {
                 info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
@@ -727,11 +735,13 @@ async fn process_bar_signal_ibkr(
         if let Some(sig) = signal {
             if portfolio.should_execute(&sig) {
                 info!("{}", SEP);
-                info!("SIGNAL: {} {} @ {:.2} (volume rank #{})", sig.signal, sig.symbol, sig.price, sig.volume_rank);
+                info!("SIGNAL: {} {} @ {:.2} ({:.0}th percentile volume)",
+                    sig.signal, sig.symbol, sig.price, sig.volume_percentile);
                 info!("Reason: {}", sig.reason);
                 info!("{}", SEP);
 
-                let qty = portfolio.calculate_position_size(sig.price, sig.volume_rank);
+                // LOSSLESS: Position size derived from support distance
+                let qty = portfolio.calculate_position_size(sig.price, sig.support);
                 execute_ibkr_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
             } else {
                 info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
@@ -770,6 +780,7 @@ async fn execute_alpaca_signal(
                         current_price: sig.price,
                         entry_time: Utc::now(),
                         market_value: qty * sig.price,
+                        sector: Sector::from_symbol(&sig.symbol),
                     });
 
                     if telegram_enabled {
@@ -815,6 +826,7 @@ async fn execute_alpaca_signal(
                         current_price: sig.price,
                         entry_time: Utc::now(),
                         market_value: qty * sig.price,
+                        sector: Sector::from_symbol(&sig.symbol),
                     });
 
                     if telegram_enabled {
@@ -871,6 +883,7 @@ async fn execute_ibkr_signal(
                         current_price: sig.price,
                         entry_time: Utc::now(),
                         market_value: qty * sig.price,
+                        sector: Sector::from_symbol(&sig.symbol),
                     });
 
                     if telegram_enabled {
@@ -910,6 +923,7 @@ async fn execute_ibkr_signal(
                         current_price: sig.price,
                         entry_time: Utc::now(),
                         market_value: qty * sig.price,
+                        sector: Sector::from_symbol(&sig.symbol),
                     });
 
                     if telegram_enabled {

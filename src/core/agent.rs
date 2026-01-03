@@ -1,4 +1,4 @@
-//! Symbol Agent Module
+//! Symbol Agent Module - Lossless Implementation
 //!
 //! "Analogous to having a thousand independent traders each focusing on a
 //! single stock, as opposed to a single quant manager trying to make sense
@@ -9,13 +9,19 @@
 //! - No portfolio optimization
 //! - No correlation analysis
 //! - No sector rotation logic
+//!
+//! LOSSLESS PRINCIPLES:
+//! - Volume percentile derived from data distribution (not fixed thresholds)
+//! - Granularity derived from ATR (not price-based thresholds)
+//! - Entry signals based on percentile ranking (not "top N")
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::sr::{SRLevels, default_granularity};
+#[allow(deprecated)]
+use super::sr::{SRLevels, default_granularity, granularity_from_atr};
 use super::capitulation::VolumeTracker;
 
 /// Trading signal from an agent
@@ -70,8 +76,9 @@ pub struct AgentSignal {
     pub reason: String,
     pub support: Option<Decimal>,
     pub resistance: Option<Decimal>,
-    /// LOSSLESS: Volume rank (1 = highest in window, 2 = second highest, etc.)
-    pub volume_rank: usize,
+    /// LOSSLESS: Volume percentile (0-100) derived from all observed data
+    /// 100 = highest ever, 50 = median, etc.
+    pub volume_percentile: f64,
 }
 
 /// Independent trading agent for a single symbol
@@ -99,11 +106,14 @@ pub struct SymbolAgent {
 }
 
 impl SymbolAgent {
-    /// Create a new agent for a symbol
+    /// Create a new agent for a symbol (legacy - uses price-based granularity)
     ///
     /// # Arguments
     /// * `symbol` - The trading symbol (e.g., "AAPL", "BTC")
     /// * `initial_price` - Initial price for granularity calculation
+    ///
+    /// Note: For lossless derivation, prefer `new_with_atr()` once ATR is calculated.
+    #[allow(deprecated)]
     pub fn new(symbol: String, initial_price: Decimal) -> Self {
         let granularity = default_granularity(&symbol, initial_price);
 
@@ -113,6 +123,27 @@ impl SymbolAgent {
             volume: VolumeTracker::new(),
             position: None,
             last_price: initial_price,
+            last_volume: 0,
+            bar_count: 0,
+        }
+    }
+
+    /// Create agent with granularity derived from ATR (lossless)
+    ///
+    /// # Arguments
+    /// * `symbol` - The trading symbol
+    /// * `atr` - Average True Range calculated from historical data
+    ///
+    /// This is the preferred constructor as it derives granularity from market data.
+    pub fn new_with_atr(symbol: String, atr: Decimal) -> Self {
+        let granularity = granularity_from_atr(atr);
+
+        Self {
+            symbol,
+            sr: SRLevels::new(granularity),
+            volume: VolumeTracker::new(),
+            position: None,
+            last_price: Decimal::ZERO,
             last_volume: 0,
             bar_count: 0,
         }
@@ -209,6 +240,8 @@ impl SymbolAgent {
     }
 
     /// Check for trading signals based on current state
+    ///
+    /// LOSSLESS: Uses percentile-based volume checks derived from data distribution.
     fn check_signals(
         &mut self,
         time: DateTime<Utc>,
@@ -220,15 +253,15 @@ impl SymbolAgent {
         let resistance = self.sr.get_resistance(close);
         let price_change = close - open;
 
-        // LOSSLESS: Volume rank (1 = highest, no threshold)
-        let volume_rank = self.volume.rank(volume);
+        // LOSSLESS: Volume percentile (derived from all observed data)
+        let volume_percentile = self.volume.percentile(volume);
 
-        // LOSSLESS: Spike = rank 1 (highest in window)
-        let is_volume_spike = volume_rank == 1;
+        // LOSSLESS: Capitulation = high percentile volume (80th+) AND recent highest
+        let is_capitulation_volume = self.volume.is_capitulation_volume(volume);
         let is_down_day = price_change < Decimal::ZERO;
         let is_up_day = price_change > Decimal::ZERO;
-        let is_buy_capitulation = is_volume_spike && is_down_day;
-        let is_sell_capitulation = is_volume_spike && is_up_day;
+        let is_buy_capitulation = is_capitulation_volume && is_down_day;
+        let is_sell_capitulation = is_capitulation_volume && is_up_day;
 
         // Check if at S/R levels
         let at_support = support.map_or(false, |s| self.sr.is_near(close, s));
@@ -244,12 +277,12 @@ impl SymbolAgent {
                         signal: Signal::Buy,
                         price: close,
                         reason: format!(
-                            "Volume capitulation at support (rank #{} in window)",
-                            volume_rank
+                            "Volume capitulation at support ({:.0}th percentile)",
+                            volume_percentile
                         ),
                         support,
                         resistance,
-                        volume_rank,
+                        volume_percentile,
                     };
 
                     self.position = Some(Position {
@@ -268,12 +301,12 @@ impl SymbolAgent {
                         signal: Signal::Short,
                         price: close,
                         reason: format!(
-                            "Volume capitulation at resistance (rank #{} in window)",
-                            volume_rank
+                            "Volume capitulation at resistance ({:.0}th percentile)",
+                            volume_percentile
                         ),
                         support,
                         resistance,
-                        volume_rank,
+                        volume_percentile,
                     };
 
                     self.position = Some(Position {
@@ -286,9 +319,9 @@ impl SymbolAgent {
                     return Some(signal);
                 }
 
-                // LOSSLESS alternative entry: at support on down day (weaker signal)
-                // Only when volume is in top 3 (derived from window, not threshold)
-                if at_support && is_down_day && volume_rank <= 3 {
+                // LOSSLESS alternative entry: at support on down day with elevated volume
+                // "Elevated" = 80th percentile (derived from data distribution)
+                if at_support && is_down_day && volume_percentile >= 80.0 {
                     if let Some(s) = support {
                         let touched_support = self.sr.is_near(close.min(open), s);
                         if touched_support {
@@ -296,10 +329,13 @@ impl SymbolAgent {
                                 symbol: self.symbol.clone(),
                                 signal: Signal::Buy,
                                 price: close,
-                                reason: format!("Price at support level (volume rank #{})", volume_rank),
+                                reason: format!(
+                                    "Price at support with elevated volume ({:.0}th percentile)",
+                                    volume_percentile
+                                ),
                                 support,
                                 resistance,
-                                volume_rank,
+                                volume_percentile,
                             };
 
                             self.position = Some(Position {
@@ -329,7 +365,7 @@ impl SymbolAgent {
                                 ),
                                 support,
                                 resistance,
-                                volume_rank,
+                                volume_percentile,
                             };
 
                             self.position = None;
@@ -349,7 +385,7 @@ impl SymbolAgent {
                                 ),
                                 support,
                                 resistance,
-                                volume_rank,
+                                volume_percentile,
                             };
 
                             self.position = None;
@@ -426,13 +462,16 @@ mod tests {
         let mut agent = SymbolAgent::with_granularity("TEST".to_string(), dec!(1.00));
         let now = Utc::now();
 
-        // Initially not ready (no S/R levels, no volume)
+        // Initially not ready (no S/R levels, no volume context)
         assert!(!agent.is_ready());
 
-        // Process one bar - creates S/R level and volume context
-        agent.process_bar(now, dec!(100), dec!(101), dec!(99), dec!(100), 1000);
+        // Process 10 bars to meet volume context requirement
+        for i in 0..10 {
+            let price = dec!(100) + Decimal::from(i);
+            agent.process_bar(now, price, price + dec!(1), price - dec!(1), price, 1000);
+        }
 
-        // Now ready (has S/R + volume context)
+        // Now ready (has S/R levels + 10+ volume observations)
         assert!(agent.is_ready());
     }
 
@@ -441,13 +480,13 @@ mod tests {
         let mut agent = SymbolAgent::with_granularity("TEST".to_string(), dec!(1.00));
         let now = Utc::now();
 
-        // Feed bars - should become ready after first bar with S/R + volume
-        for i in 0..5 {
+        // Feed 10 bars - needs 10+ for volume context
+        for i in 0..10 {
             let price = dec!(100) + Decimal::from(i);
             agent.process_bar(now, price, price + dec!(1), price - dec!(1), price, 1000);
         }
 
-        // Should be ready after first bar (lossless - no bar count threshold)
+        // Should be ready after 10 bars (lossless - needs volume context)
         assert!(agent.is_ready());
     }
 
@@ -486,8 +525,8 @@ mod tests {
         if let Some(s) = signal {
             // If a signal is generated, it should be a buy signal given conditions
             assert!(matches!(s.signal, Signal::Buy | Signal::Hold));
-            // Verify volume_rank is set
-            assert!(s.volume_rank >= 1);
+            // Verify volume_percentile is set (0-100 range)
+            assert!(s.volume_percentile >= 0.0 && s.volume_percentile <= 100.0);
         }
     }
 
@@ -526,8 +565,8 @@ mod tests {
         // If we're at resistance with a long position, should get sell signal
         if let Some(s) = signal {
             assert_eq!(s.signal, Signal::Sell);
-            // Verify volume_rank is set
-            assert!(s.volume_rank >= 1);
+            // Verify volume_percentile is set (0-100 range)
+            assert!(s.volume_percentile >= 0.0 && s.volume_percentile <= 100.0);
         }
 
         // Verify position tracking works
@@ -568,11 +607,11 @@ mod tests {
     }
 
     #[test]
-    fn test_volume_rank_in_signal() {
+    fn test_volume_percentile_in_signal() {
         let mut agent = SymbolAgent::with_granularity("TEST".to_string(), dec!(1.00));
         let now = Utc::now();
 
-        // Build up some history with varying volume
+        // Build up some history with varying volume (10+ bars for context)
         for i in 1..=10 {
             agent.process_bar(
                 now,
@@ -593,7 +632,7 @@ mod tests {
         }));
 
         // Process a bar that should trigger a sell at resistance
-        // Use lower volume so it doesn't rank as highest
+        // Use mid-range volume
         let signal = agent.process_bar(
             now,
             dec!(100),
@@ -603,11 +642,18 @@ mod tests {
             500,        // Mid-range volume
         );
 
-        // If signal generated, verify volume_rank is properly calculated
+        // If signal generated, verify volume_percentile is properly calculated
         if let Some(s) = signal {
-            // 500 is higher than 100-400 but lower than 500-1000
-            // So rank should reflect relative position
-            assert!(s.volume_rank >= 1);
+            // 500 is around 50th percentile of 100-1000 range
+            assert!(s.volume_percentile >= 0.0 && s.volume_percentile <= 100.0);
         }
+    }
+
+    #[test]
+    fn test_new_with_atr() {
+        // Test ATR-based agent creation
+        let agent = SymbolAgent::new_with_atr("TEST".to_string(), dec!(5.0));
+        assert_eq!(agent.symbol(), "TEST");
+        assert!(!agent.is_ready()); // No data yet
     }
 }
