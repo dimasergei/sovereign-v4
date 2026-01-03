@@ -80,18 +80,26 @@ pub async fn send_daily_summary(
     short_exposure: f64,
     unrealized_pnl: rust_decimal::Decimal,
     total_bars: u64,
+    sector_info: &str,
 ) {
+    let sector_line = if sector_info.is_empty() || sector_info == "No sector exposure" {
+        String::new()
+    } else {
+        format!("\nSectors: {}", sector_info)
+    };
+
     let msg = format!(
         "📊 <b>Daily Summary</b>\n\n\
         Positions: {}\n\
         Exposure: {:.0}% long / {:.0}% short\n\
         Unrealized P&L: ${:.2}\n\
-        Bars Processed: {}",
+        Bars Processed: {}{}",
         positions,
         long_exposure * 100.0,
         short_exposure * 100.0,
         unrealized_pnl,
-        total_bars
+        total_bars,
+        sector_line
     );
     let _ = send(&msg).await;
 }
