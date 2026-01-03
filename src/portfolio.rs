@@ -206,10 +206,21 @@ impl Portfolio {
     /// LOSSLESS: Position size is DERIVED from:
     /// - Risk amount (1% of equity) - portfolio management, not strategy
     /// - Stop distance from S/R levels - derived from market data
+    /// - ATR fallback when no S/R available - derived from volatility
     /// - NO volume scaling - volume affects ENTRY decision, not SIZE
     ///
     /// This matches pftq's philosophy: "No tweaking, no updates"
-    pub fn calculate_position_size(&self, price: Decimal, support: Option<Decimal>) -> Decimal {
+    ///
+    /// # Arguments
+    /// * `price` - Current price
+    /// * `support` - Derived support level (preferred for stop distance)
+    /// * `atr` - Average True Range fallback (used when no support)
+    pub fn calculate_position_size(
+        &self,
+        price: Decimal,
+        support: Option<Decimal>,
+        atr: Option<Decimal>,
+    ) -> Decimal {
         if price.is_zero() {
             return Decimal::ZERO;
         }
@@ -219,13 +230,20 @@ impl Portfolio {
         let risk_pct = dec!(0.01);
         let risk_amount = self.equity * risk_pct;
 
-        // Stop distance DERIVED from S/R (lossless)
+        // Stop distance DERIVED from S/R (lossless) or ATR fallback
         let stop_distance = match support {
             Some(s) if s < price && !s.is_zero() => price - s,
             _ => {
-                // No support found - use 2% of price as proxy
-                // This should rarely happen after proper bootstrap
-                price * dec!(0.02)
+                // No support found - use ATR as derived fallback
+                // ATR represents natural volatility, derived from price data
+                match atr {
+                    Some(a) if !a.is_zero() => a,
+                    _ => {
+                        // No ATR either - cannot size safely
+                        // This should never happen after proper bootstrap
+                        return Decimal::ZERO;
+                    }
+                }
             }
         };
 
@@ -353,26 +371,30 @@ mod tests {
         // Price = $100, Support = $95 -> stop distance = $5
         // Size = $1000 / $5 = 200 shares
         // But capped at 10% of equity = $10000 / $100 = 100 shares
-        let size_with_support = portfolio.calculate_position_size(dec!(100), Some(dec!(95)));
+        let size_with_support = portfolio.calculate_position_size(dec!(100), Some(dec!(95)), None);
         assert_eq!(size_with_support, dec!(100)); // Capped at 10%
 
         // Tighter stop = larger position (but still capped)
         // Price = $100, Support = $98 -> stop distance = $2
         // Size = $1000 / $2 = 500 shares (capped to 100)
-        let size_tight_stop = portfolio.calculate_position_size(dec!(100), Some(dec!(98)));
+        let size_tight_stop = portfolio.calculate_position_size(dec!(100), Some(dec!(98)), None);
         assert_eq!(size_tight_stop, dec!(100)); // Capped
 
         // Wider stop = smaller position
         // Price = $100, Support = $80 -> stop distance = $20
         // Size = $1000 / $20 = 50 shares (under cap, so actual 50)
-        let size_wide_stop = portfolio.calculate_position_size(dec!(100), Some(dec!(80)));
+        let size_wide_stop = portfolio.calculate_position_size(dec!(100), Some(dec!(80)), None);
         assert_eq!(size_wide_stop, dec!(50));
 
-        // No support = use 2% fallback
-        // Price = $100, no support -> stop distance = $2
-        // Size = $1000 / $2 = 500 shares (capped to 100)
-        let size_no_support = portfolio.calculate_position_size(dec!(100), None);
-        assert_eq!(size_no_support, dec!(100)); // Capped
+        // No support but has ATR = use ATR as fallback
+        // Price = $100, no support, ATR = $3 -> stop distance = $3
+        // Size = $1000 / $3 = 333 shares (capped to 100)
+        let size_atr_fallback = portfolio.calculate_position_size(dec!(100), None, Some(dec!(3)));
+        assert_eq!(size_atr_fallback, dec!(100)); // Capped
+
+        // No support and no ATR = cannot size safely (returns 0)
+        let size_no_data = portfolio.calculate_position_size(dec!(100), None, None);
+        assert_eq!(size_no_data, dec!(0));
     }
 
     #[test]
