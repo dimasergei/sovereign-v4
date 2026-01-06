@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -45,6 +45,7 @@ const MOE_PATH: &str = "sovereign_moe.json";
 const META_PATH: &str = "sovereign_meta.json";
 const WEAKNESS_PATH: &str = "sovereign_weakness.json";
 const CAUSALITY_PATH: &str = "sovereign_causality.json";
+const WORLDMODEL_PATH: &str = "sovereign_worldmodel.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -120,6 +121,45 @@ fn save_causality(causal_analyzer: &Arc<Mutex<CausalAnalyzer>>) {
         warn!("Failed to save CausalAnalyzer: {}", e);
     } else {
         info!("Causal: Saved - {}", ca.format_summary());
+    }
+}
+
+/// Save WorldModel state
+fn save_worldmodel(world_model: &Arc<Mutex<WorldModel>>) {
+    let wm = world_model.lock().unwrap();
+    let symbols = wm.get_symbols();
+    // Serialize and save
+    match serde_json::to_string_pretty(&*wm) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(WORLDMODEL_PATH, json) {
+                warn!("Failed to save WorldModel: {}", e);
+            } else {
+                info!("WorldModel: Saved - {} symbols, equity {:.2}", symbols.len(), wm.get_equity());
+            }
+        }
+        Err(e) => warn!("Failed to serialize WorldModel: {}", e),
+    }
+}
+
+/// Load WorldModel from file
+fn load_worldmodel(initial_equity: f64) -> WorldModel {
+    match std::fs::read_to_string(WORLDMODEL_PATH) {
+        Ok(json) => {
+            match serde_json::from_str::<WorldModel>(&json) {
+                Ok(wm) => {
+                    info!("WorldModel: Loaded from {}", WORLDMODEL_PATH);
+                    wm
+                }
+                Err(e) => {
+                    warn!("Failed to parse WorldModel: {}, creating new", e);
+                    WorldModel::new(initial_equity)
+                }
+            }
+        }
+        Err(_) => {
+            info!("WorldModel: Creating new (no saved state)");
+            WorldModel::new(initial_equity)
+        }
     }
 }
 
@@ -409,6 +449,19 @@ async fn main() -> Result<()> {
         agent.attach_causal_analyzer(Arc::clone(&causal_analyzer));
     }
 
+    // Load WorldModel for forward planning
+    let initial_equity_f64 = initial_balance.to_f64().unwrap_or(100000.0);
+    let world_model = Arc::new(Mutex::new(load_worldmodel(initial_equity_f64)));
+    {
+        let wm = world_model.lock().unwrap();
+        info!("WorldModel: Loaded - {} symbols, equity {:.2}", wm.get_symbols().len(), wm.get_equity());
+    }
+
+    // Attach WorldModel to all agents
+    for agent in agents.values_mut() {
+        agent.attach_world_model(Arc::clone(&world_model));
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -461,6 +514,7 @@ async fn main() -> Result<()> {
                 &meta_learner,
                 &weakness_analyzer,
                 &causal_analyzer,
+                &world_model,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -477,6 +531,7 @@ async fn main() -> Result<()> {
                 &meta_learner,
                 &weakness_analyzer,
                 &causal_analyzer,
+                &world_model,
             ).await
         }
     }
@@ -595,6 +650,7 @@ async fn run_alpaca_loop(
     meta_learner: &Arc<Mutex<MetaLearner>>,
     weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
     causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
+    world_model: &Arc<Mutex<WorldModel>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -697,13 +753,14 @@ async fn run_alpaca_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, and CausalAnalyzer
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, and WorldModel
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
                 save_meta(meta_learner);
                 save_weakness(weakness_analyzer);
                 save_causality(causal_analyzer);
+                save_worldmodel(world_model);
 
                 // Run periodic weakness analysis on trade history
                 {
@@ -765,6 +822,7 @@ async fn run_ibkr_loop(
     meta_learner: &Arc<Mutex<MetaLearner>>,
     weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
     causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
+    world_model: &Arc<Mutex<WorldModel>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -844,13 +902,14 @@ async fn run_ibkr_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, and CausalAnalyzer
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, and WorldModel
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
                 save_meta(meta_learner);
                 save_weakness(weakness_analyzer);
                 save_causality(causal_analyzer);
+                save_worldmodel(world_model);
 
                 // Run periodic weakness analysis on trade history
                 {

@@ -32,6 +32,7 @@ use super::moe::MixtureOfExperts;
 use super::metalearner::{MetaLearner, calculate_accuracy};
 use super::weakness::WeaknessAnalyzer;
 use super::causality::CausalAnalyzer;
+use super::worldmodel::{WorldModel, PositionDirection};
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -194,6 +195,10 @@ pub struct SymbolAgent {
     // Causal reasoning
     /// Shared causal analyzer for understanding market relationships
     causal_analyzer: Option<Arc<Mutex<CausalAnalyzer>>>,
+
+    // World model for forward planning
+    /// Shared world model for market dynamics simulation
+    world_model: Option<Arc<Mutex<WorldModel>>>,
 }
 
 impl SymbolAgent {
@@ -233,6 +238,7 @@ impl SymbolAgent {
             meta_adaptation_threshold: 10,
             weakness_analyzer: None,
             causal_analyzer: None,
+            world_model: None,
         }
     }
 
@@ -266,6 +272,7 @@ impl SymbolAgent {
             meta_adaptation_threshold: 10,
             weakness_analyzer: None,
             causal_analyzer: None,
+            world_model: None,
         }
     }
 
@@ -304,6 +311,7 @@ impl SymbolAgent {
             meta_adaptation_threshold: 10,
             weakness_analyzer: None,
             causal_analyzer: None,
+            world_model: None,
         }
     }
 
@@ -334,6 +342,7 @@ impl SymbolAgent {
             meta_adaptation_threshold: 10,
             weakness_analyzer: None,
             causal_analyzer: None,
+            world_model: None,
         }
     }
 
@@ -1550,6 +1559,83 @@ impl SymbolAgent {
 
         let ca_lock = ca.lock().unwrap();
         ca_lock.predict_regime_from_causes(&self.symbol)
+    }
+
+    // ==================== World Model Methods ====================
+
+    /// Attach world model for forward planning
+    pub fn attach_world_model(&mut self, wm: Arc<Mutex<WorldModel>>) {
+        self.world_model = Some(wm);
+    }
+
+    /// Check if world model is attached
+    pub fn has_world_model(&self) -> bool {
+        self.world_model.is_some()
+    }
+
+    /// Get reference to world model
+    pub fn world_model(&self) -> Option<&Arc<Mutex<WorldModel>>> {
+        self.world_model.as_ref()
+    }
+
+    /// Update world model with current price and regime
+    pub fn update_world_model(&self, price: Decimal, regime: Regime) {
+        if let Some(ref wm) = self.world_model {
+            let mut wm_lock = wm.lock().unwrap();
+            let mut prices = std::collections::HashMap::new();
+            prices.insert(self.symbol.clone(), price);
+            let mut regimes = std::collections::HashMap::new();
+            regimes.insert(self.symbol.clone(), regime);
+            wm_lock.update_state(prices, regimes);
+        }
+    }
+
+    /// Get world model confidence adjustment for a trade direction
+    ///
+    /// Returns a value in [0.5, 1.5] to adjust position size:
+    /// - > 1.0 if world model predicts favorable conditions
+    /// - < 1.0 if world model predicts unfavorable conditions
+    pub fn get_world_model_confidence(&self, is_long: bool) -> f64 {
+        let Some(ref wm) = self.world_model else {
+            return 1.0;
+        };
+
+        let wm_lock = wm.lock().unwrap();
+        let direction = if is_long {
+            PositionDirection::Long
+        } else {
+            PositionDirection::Short
+        };
+
+        wm_lock.get_prediction_confidence(&self.symbol, direction)
+    }
+
+    /// Get expected value from world model for a trade direction
+    ///
+    /// Returns the expected profit/loss based on Monte Carlo simulation
+    pub fn get_world_model_expected_value(&self, is_long: bool, horizon: usize) -> f64 {
+        let Some(ref wm) = self.world_model else {
+            return 0.0;
+        };
+
+        let wm_lock = wm.lock().unwrap();
+        let direction = if is_long {
+            PositionDirection::Long
+        } else {
+            PositionDirection::Short
+        };
+
+        wm_lock.get_expected_value(&self.symbol, direction, horizon)
+    }
+
+    /// Get price forecast from world model
+    pub fn get_price_forecast(&self, steps_ahead: usize) -> Option<super::worldmodel::PriceForecast> {
+        let Some(ref wm) = self.world_model else {
+            return None;
+        };
+
+        let wm_lock = wm.lock().unwrap();
+        wm_lock.forecast_price(&self.symbol, steps_ahead, 500)
     }
 }
 

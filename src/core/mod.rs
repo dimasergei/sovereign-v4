@@ -20,6 +20,7 @@ pub mod transfer;
 pub mod moe;
 pub mod weakness;
 pub mod causality;
+pub mod worldmodel;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
@@ -31,3 +32,4 @@ pub use transfer::{TransferManager, AssetCluster, get_cluster};
 pub use moe::{MixtureOfExperts, Expert};
 pub use weakness::{WeaknessAnalyzer, Weakness, WeaknessType};
 pub use causality::{CausalAnalyzer, CausalGraph, CausalRelationship, CausalDirection};
+pub use worldmodel::{WorldModel, MarketState, TransitionModel, Action, SimPosition, SimulationResult, PriceForecast, PositionDirection};
