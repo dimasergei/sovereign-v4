@@ -27,6 +27,7 @@ pub mod sequence;
 pub mod embeddings;
 pub mod consolidation;
 pub mod transferability;
+pub mod selfmod;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
@@ -51,3 +52,8 @@ pub use sequence::{LSTMCell, SequenceEncoder, MarketFeatures, RegimePredictor};
 pub use embeddings::{VectorIndex, TradeEmbedding, TradeContext, EmbeddingModel, IndexType, cosine_similarity};
 pub use consolidation::{MemoryConsolidator, MemoryTier, Episode, EpisodeContext, Pattern, MemoryStats, ImportanceScorer, PatternExtractor};
 pub use transferability::{TransferabilityPredictor, TransferabilityScore, SymbolProfile, TransferOutcome};
+pub use selfmod::{
+    SelfModificationEngine, Constitution, ConstitutionalGuard, RuleEngine,
+    TradingRule, RuleCondition, RuleAction, RuleContext, RulePerformance,
+    ModificationType, Creator, ApprovalStatus, PendingModification, AppliedModification,
+};

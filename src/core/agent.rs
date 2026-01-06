@@ -37,6 +37,7 @@ use super::counterfactual::CounterfactualAnalyzer;
 use super::sequence::{MarketFeatures, RegimePredictor};
 use super::embeddings::{VectorIndex, TradeContext as EmbeddingTradeContext, EMBEDDING_DIM};
 use super::consolidation::{MemoryConsolidator, EpisodeContext};
+use super::selfmod::{SelfModificationEngine, RuleContext, RuleAction};
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -219,6 +220,10 @@ pub struct SymbolAgent {
     // Hierarchical memory consolidation
     /// Shared memory consolidator for pattern extraction
     memory_consolidator: Option<Arc<Mutex<MemoryConsolidator>>>,
+
+    // Autonomous self-modification
+    /// Shared self-modification engine for rule learning
+    self_mod: Option<Arc<Mutex<SelfModificationEngine>>>,
 }
 
 impl SymbolAgent {
@@ -263,6 +268,7 @@ impl SymbolAgent {
             regime_predictor: None,
             vector_index: None,
             memory_consolidator: None,
+            self_mod: None,
         }
     }
 
@@ -301,6 +307,7 @@ impl SymbolAgent {
             regime_predictor: None,
             vector_index: None,
             memory_consolidator: None,
+            self_mod: None,
         }
     }
 
@@ -344,6 +351,7 @@ impl SymbolAgent {
             regime_predictor: None,
             vector_index: None,
             memory_consolidator: None,
+            self_mod: None,
         }
     }
 
@@ -379,6 +387,7 @@ impl SymbolAgent {
             regime_predictor: None,
             vector_index: None,
             memory_consolidator: None,
+            self_mod: None,
         }
     }
 
@@ -636,6 +645,22 @@ impl SymbolAgent {
                             return None;
                         }
 
+                        // SELF-MOD: Evaluate rules for this trade
+                        let (actions, skip_trade) = self.evaluate_self_mod_rules(
+                            sr_score,
+                            volume_percentile,
+                            combined_confidence,
+                            true, // is_long
+                            time,
+                        );
+                        if skip_trade {
+                            return None;
+                        }
+                        let (modified_conviction, _size_factor) = self.apply_self_mod_actions(&actions, conviction);
+                        if modified_conviction == 0 {
+                            return None;
+                        }
+
                         let signal = AgentSignal {
                             symbol: self.symbol.clone(),
                             signal: Signal::Buy,
@@ -647,7 +672,7 @@ impl SymbolAgent {
                             support,
                             resistance,
                             volume_percentile,
-                            conviction,
+                            conviction: modified_conviction,
                         };
 
                         self.position = Some(Position {
@@ -686,6 +711,22 @@ impl SymbolAgent {
                             return None;
                         }
 
+                        // SELF-MOD: Evaluate rules for this trade
+                        let (actions, skip_trade) = self.evaluate_self_mod_rules(
+                            sr_score,
+                            volume_percentile,
+                            combined_confidence,
+                            false, // is_long (this is a short)
+                            time,
+                        );
+                        if skip_trade {
+                            return None;
+                        }
+                        let (modified_conviction, _size_factor) = self.apply_self_mod_actions(&actions, conviction);
+                        if modified_conviction == 0 {
+                            return None;
+                        }
+
                         let signal = AgentSignal {
                             symbol: self.symbol.clone(),
                             signal: Signal::Short,
@@ -697,7 +738,7 @@ impl SymbolAgent {
                             support,
                             resistance,
                             volume_percentile,
-                            conviction,
+                            conviction: modified_conviction,
                         };
 
                         self.position = Some(Position {
@@ -741,6 +782,22 @@ impl SymbolAgent {
                                 return None;
                             }
 
+                            // SELF-MOD: Evaluate rules for this trade
+                            let (actions, skip_trade) = self.evaluate_self_mod_rules(
+                                sr_score,
+                                volume_percentile,
+                                combined_confidence,
+                                true, // is_long
+                                time,
+                            );
+                            if skip_trade {
+                                return None;
+                            }
+                            let (modified_conviction, _size_factor) = self.apply_self_mod_actions(&actions, conviction);
+                            if modified_conviction == 0 {
+                                return None;
+                            }
+
                             let signal = AgentSignal {
                                 symbol: self.symbol.clone(),
                                 signal: Signal::Buy,
@@ -752,7 +809,7 @@ impl SymbolAgent {
                                 support,
                                 resistance,
                                 volume_percentile,
-                                conviction,
+                                conviction: modified_conviction,
                             };
 
                             self.position = Some(Position {
@@ -2355,6 +2412,127 @@ impl SymbolAgent {
         } else {
             1.0 // No adjustment if no pattern found
         }
+    }
+
+    // =========================================================================
+    // AUTONOMOUS SELF-MODIFICATION
+    // =========================================================================
+
+    /// Attach self-modification engine
+    pub fn attach_self_mod(&mut self, self_mod: Arc<Mutex<SelfModificationEngine>>) {
+        self.self_mod = Some(self_mod);
+    }
+
+    /// Check if self-modification engine is attached
+    pub fn has_self_mod(&self) -> bool {
+        self.self_mod.is_some()
+    }
+
+    /// Evaluate self-modification rules for a potential trade
+    ///
+    /// Returns the actions to apply and whether to skip the trade entirely
+    pub fn evaluate_self_mod_rules(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        confidence: f64,
+        is_long: bool,
+        time: DateTime<Utc>,
+    ) -> (Vec<RuleAction>, bool) {
+        let mut actions = Vec::new();
+        let mut skip_trade = false;
+
+        if let Some(ref engine_lock) = self.self_mod {
+            if let Ok(engine) = engine_lock.lock() {
+                // Build RuleContext from current state
+                let mut context = RuleContext::new(&self.symbol, self.regime_detector.current_regime());
+                context.sr_score = sr_score;
+                context.volume_percentile = volume_percentile;
+                context.confidence = confidence;
+                context.is_long = is_long;
+                context.time = time;
+
+                // Add active weaknesses if available
+                if let Some(ref wa_lock) = self.weakness_analyzer {
+                    if let Ok(wa) = wa_lock.lock() {
+                        for weakness in wa.get_weaknesses() {
+                            context.active_weaknesses.insert(format!("{:?}", weakness.weakness_type));
+                        }
+                    }
+                }
+
+                // Evaluate rules through the engine
+                let triggered_actions = engine.rule_engine().evaluate(&context);
+
+                for action in triggered_actions {
+                    info!(
+                        "[SELF-MOD] {} Action triggered: {:?}",
+                        self.symbol, action
+                    );
+
+                    match &action {
+                        RuleAction::SkipTrade { reason } => {
+                            info!("[SELF-MOD] {} Skipping trade: {}", self.symbol, reason);
+                            skip_trade = true;
+                        }
+                        _ => {
+                            actions.push(action.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        (actions, skip_trade)
+    }
+
+    /// Apply self-modification rule actions to a signal
+    ///
+    /// Returns the modified conviction and any size adjustment factor
+    pub fn apply_self_mod_actions(&self, actions: &[RuleAction], conviction: u8) -> (u8, f64) {
+        let mut modified_conviction = conviction;
+        let mut size_factor = 1.0;
+
+        for action in actions {
+            match action {
+                RuleAction::ReduceSize { multiplier, reason } => {
+                    size_factor *= multiplier;
+                    info!(
+                        "[SELF-MOD] {} Reducing size by {:.1}x: {}",
+                        self.symbol, multiplier, reason
+                    );
+                }
+                RuleAction::IncreaseSize { multiplier, reason } => {
+                    size_factor *= multiplier;
+                    info!(
+                        "[SELF-MOD] {} Increasing size by {:.1}x: {}",
+                        self.symbol, multiplier, reason
+                    );
+                }
+                RuleAction::RequireConfirmation { from } => {
+                    // Require confirmation - reduce conviction to prompt review
+                    info!(
+                        "[SELF-MOD] {} Confirmation required from: {}",
+                        self.symbol, from
+                    );
+                    modified_conviction = modified_conviction.saturating_sub(20);
+                }
+                RuleAction::AdjustConfidence { delta } => {
+                    let new_conv = (modified_conviction as f64 + delta * 100.0).clamp(0.0, 100.0) as u8;
+                    info!(
+                        "[SELF-MOD] {} Adjusting confidence by {:.0}%: {} -> {}",
+                        self.symbol, delta * 100.0, modified_conviction, new_conv
+                    );
+                    modified_conviction = new_conv;
+                }
+                RuleAction::Log { message } => {
+                    info!("[SELF-MOD] {} Log: {}", self.symbol, message);
+                }
+                _ => {}
+            }
+        }
+
+        (modified_conviction, size_factor)
     }
 }
 

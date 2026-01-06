@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType, MemoryConsolidator, TransferabilityPredictor};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType, MemoryConsolidator, TransferabilityPredictor, SelfModificationEngine, Constitution};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -52,6 +52,7 @@ const SEQUENCE_PATH: &str = "sovereign_sequence.json";
 const EMBEDDINGS_PATH: &str = "sovereign_embeddings.bin";
 const CONSOLIDATION_PATH: &str = "sovereign_consolidation.json";
 const TRANSFERABILITY_PATH: &str = "sovereign_transferability.json";
+const SELFMOD_PATH: &str = "sovereign_selfmod.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -245,6 +246,58 @@ fn save_transferability(transferability_predictor: &Arc<Mutex<TransferabilityPre
     }
 }
 
+/// Save SelfModificationEngine state
+fn save_selfmod(selfmod: &Arc<Mutex<SelfModificationEngine>>) {
+    let engine = selfmod.lock().unwrap();
+    if let Err(e) = engine.save(SELFMOD_PATH) {
+        warn!("Failed to save SelfModificationEngine: {}", e);
+    } else {
+        info!("SelfMod: Saved - {} rules active, {} pending",
+            engine.rule_engine().active_count(),
+            engine.guard().pending_count()
+        );
+    }
+}
+
+/// Run daily self-modification analysis and proposal generation
+fn run_analyze_and_propose(
+    selfmod: &Arc<Mutex<SelfModificationEngine>>,
+    weakness_analyzer: &Arc<Mutex<crate::core::WeaknessAnalyzer>>,
+    counterfactual: &Arc<Mutex<crate::core::CounterfactualAnalyzer>>,
+) {
+    let mut engine = selfmod.lock().unwrap();
+    let wa = weakness_analyzer.lock().unwrap();
+    let cf = counterfactual.lock().unwrap();
+
+    // Get weaknesses and insights for rule generation
+    let weaknesses = wa.get_weaknesses();
+    let insights = cf.get_insights();
+
+    let mut proposal_count = 0;
+
+    // Generate rules from weaknesses
+    for weakness in weaknesses {
+        if let Some(rule) = engine.generate_rule_from_weakness(weakness) {
+            info!("[SELF-MOD] Proposed rule from weakness: {}", rule.name);
+            proposal_count += 1;
+            // Apply the rule addition
+            let _ = engine.apply_rule_addition(rule);
+        }
+    }
+
+    // Generate threshold changes from insights
+    for insight in insights {
+        if let Some(mod_type) = engine.generate_threshold_change(insight) {
+            info!("[SELF-MOD] Proposed threshold change: {:?}", mod_type);
+            proposal_count += 1;
+        }
+    }
+
+    if proposal_count > 0 {
+        info!("[SELF-MOD] Generated {} proposals from daily analysis", proposal_count);
+    }
+}
+
 /// Run weekly learning from transfer outcomes
 fn learn_from_transfers(transfer_manager: &Arc<Mutex<TransferManager>>) {
     let tm = transfer_manager.lock().unwrap();
@@ -263,6 +316,124 @@ fn discover_ml_clusters(transfer_manager: &Arc<Mutex<TransferManager>>) {
         for (i, cluster) in clusters.iter().enumerate() {
             info!("  Cluster {}: {} symbols - {:?}",
                 i + 1, cluster.len(), cluster.iter().take(5).cloned().collect::<Vec<_>>());
+        }
+    }
+}
+
+/// Process Telegram self-modification commands
+async fn process_telegram_commands(selfmod: &Arc<Mutex<SelfModificationEngine>>) {
+    let commands = telegram::poll_commands().await;
+
+    for cmd in commands {
+        match cmd.command.as_str() {
+            "/pending" => {
+                let engine = selfmod.lock().unwrap();
+                let pending: Vec<(String, String, String)> = engine
+                    .get_pending()
+                    .iter()
+                    .map(|p| (
+                        p.id.to_string(),
+                        format!("{:?}", p.modification),
+                        p.reason.clone(),
+                    ))
+                    .collect();
+                drop(engine);
+                telegram::send_pending_mods(&pending).await;
+            }
+            "/rules" => {
+                let engine = selfmod.lock().unwrap();
+                let rules: Vec<(String, String, String, u32)> = engine
+                    .get_active_rules()
+                    .iter()
+                    .map(|r| (
+                        r.name.clone(),
+                        format!("{:?}", r.condition),
+                        format!("{:?}", r.action),
+                        r.performance.times_triggered,
+                    ))
+                    .collect();
+                drop(engine);
+                telegram::send_rules(&rules).await;
+            }
+            "/constitution" => {
+                let engine = selfmod.lock().unwrap();
+                let c = engine.guard().constitution();
+                telegram::send_constitution(
+                    c.max_position_size,
+                    c.max_daily_loss,
+                    c.max_drawdown,
+                    c.min_confidence_for_trade,
+                    c.max_active_rules as usize,
+                    c.forbidden_modifications.len(),
+                ).await;
+            }
+            "/approve" => {
+                if let Some(id_str) = cmd.args.first() {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        let mut engine = selfmod.lock().unwrap();
+                        match engine.approve_pending(id, "telegram") {
+                            Ok(()) => {
+                                drop(engine);
+                                telegram::send_approval(id_str, true, "Modification approved and applied.").await;
+                            }
+                            Err(e) => {
+                                drop(engine);
+                                telegram::send_approval(id_str, false, &format!("Error: {}", e)).await;
+                            }
+                        }
+                    } else {
+                        telegram::send_approval(id_str, false, "Invalid ID format").await;
+                    }
+                } else {
+                    telegram::send_approval("", false, "Usage: /approve <id>").await;
+                }
+            }
+            "/reject" => {
+                if let Some(id_str) = cmd.args.first() {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        let mut engine = selfmod.lock().unwrap();
+                        match engine.reject_pending(id, "rejected via telegram") {
+                            Ok(()) => {
+                                drop(engine);
+                                telegram::send_rejection(id_str, true, "Modification rejected.").await;
+                            }
+                            Err(e) => {
+                                drop(engine);
+                                telegram::send_rejection(id_str, false, &format!("Error: {}", e)).await;
+                            }
+                        }
+                    } else {
+                        telegram::send_rejection(id_str, false, "Invalid ID format").await;
+                    }
+                } else {
+                    telegram::send_rejection("", false, "Usage: /reject <id>").await;
+                }
+            }
+            "/rollback" => {
+                if let Some(id_str) = cmd.args.first() {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        let mut engine = selfmod.lock().unwrap();
+                        match engine.rollback_modification(id) {
+                            Ok(()) => {
+                                drop(engine);
+                                telegram::send_rollback(id_str, true, "Modification rolled back.").await;
+                            }
+                            Err(e) => {
+                                drop(engine);
+                                telegram::send_rollback(id_str, false, &format!("Error: {}", e)).await;
+                            }
+                        }
+                    } else {
+                        telegram::send_rollback(id_str, false, "Invalid ID format").await;
+                    }
+                } else {
+                    telegram::send_rollback("", false, "Usage: /rollback <id>").await;
+                }
+            }
+            "/selfmod" | "/selfmodhelp" => {
+                telegram::send_selfmod_help().await;
+            }
+            _ => {}
         }
     }
 }
@@ -650,6 +821,25 @@ async fn main() -> Result<()> {
         agent.attach_memory_consolidator(Arc::clone(&memory_consolidator));
     }
 
+    // Load SelfModificationEngine with conservative constitution
+    let constitution = Constitution::default();
+    let selfmod = Arc::new(Mutex::new(
+        SelfModificationEngine::load_or_new(SELFMOD_PATH, constitution)
+    ));
+    {
+        let engine = selfmod.lock().unwrap();
+        info!("SelfMod: Loaded - {} rules active, {} pending, {} applied",
+            engine.rule_engine().active_count(),
+            engine.guard().pending_count(),
+            engine.applied_count()
+        );
+    }
+
+    // Attach SelfModificationEngine to all agents
+    for agent in agents.values_mut() {
+        agent.attach_self_mod(Arc::clone(&selfmod));
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -709,6 +899,7 @@ async fn main() -> Result<()> {
                 &vector_index,
                 &memory_consolidator,
                 &transferability_predictor,
+                &selfmod,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -732,6 +923,7 @@ async fn main() -> Result<()> {
                 &vector_index,
                 &memory_consolidator,
                 &transferability_predictor,
+                &selfmod,
             ).await
         }
     }
@@ -857,6 +1049,7 @@ async fn run_alpaca_loop(
     vector_index: &Arc<Mutex<VectorIndex>>,
     memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
     transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
+    selfmod: &Arc<Mutex<SelfModificationEngine>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -890,6 +1083,11 @@ async fn run_alpaca_loop(
         if last_health_check.elapsed().as_secs() >= 10 {
             last_health_check = std::time::Instant::now();
             health.set_market_open(is_market_open());
+
+            // Poll for Telegram commands
+            if telegram_enabled {
+                process_telegram_commands(selfmod).await;
+            }
 
             match health.check() {
                 HealthStatus::Healthy { gaps: _ } => alert_manager.reset(),
@@ -987,9 +1185,13 @@ async fn run_alpaca_loop(
                 save_embeddings(vector_index);
                 save_consolidation(memory_consolidator);
                 save_transferability(&transferability_predictor);
+                save_selfmod(selfmod);
 
                 // Run pattern consolidation
                 run_consolidation(memory_consolidator);
+
+                // Run daily self-modification analysis
+                run_analyze_and_propose(selfmod, weakness_analyzer, counterfactual);
 
                 // Run weekly ML transfer learning and cluster discovery
                 learn_from_transfers(transfer_manager);
@@ -1083,6 +1285,7 @@ async fn run_ibkr_loop(
     vector_index: &Arc<Mutex<VectorIndex>>,
     memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
     transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
+    selfmod: &Arc<Mutex<SelfModificationEngine>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -1107,6 +1310,11 @@ async fn run_ibkr_loop(
         if last_health_check.elapsed().as_secs() >= 10 {
             last_health_check = std::time::Instant::now();
             health.set_market_open(is_market_open());
+
+            // Poll for Telegram commands
+            if telegram_enabled {
+                process_telegram_commands(selfmod).await;
+            }
 
             match health.check() {
                 HealthStatus::Healthy { gaps: _ } => alert_manager.reset(),
@@ -1190,9 +1398,13 @@ async fn run_ibkr_loop(
                 save_embeddings(vector_index);
                 save_consolidation(memory_consolidator);
                 save_transferability(&transferability_predictor);
+                save_selfmod(selfmod);
 
                 // Run pattern consolidation
                 run_consolidation(memory_consolidator);
+
+                // Run daily self-modification analysis
+                run_analyze_and_propose(selfmod, weakness_analyzer, counterfactual);
 
                 // Run weekly ML transfer learning and cluster discovery
                 learn_from_transfers(transfer_manager);
