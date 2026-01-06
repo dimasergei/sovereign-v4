@@ -15,5 +15,5 @@ pub mod agent;
 pub mod health;
 
 // Re-export commonly used types
-pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position};
+pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
 pub use health::HealthMonitor;

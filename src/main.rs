@@ -31,6 +31,7 @@ use crate::universe::{Universe, Sector};
 use crate::portfolio::{Portfolio, PortfolioPosition};
 use crate::data::alpaca_stream::{self, AlpacaMessage};
 use crate::data::database::TradeDb;
+use crate::data::memory::TradeMemory;
 use crate::broker::alpaca::AlpacaBroker;
 use crate::broker::ibkr::IbkrBroker;
 use crate::comms::telegram;
@@ -128,6 +129,16 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Initialize AGI memory for learning
+    let memory = Arc::new(TradeMemory::new("sovereign_memory.db")?);
+    if let Ok((total, wins, total_profit, avg_profit)) = memory.get_overall_stats() {
+        if total > 0 {
+            let win_rate = wins as f64 / total as f64 * 100.0;
+            info!("Memory: {} trades learned | {:.1}% win rate | ${:.2} avg profit",
+                total, win_rate, avg_profit);
+        }
+    }
+
     // Initialize broker based on config
     let broker_type = if cfg.is_ibkr() {
         let ibkr_cfg = cfg.ibkr_config().expect("IBKR config required");
@@ -184,13 +195,13 @@ async fn main() -> Result<()> {
     let universe = Universe::from_symbols(symbols.clone());
     info!("Universe: {} symbols loaded", universe.len());
 
-    // Initialize agents (one per symbol)
+    // Initialize agents (one per symbol) with AGI memory
     let mut agents: HashMap<String, SymbolAgent> = HashMap::new();
     for sym in &symbols {
-        let agent = SymbolAgent::new(sym.clone(), dec!(100));
+        let agent = SymbolAgent::new_with_memory(sym.clone(), dec!(100), Arc::clone(&memory));
         agents.insert(sym.clone(), agent);
     }
-    info!("Agents: {} created, bootstrapping with historical data...", agents.len());
+    info!("Agents: {} created with memory, bootstrapping with historical data...", agents.len());
 
     // Bootstrap each agent with historical S/R data
     match &broker_type {

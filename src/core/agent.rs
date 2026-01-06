@@ -19,10 +19,12 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[allow(deprecated)]
 use super::sr::{SRLevels, default_granularity, granularity_from_atr};
 use super::capitulation::VolumeTracker;
+use crate::data::memory::{TradeMemory, MarketRegime};
 
 /// Trading signal from an agent
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +83,31 @@ pub struct AgentSignal {
     pub volume_percentile: f64,
 }
 
+/// Entry context for outcome tracking (AGI learning)
+#[derive(Debug, Clone)]
+pub struct EntryContext {
+    /// Unique trade ticket
+    pub ticket: u64,
+    /// S/R level that triggered entry
+    pub sr_level: Decimal,
+    /// S/R score at entry (0 = strongest, negative = weaker)
+    pub sr_score: i32,
+    /// Volume percentile at entry
+    pub volume_percentile: f64,
+    /// ATR at entry
+    pub atr: Option<Decimal>,
+    /// Market regime at entry
+    pub regime: MarketRegime,
+    /// Bar count at entry (for hold duration)
+    pub entry_bar_count: u64,
+    /// Entry price for MAE/MFE calculation
+    pub entry_price: Decimal,
+    /// Maximum adverse excursion (worst drawdown during trade)
+    pub mae: f64,
+    /// Maximum favorable excursion (best profit during trade)
+    pub mfe: f64,
+}
+
 /// Independent trading agent for a single symbol
 ///
 /// Each agent:
@@ -89,6 +116,7 @@ pub struct AgentSignal {
 /// - Generates buy/sell signals based on S/R + capitulation
 /// - Manages its own position state
 /// - Tracks ATR for volatility-based calculations (lossless)
+/// - Records trade context for AGI learning (when memory is attached)
 pub struct SymbolAgent {
     /// Symbol this agent is trading
     symbol: String,
@@ -108,6 +136,12 @@ pub struct SymbolAgent {
     recent_bars: Vec<(Decimal, Decimal, Decimal, Decimal)>,
     /// Maximum bars to keep for ATR (operational limit)
     max_atr_bars: usize,
+    /// Persistent memory for AGI learning (optional)
+    memory: Option<Arc<TradeMemory>>,
+    /// Pending entry context for outcome tracking
+    pending_entry: Option<EntryContext>,
+    /// Next ticket number for trade identification
+    next_ticket: u64,
 }
 
 impl SymbolAgent {
@@ -132,6 +166,30 @@ impl SymbolAgent {
             bar_count: 0,
             recent_bars: Vec::with_capacity(20),
             max_atr_bars: 20, // Operational limit for ATR calculation
+            memory: None,
+            pending_entry: None,
+            next_ticket: 1,
+        }
+    }
+
+    /// Create agent with memory for AGI learning
+    #[allow(deprecated)]
+    pub fn new_with_memory(symbol: String, initial_price: Decimal, memory: Arc<TradeMemory>) -> Self {
+        let granularity = default_granularity(&symbol, initial_price);
+
+        Self {
+            symbol,
+            sr: SRLevels::new(granularity),
+            volume: VolumeTracker::new(),
+            position: None,
+            last_price: initial_price,
+            last_volume: 0,
+            bar_count: 0,
+            recent_bars: Vec::with_capacity(20),
+            max_atr_bars: 20,
+            memory: Some(memory),
+            pending_entry: None,
+            next_ticket: 1,
         }
     }
 
@@ -155,6 +213,9 @@ impl SymbolAgent {
             bar_count: 0,
             recent_bars: Vec::with_capacity(20),
             max_atr_bars: 20,
+            memory: None,
+            pending_entry: None,
+            next_ticket: 1,
         }
     }
 
@@ -170,7 +231,15 @@ impl SymbolAgent {
             bar_count: 0,
             recent_bars: Vec::with_capacity(20),
             max_atr_bars: 20,
+            memory: None,
+            pending_entry: None,
+            next_ticket: 1,
         }
+    }
+
+    /// Attach memory for AGI learning
+    pub fn attach_memory(&mut self, memory: Arc<TradeMemory>) {
+        self.memory = Some(memory);
     }
 
     /// Get the symbol this agent is trading
@@ -498,6 +567,195 @@ impl SymbolAgent {
         // Simple average of true ranges
         let sum: Decimal = true_ranges.iter().copied().sum();
         Some(sum / Decimal::from(true_ranges.len()))
+    }
+
+    // =========================================================================
+    // AGI MEMORY INTEGRATION METHODS
+    // =========================================================================
+
+    /// Record entry context when opening a trade (for AGI learning)
+    ///
+    /// Call this after a trade is confirmed to record the full context
+    /// for later outcome analysis.
+    pub fn record_entry_context(
+        &mut self,
+        sr_level: Decimal,
+        volume_percentile: f64,
+    ) {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+
+        let sr_score = self.sr.score_at(sr_level);
+        let regime = self.memory
+            .as_ref()
+            .and_then(|m| m.get_current_regime().ok().flatten())
+            .unwrap_or(MarketRegime::Unknown);
+
+        let entry_price = self.last_price;
+
+        // Store pending entry for MAE/MFE tracking
+        self.pending_entry = Some(EntryContext {
+            ticket,
+            sr_level,
+            sr_score,
+            volume_percentile,
+            atr: self.atr(),
+            regime,
+            entry_bar_count: self.bar_count,
+            entry_price,
+            mae: 0.0,
+            mfe: 0.0,
+        });
+
+        // Record to persistent memory
+        if let Some(ref memory) = self.memory {
+            let _ = memory.record_trade_entry(
+                &self.symbol,
+                ticket,
+                match self.position {
+                    Some(ref p) if p.side == Side::Long => "BUY",
+                    Some(ref p) if p.side == Side::Short => "SHORT",
+                    _ => "UNKNOWN",
+                },
+                entry_price,
+                sr_level,
+                sr_score,
+                volume_percentile,
+                self.atr().unwrap_or(Decimal::ZERO),
+                regime.as_str(),
+                self.bar_count,
+            );
+
+            // Record S/R touch
+            let _ = memory.record_sr_touch(
+                &self.symbol,
+                sr_level.to_f64().unwrap_or(0.0),
+                self.sr.is_near(entry_price, sr_level).then(|| 1.0).unwrap_or(0.0),
+            );
+        }
+    }
+
+    /// Update MAE/MFE during trade (call on each bar while in position)
+    pub fn update_excursions(&mut self, current_price: Decimal) {
+        if let Some(ref mut entry) = self.pending_entry {
+            if let Some(ref pos) = self.position {
+                let pnl_pct = match pos.side {
+                    Side::Long => ((current_price - entry.entry_price) / entry.entry_price)
+                        .to_f64().unwrap_or(0.0) * 100.0,
+                    Side::Short => ((entry.entry_price - current_price) / entry.entry_price)
+                        .to_f64().unwrap_or(0.0) * 100.0,
+                };
+
+                if pnl_pct < entry.mae {
+                    entry.mae = pnl_pct;
+                }
+                if pnl_pct > entry.mfe {
+                    entry.mfe = pnl_pct;
+                }
+            }
+        }
+    }
+
+    /// Record exit outcome when closing a trade (for AGI learning)
+    ///
+    /// Call this after a trade is closed to record the outcome and
+    /// update S/R effectiveness and volume calibration.
+    pub fn record_exit_outcome(
+        &mut self,
+        exit_price: Decimal,
+        hit_tp: bool,
+        hit_sl: bool,
+    ) {
+        let Some(entry) = self.pending_entry.take() else {
+            return;
+        };
+
+        let profit = match self.position {
+            Some(ref p) if p.side == Side::Long => exit_price - entry.entry_price,
+            Some(ref p) if p.side == Side::Short => entry.entry_price - exit_price,
+            _ => Decimal::ZERO,
+        };
+
+        let profit_pct = if !entry.entry_price.is_zero() {
+            (profit / entry.entry_price).to_f64().unwrap_or(0.0) * 100.0
+        } else {
+            0.0
+        };
+
+        let hold_bars = (self.bar_count - entry.entry_bar_count) as i64;
+        let was_winner = profit > Decimal::ZERO;
+        let bounced = was_winner; // Simplified: winner = bounced at S/R
+
+        if let Some(ref memory) = self.memory {
+            // Record trade exit
+            let _ = memory.record_trade_exit(
+                entry.ticket,
+                exit_price,
+                profit,
+                profit_pct,
+                hit_tp,
+                hit_sl,
+                hold_bars,
+                entry.mae,
+                entry.mfe,
+            );
+
+            // Update S/R effectiveness
+            let _ = memory.record_sr_trade_outcome(
+                &self.symbol,
+                entry.sr_level.to_f64().unwrap_or(0.0),
+                self.atr().map(|a| a.to_f64().unwrap_or(1.0) / 2.0).unwrap_or(1.0),
+                bounced,
+                profit.to_f64().unwrap_or(0.0),
+            );
+
+            // Update volume calibration
+            let _ = memory.update_volume_calibration(
+                &self.symbol,
+                entry.volume_percentile,
+                was_winner,
+            );
+
+            // Update regime stats
+            let _ = memory.update_regime_stats(
+                profit.to_f64().unwrap_or(0.0),
+                hold_bars,
+            );
+        }
+    }
+
+    /// Get S/R confidence based on historical effectiveness
+    ///
+    /// Returns a confidence score 0.0-1.0 based on:
+    /// - Historical win rate at this level (if available)
+    /// - Fallback to S/R score (0 = strongest)
+    pub fn get_sr_confidence(&self, price_level: Decimal) -> f64 {
+        // Try to get historical win rate from memory
+        if let Some(ref memory) = self.memory {
+            let granularity = self.atr()
+                .map(|a| a.to_f64().unwrap_or(1.0) / 2.0)
+                .unwrap_or(1.0);
+
+            if let Ok(Some(win_rate)) = memory.get_sr_win_rate(
+                &self.symbol,
+                price_level.to_f64().unwrap_or(0.0),
+                granularity,
+            ) {
+                return win_rate;
+            }
+        }
+
+        // Fallback to S/R score-based confidence
+        // Score of 0 = never crossed = 100% confidence
+        // Score of -10 = crossed 10 times = lower confidence
+        let score = self.sr.score_at(price_level);
+        let confidence = 1.0 / (1.0 + (-score as f64).abs() * 0.1);
+        confidence.clamp(0.0, 1.0)
+    }
+
+    /// Get pending entry ticket (for external tracking)
+    pub fn pending_ticket(&self) -> Option<u64> {
+        self.pending_entry.as_ref().map(|e| e.ticket)
     }
 }
 
