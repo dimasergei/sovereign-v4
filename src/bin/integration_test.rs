@@ -10,6 +10,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use sovereign::core::{
+    Calibrator,
     ConfidenceCalibrator,
     TransferManager, get_cluster,
     MixtureOfExperts,

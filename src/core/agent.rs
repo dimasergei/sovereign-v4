@@ -26,7 +26,7 @@ use tracing::info;
 use super::sr::{SRLevels, default_granularity, granularity_from_atr};
 use super::capitulation::VolumeTracker;
 use super::regime::{Regime, RegimeDetector};
-use super::learner::{ConfidenceCalibrator, TradeOutcome, NUM_FEATURES};
+use super::learner::{Calibrator, ConfidenceCalibrator, TradeOutcome, NUM_FEATURES};
 use super::transfer::TransferManager;
 use super::moe::MixtureOfExperts;
 use super::metalearner::{MetaLearner, calculate_accuracy};

@@ -29,7 +29,7 @@ pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
 pub use health::HealthMonitor;
 pub use regime::{Regime, RegimeDetector};
 pub use metalearner::{MetaLearner, AdaptationResult};
-pub use learner::{ConfidenceCalibrator, TradeOutcome};
+pub use learner::{Calibrator, ConfidenceCalibrator, TradeOutcome};
 pub use transfer::{TransferManager, AssetCluster, get_cluster};
 pub use moe::{MixtureOfExperts, Expert};
 pub use weakness::{WeaknessAnalyzer, Weakness, WeaknessType};

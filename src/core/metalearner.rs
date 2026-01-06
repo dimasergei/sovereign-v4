@@ -20,7 +20,7 @@ use std::fs;
 use std::path::Path;
 use tracing::info;
 
-use super::learner::{ConfidenceCalibrator, TradeOutcome, NUM_FEATURES};
+use super::learner::{encode_features, ConfidenceCalibrator, TradeOutcome, NUM_FEATURES};
 use super::regime::Regime;
 
 /// Default outer learning rate for meta-updates
@@ -161,7 +161,7 @@ impl MetaLearner {
             let mut grad_bias = 0.0;
 
             for trade in trades {
-                let features = ConfidenceCalibrator::encode_features(
+                let features = encode_features(
                     trade.sr_score,
                     trade.volume_pct,
                     &trade.regime,
@@ -411,7 +411,7 @@ pub fn calculate_accuracy(
 
     let mut correct = 0;
     for trade in trades {
-        let features = ConfidenceCalibrator::encode_features(
+        let features = encode_features(
             trade.sr_score,
             trade.volume_pct,
             &trade.regime,

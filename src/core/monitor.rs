@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use super::regime::Regime;
-use super::learner::ConfidenceCalibrator;
+use super::learner::{Calibrator, ConfidenceCalibrator};
 use super::transfer::TransferManager;
 use super::moe::MixtureOfExperts;
 use super::metalearner::MetaLearner;

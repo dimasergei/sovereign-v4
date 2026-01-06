@@ -15,7 +15,7 @@ use std::fs;
 use std::path::Path;
 use tracing::info;
 
-use super::learner::{ConfidenceCalibrator, TradeOutcome};
+use super::learner::{encode_features, Calibrator, ConfidenceCalibrator, TradeOutcome};
 use super::regime::Regime;
 
 /// Number of features in the linear model (must match learner.rs)
@@ -140,7 +140,7 @@ impl MixtureOfExperts {
     /// Returns weighted average: sum(gating_i * expert_i.predict())
     pub fn predict(&self, sr_score: i32, volume_pct: f64, regime: &Regime) -> f64 {
         // Encode features once
-        let features = ConfidenceCalibrator::encode_features(sr_score, volume_pct, regime);
+        let features = encode_features(sr_score, volume_pct, regime);
 
         // Blend predictions from all experts weighted by gating
         let mut weighted_sum = 0.0;
@@ -176,7 +176,7 @@ impl MixtureOfExperts {
         won: bool,
         learning_rate: f64,
     ) {
-        let features = ConfidenceCalibrator::encode_features(sr_score, volume_pct, regime);
+        let features = encode_features(sr_score, volume_pct, regime);
         let target = if won { 1.0 } else { 0.0 };
 
         // Route to the expert for this regime
@@ -531,7 +531,7 @@ mod tests {
 
         // Simulate winning trades
         for _ in 0..10 {
-            let features = ConfidenceCalibrator::encode_features(0, 80.0, &Regime::TrendingUp);
+            let features = encode_features(0, 80.0, &Regime::TrendingUp);
             expert.update(&features, 1.0, 0.1);
         }
 
@@ -540,7 +540,7 @@ mod tests {
 
         // Simulate losing trades
         for _ in 0..20 {
-            let features = ConfidenceCalibrator::encode_features(-5, 40.0, &Regime::TrendingUp);
+            let features = encode_features(-5, 40.0, &Regime::TrendingUp);
             expert.update(&features, 0.0, 0.1);
         }
 
