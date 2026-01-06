@@ -15,9 +15,11 @@ pub mod agent;
 pub mod health;
 pub mod regime;
 pub mod learner;
+pub mod transfer;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
 pub use health::HealthMonitor;
 pub use regime::{Regime, RegimeDetector};
 pub use learner::{ConfidenceCalibrator, TradeOutcome};
+pub use transfer::{TransferManager, AssetCluster, get_cluster};

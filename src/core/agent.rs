@@ -27,7 +27,9 @@ use super::sr::{SRLevels, default_granularity, granularity_from_atr};
 use super::capitulation::VolumeTracker;
 use super::regime::{Regime, RegimeDetector};
 use super::learner::{ConfidenceCalibrator, TradeOutcome};
+use super::transfer::TransferManager;
 use crate::data::memory::{TradeMemory, MarketRegime};
+use std::sync::Mutex;
 
 /// Trading signal from an agent
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +165,8 @@ pub struct SymbolAgent {
     next_ticket: u64,
     /// Recent trade outcomes for EWC Fisher computation
     recent_trades: Vec<TradeOutcome>,
+    /// Shared transfer manager for cross-symbol knowledge transfer
+    transfer_manager: Option<Arc<Mutex<TransferManager>>>,
 }
 
 impl SymbolAgent {
@@ -193,6 +197,7 @@ impl SymbolAgent {
             pending_entry: None,
             next_ticket: 1,
             recent_trades: Vec::new(),
+            transfer_manager: None,
         }
     }
 
@@ -217,6 +222,7 @@ impl SymbolAgent {
             pending_entry: None,
             next_ticket: 1,
             recent_trades: Vec::new(),
+            transfer_manager: None,
         }
     }
 
@@ -246,6 +252,7 @@ impl SymbolAgent {
             pending_entry: None,
             next_ticket: 1,
             recent_trades: Vec::new(),
+            transfer_manager: None,
         }
     }
 
@@ -267,12 +274,51 @@ impl SymbolAgent {
             pending_entry: None,
             next_ticket: 1,
             recent_trades: Vec::new(),
+            transfer_manager: None,
         }
     }
 
     /// Attach memory for AGI learning
     pub fn attach_memory(&mut self, memory: Arc<TradeMemory>) {
         self.memory = Some(memory);
+    }
+
+    /// Attach transfer manager for cross-symbol knowledge transfer
+    pub fn attach_transfer_manager(&mut self, tm: Arc<Mutex<TransferManager>>) {
+        self.transfer_manager = Some(tm);
+    }
+
+    /// Initialize calibrator from cluster prior if available
+    ///
+    /// If this symbol's cluster has learned weights (>= 20 trades) and
+    /// this calibrator has < 10 updates, initialize from cluster prior.
+    pub fn maybe_init_from_cluster(&mut self) {
+        // Only initialize if calibrator is fresh
+        if self.calibrator.update_count() >= 10 {
+            return;
+        }
+
+        let Some(ref tm) = self.transfer_manager else {
+            return;
+        };
+
+        let tm_lock = tm.lock().unwrap();
+        if let Some(prior_weights) = tm_lock.get_cluster_prior(&self.symbol) {
+            let cluster = super::transfer::get_cluster(&self.symbol);
+            let stats = tm_lock.get_cluster_stats(cluster);
+            let (trade_count, win_rate) = stats
+                .map(|s| (s.trade_count, s.win_rate()))
+                .unwrap_or((0, 0.5));
+
+            self.calibrator.set_weights(prior_weights);
+            info!(
+                "[TRANSFER] {} initialized from {} cluster ({} trades, {:.0}% win rate)",
+                self.symbol,
+                cluster.name(),
+                trade_count,
+                win_rate * 100.0
+            );
+        }
     }
 
     /// Get the symbol this agent is trading
@@ -874,6 +920,12 @@ impl SymbolAgent {
         // Keep only the most recent trades (cap at 100)
         if self.recent_trades.len() > 100 {
             self.recent_trades.remove(0);
+        }
+
+        // Update transfer manager for cross-symbol knowledge transfer
+        if let Some(ref tm) = self.transfer_manager {
+            let mut tm_lock = tm.lock().unwrap();
+            tm_lock.update_cluster(&self.symbol, self.calibrator.get_weights(), was_winner);
         }
 
         let outcome = if was_winner { "winning" } else { "losing" };

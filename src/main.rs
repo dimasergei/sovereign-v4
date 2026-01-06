@@ -25,8 +25,9 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager};
 use crate::core::health::HealthStatus;
+use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
 use crate::portfolio::{Portfolio, PortfolioPosition};
 use crate::data::alpaca_stream::{self, AlpacaMessage};
@@ -39,6 +40,7 @@ use crate::config::Config;
 
 const SEP: &str = "===========================================================";
 const CALIBRATOR_PATH: &str = "sovereign_calibrator.json";
+const TRANSFER_PATH: &str = "sovereign_transfer.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -55,6 +57,16 @@ fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
                 info!("Calibrator: Saved {} updates to {}", cal.update_count(), CALIBRATOR_PATH);
             }
         }
+    }
+}
+
+/// Save transfer manager state
+fn save_transfer(transfer_manager: &Arc<Mutex<TransferManager>>) {
+    let tm = transfer_manager.lock().unwrap();
+    if let Err(e) = tm.save(TRANSFER_PATH) {
+        warn!("Failed to save transfer state: {}", e);
+    } else {
+        info!("Transfer: Saved state - {}", tm.format_summary());
     }
 }
 
@@ -276,6 +288,19 @@ async fn main() -> Result<()> {
         info!("Calibrator: Starting fresh (no saved weights found)");
     }
 
+    // Load transfer manager for cross-symbol knowledge transfer
+    let transfer_manager = Arc::new(Mutex::new(TransferManager::load_or_new(TRANSFER_PATH)));
+    {
+        let tm = transfer_manager.lock().unwrap();
+        info!("Transfer: {}", tm.format_summary());
+    }
+
+    // Attach transfer manager to all agents and try cluster initialization
+    for agent in agents.values_mut() {
+        agent.attach_transfer_manager(Arc::clone(&transfer_manager));
+        agent.maybe_init_from_cluster();
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -324,6 +349,7 @@ async fn main() -> Result<()> {
                 &mut health,
                 &mut alert_manager,
                 telegram_enabled,
+                &transfer_manager,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -336,6 +362,7 @@ async fn main() -> Result<()> {
                 &mut alert_manager,
                 &mut last_tickle,
                 telegram_enabled,
+                &transfer_manager,
             ).await
         }
     }
@@ -450,6 +477,7 @@ async fn run_alpaca_loop(
     health: &mut HealthMonitor,
     alert_manager: &mut AlertManager,
     telegram_enabled: bool,
+    transfer_manager: &Arc<Mutex<TransferManager>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -552,8 +580,9 @@ async fn run_alpaca_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights
+                // Save learned calibrator weights and transfer state
                 save_calibrator(agents);
+                save_transfer(transfer_manager);
 
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();
@@ -583,6 +612,7 @@ async fn run_ibkr_loop(
     alert_manager: &mut AlertManager,
     last_tickle: &mut std::time::Instant,
     telegram_enabled: bool,
+    transfer_manager: &Arc<Mutex<TransferManager>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -662,8 +692,9 @@ async fn run_ibkr_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights
+                // Save learned calibrator weights and transfer state
                 save_calibrator(agents);
+                save_transfer(transfer_manager);
 
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();
