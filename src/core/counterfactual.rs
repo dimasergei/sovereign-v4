@@ -1094,6 +1094,32 @@ impl CounterfactualAnalyzer {
         }
         Self::new(memory)
     }
+
+    // ==================== Monitor Methods ====================
+
+    /// Get total number of analyses performed
+    pub fn total_analyses(&self) -> usize {
+        self.total_trades_analyzed as usize
+    }
+
+    /// Get number of insights generated
+    pub fn insight_count(&self) -> usize {
+        self.insights.len()
+    }
+
+    /// Get count of systematic errors found
+    pub fn systematic_error_count(&self) -> usize {
+        self.get_systematic_errors().len()
+    }
+
+    /// Get estimated improvement if insights were followed
+    pub fn estimated_improvement(&self) -> f64 {
+        if self.insights.is_empty() {
+            return 0.0;
+        }
+        // Average improvement across all insights
+        self.insights.iter().map(|i| i.avg_improvement).sum::<f64>() / self.insights.len() as f64
+    }
 }
 
 #[cfg(test)]

@@ -309,6 +309,26 @@ impl MetaLearner {
         self.adaptation_history.len()
     }
 
+    /// Get average adaptation speed (trades to reach target accuracy)
+    pub fn avg_adaptation_speed(&self) -> f64 {
+        if self.adaptation_history.is_empty() {
+            return 0.0;
+        }
+        let total: u32 = self.adaptation_history.iter().map(|a| a.trades_used).sum();
+        total as f64 / self.adaptation_history.len() as f64
+    }
+
+    /// Get success rate of adaptations (how often accuracy improved)
+    pub fn success_rate(&self) -> f64 {
+        if self.adaptation_history.is_empty() {
+            return 0.0;
+        }
+        let successes = self.adaptation_history.iter()
+            .filter(|a| a.post_adaptation_accuracy > a.pre_adaptation_accuracy)
+            .count();
+        successes as f64 / self.adaptation_history.len() as f64
+    }
+
     /// Get outer learning rate
     pub fn outer_lr(&self) -> f64 {
         self.outer_lr

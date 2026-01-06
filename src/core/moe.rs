@@ -249,8 +249,20 @@ impl MixtureOfExperts {
     }
 
     /// Get current gating weights
-    pub fn gating_weights(&self) -> &[f64; 4] {
-        &self.gating_weights
+    pub fn gating_weights(&self) -> [f64; 4] {
+        self.gating_weights
+    }
+
+    /// Get trade count for a specific regime's expert
+    pub fn expert_trades(&self, regime: Regime) -> u32 {
+        let idx = regime.index();
+        self.experts[idx].trade_count()
+    }
+
+    /// Get win rate for a specific regime's expert
+    pub fn expert_win_rate(&self, regime: Regime) -> f64 {
+        let idx = regime.index();
+        self.experts[idx].win_rate()
     }
 
     /// Get temperature
@@ -421,12 +433,12 @@ mod tests {
         moe.set_temperature(0.5);
         let regime_probs = [0.6, 0.2, 0.1, 0.1];
         moe.update_gating(&regime_probs);
-        let sharp_weights = *moe.gating_weights();
+        let sharp_weights = moe.gating_weights();
 
         // Reset and use higher temperature
         moe.set_temperature(2.0);
         moe.update_gating(&regime_probs);
-        let soft_weights = *moe.gating_weights();
+        let soft_weights = moe.gating_weights();
 
         // Sharp weights should be more extreme
         assert!(sharp_weights[0] > soft_weights[0]);

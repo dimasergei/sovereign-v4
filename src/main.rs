@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -47,6 +47,7 @@ const WEAKNESS_PATH: &str = "sovereign_weakness.json";
 const CAUSALITY_PATH: &str = "sovereign_causality.json";
 const WORLDMODEL_PATH: &str = "sovereign_worldmodel.json";
 const COUNTERFACTUAL_PATH: &str = "sovereign_counterfactual.json";
+const MONITOR_PATH: &str = "sovereign_monitor.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -171,6 +172,16 @@ fn save_counterfactual(counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>) {
         warn!("Failed to save CounterfactualAnalyzer: {}", e);
     } else {
         info!("Counterfactual: Saved - {}", cf.format_summary());
+    }
+}
+
+/// Save AGIMonitor state
+fn save_monitor(monitor: &Arc<Mutex<AGIMonitor>>) {
+    let mon = monitor.lock().unwrap();
+    if let Err(e) = mon.save(MONITOR_PATH) {
+        warn!("Failed to save AGIMonitor: {}", e);
+    } else {
+        info!("Monitor: Saved - {}", mon.format_summary());
     }
 }
 
@@ -487,6 +498,23 @@ async fn main() -> Result<()> {
         agent.attach_counterfactual_analyzer(Arc::clone(&counterfactual));
     }
 
+    // Load AGI Monitor for comprehensive system monitoring
+    let agi_monitor = Arc::new(Mutex::new(AGIMonitor::load_or_new(MONITOR_PATH)));
+    {
+        let mut mon = agi_monitor.lock().unwrap();
+        // Attach all components
+        mon.attach_memory(Arc::clone(&memory));
+        mon.attach_calibrator(calibrator.clone());
+        mon.attach_moe(moe.clone());
+        mon.attach_meta_learner(Arc::clone(&meta_learner));
+        mon.attach_transfer_manager(Arc::clone(&transfer_manager));
+        mon.attach_weakness_analyzer(Arc::clone(&weakness_analyzer));
+        mon.attach_causal_analyzer(Arc::clone(&causal_analyzer));
+        mon.attach_world_model(Arc::clone(&world_model));
+        mon.attach_counterfactual(Arc::clone(&counterfactual));
+        info!("Monitor: Loaded - {}", mon.format_summary());
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -541,6 +569,7 @@ async fn main() -> Result<()> {
                 &causal_analyzer,
                 &world_model,
                 &counterfactual,
+                &agi_monitor,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -559,6 +588,7 @@ async fn main() -> Result<()> {
                 &causal_analyzer,
                 &world_model,
                 &counterfactual,
+                &agi_monitor,
             ).await
         }
     }
@@ -679,6 +709,7 @@ async fn run_alpaca_loop(
     causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
     world_model: &Arc<Mutex<WorldModel>>,
     counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
+    agi_monitor: &Arc<Mutex<AGIMonitor>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -688,6 +719,7 @@ async fn run_alpaca_loop(
     let symbols_clone: Vec<String> = cfg.universe.symbols.clone();
 
     let mut last_health_check = std::time::Instant::now();
+    let mut last_hourly_snapshot = std::time::Instant::now();
     let mut bar_count = 0u64;
     let mut tick_count = 0u64;
     let mut last_summary_date: Option<chrono::NaiveDate> = None;
@@ -774,6 +806,13 @@ async fn run_alpaca_loop(
             Err(_) => {}
         }
 
+        // Hourly snapshot for AGI monitoring
+        if last_hourly_snapshot.elapsed().as_secs() >= 3600 {
+            last_hourly_snapshot = std::time::Instant::now();
+            let mut mon = agi_monitor.lock().unwrap();
+            mon.snapshot_hourly();
+        }
+
         // Daily summary at 21:05 UTC (5 min after market close)
         let now = Utc::now();
         let today = now.date_naive();
@@ -781,7 +820,13 @@ async fn run_alpaca_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, and Counterfactual
+                // Daily snapshot for AGI monitoring
+                {
+                    let mut mon = agi_monitor.lock().unwrap();
+                    mon.snapshot_daily();
+                }
+
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, Counterfactual, and Monitor
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
@@ -790,6 +835,7 @@ async fn run_alpaca_loop(
                 save_causality(causal_analyzer);
                 save_worldmodel(world_model);
                 save_counterfactual(counterfactual);
+                save_monitor(agi_monitor);
 
                 // Run periodic weakness analysis on trade history
                 {
@@ -874,9 +920,11 @@ async fn run_ibkr_loop(
     causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
     world_model: &Arc<Mutex<WorldModel>>,
     counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
+    agi_monitor: &Arc<Mutex<AGIMonitor>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
+    let mut last_hourly_snapshot = std::time::Instant::now();
     let mut last_data_poll = std::time::Instant::now();
     let mut bar_count = 0u64;
     let mut last_summary_date: Option<chrono::NaiveDate> = None;
@@ -946,6 +994,13 @@ async fn run_ibkr_loop(
             }
         }
 
+        // Hourly snapshot for AGI monitoring
+        if last_hourly_snapshot.elapsed().as_secs() >= 3600 {
+            last_hourly_snapshot = std::time::Instant::now();
+            let mut mon = agi_monitor.lock().unwrap();
+            mon.snapshot_hourly();
+        }
+
         // Daily summary at 21:05 UTC (5 min after market close)
         let now = Utc::now();
         let today = now.date_naive();
@@ -953,7 +1008,13 @@ async fn run_ibkr_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, and Counterfactual
+                // Daily snapshot for AGI monitoring
+                {
+                    let mut mon = agi_monitor.lock().unwrap();
+                    mon.snapshot_daily();
+                }
+
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, Counterfactual, and Monitor
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
@@ -962,6 +1023,7 @@ async fn run_ibkr_loop(
                 save_causality(causal_analyzer);
                 save_worldmodel(world_model);
                 save_counterfactual(counterfactual);
+                save_monitor(agi_monitor);
 
                 // Run periodic weakness analysis on trade history
                 {

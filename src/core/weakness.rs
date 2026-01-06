@@ -638,6 +638,11 @@ impl WeaknessAnalyzer {
         self.weaknesses.len()
     }
 
+    /// Get count of critical weaknesses (severity > 0.7)
+    pub fn critical_weakness_count(&self) -> usize {
+        self.weaknesses.iter().filter(|w| w.is_critical()).count()
+    }
+
     /// Load from file or create new (with dummy memory - weaknesses are persisted separately)
     pub fn load_or_new(path: &str) -> Self {
         if let Ok(contents) = std::fs::read_to_string(path) {

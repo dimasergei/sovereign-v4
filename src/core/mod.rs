@@ -22,6 +22,7 @@ pub mod weakness;
 pub mod causality;
 pub mod worldmodel;
 pub mod counterfactual;
+pub mod monitor;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
@@ -35,3 +36,4 @@ pub use weakness::{WeaknessAnalyzer, Weakness, WeaknessType};
 pub use causality::{CausalAnalyzer, CausalGraph, CausalRelationship, CausalDirection};
 pub use worldmodel::{WorldModel, MarketState, TransitionModel, Action, SimPosition, SimulationResult, PriceForecast, PositionDirection};
 pub use counterfactual::{CounterfactualAnalyzer, CounterfactualResult, TradingInsight, InsightType, TradeForAnalysis, Direction};
+pub use monitor::{AGIMonitor, AGIMetrics, AGIReport, PerformanceMetrics, SystemHealth, ExpertStats};

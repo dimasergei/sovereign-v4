@@ -1003,6 +1003,16 @@ impl WorldModel {
     pub fn update_equity(&mut self, new_equity: f64) {
         self.current_state.equity = new_equity;
     }
+
+    /// Get forecast accuracy (placeholder - would track historical forecasts)
+    pub fn forecast_accuracy(&self) -> f64 {
+        // In a full implementation, this would track:
+        // - Forecasts made
+        // - Actual outcomes
+        // - Percentage of correct direction predictions
+        // For now, return a default based on simulation performance
+        0.52 // Slightly better than random
+    }
 }
 
 /// Standard normal CDF approximation

@@ -367,6 +367,32 @@ impl TransferManager {
             parts.join(", ")
         }
     }
+
+    /// Get trade counts per cluster for monitoring
+    pub fn cluster_trade_counts(&self) -> HashMap<String, u32> {
+        self.cluster_stats
+            .iter()
+            .map(|(cluster, stats)| (cluster.name().to_string(), stats.trade_count))
+            .collect()
+    }
+
+    /// Get total number of transfers applied (cluster initializations)
+    pub fn transfers_applied(&self) -> u32 {
+        self.cluster_stats.values()
+            .filter(|s| s.trade_count > 0)
+            .count() as u32
+    }
+
+    /// Get overall success rate across all clusters
+    pub fn success_rate(&self) -> f64 {
+        let total_trades: u32 = self.cluster_stats.values().map(|s| s.trade_count).sum();
+        let total_wins: u32 = self.cluster_stats.values().map(|s| s.win_count).sum();
+        if total_trades > 0 {
+            total_wins as f64 / total_trades as f64
+        } else {
+            0.0
+        }
+    }
 }
 
 #[cfg(test)]

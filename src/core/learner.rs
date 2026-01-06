@@ -302,6 +302,11 @@ impl ConfidenceCalibrator {
         self.consolidation_count
     }
 
+    /// Check if EWC is currently protecting weights
+    pub fn is_ewc_active(&self) -> bool {
+        self.consolidation_count > 0 && self.fisher.iter().any(|&f| f > 0.0)
+    }
+
     /// Get current weights
     pub fn get_weights(&self) -> &[f64; NUM_FEATURES] {
         &self.weights

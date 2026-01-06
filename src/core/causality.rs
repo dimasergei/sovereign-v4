@@ -559,6 +559,11 @@ impl CausalGraph {
         self.relationships.len()
     }
 
+    /// Get count of significant relationships (confidence > 0.7)
+    pub fn significant_relationship_count(&self) -> usize {
+        self.relationships.iter().filter(|r| r.confidence > 0.7).count()
+    }
+
     /// Get factor count
     pub fn factor_count(&self) -> usize {
         self.factors.len()
@@ -934,6 +939,18 @@ impl CausalAnalyzer {
             self.graph.relationship_count(),
             self.tracked_count()
         )
+    }
+
+    // ==================== Monitor Methods ====================
+
+    /// Get total relationship count (wrapper for graph method)
+    pub fn relationship_count(&self) -> usize {
+        self.graph.relationship_count()
+    }
+
+    /// Get count of significant relationships (wrapper for graph method)
+    pub fn significant_relationship_count(&self) -> usize {
+        self.graph.significant_relationship_count()
     }
 }
 
