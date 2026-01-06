@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -46,6 +46,7 @@ const META_PATH: &str = "sovereign_meta.json";
 const WEAKNESS_PATH: &str = "sovereign_weakness.json";
 const CAUSALITY_PATH: &str = "sovereign_causality.json";
 const WORLDMODEL_PATH: &str = "sovereign_worldmodel.json";
+const COUNTERFACTUAL_PATH: &str = "sovereign_counterfactual.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -160,6 +161,16 @@ fn load_worldmodel(initial_equity: f64) -> WorldModel {
             info!("WorldModel: Creating new (no saved state)");
             WorldModel::new(initial_equity)
         }
+    }
+}
+
+/// Save CounterfactualAnalyzer state
+fn save_counterfactual(counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>) {
+    let cf = counterfactual.lock().unwrap();
+    if let Err(e) = cf.save(COUNTERFACTUAL_PATH) {
+        warn!("Failed to save CounterfactualAnalyzer: {}", e);
+    } else {
+        info!("Counterfactual: Saved - {}", cf.format_summary());
     }
 }
 
@@ -462,6 +473,20 @@ async fn main() -> Result<()> {
         agent.attach_world_model(Arc::clone(&world_model));
     }
 
+    // Load CounterfactualAnalyzer for learning from alternative decisions
+    let counterfactual = Arc::new(Mutex::new(
+        CounterfactualAnalyzer::load_or_new(COUNTERFACTUAL_PATH, Arc::clone(&memory))
+    ));
+    {
+        let cf = counterfactual.lock().unwrap();
+        info!("Counterfactual: Loaded - {}", cf.format_summary());
+    }
+
+    // Attach CounterfactualAnalyzer to all agents
+    for agent in agents.values_mut() {
+        agent.attach_counterfactual_analyzer(Arc::clone(&counterfactual));
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -515,6 +540,7 @@ async fn main() -> Result<()> {
                 &weakness_analyzer,
                 &causal_analyzer,
                 &world_model,
+                &counterfactual,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -532,6 +558,7 @@ async fn main() -> Result<()> {
                 &weakness_analyzer,
                 &causal_analyzer,
                 &world_model,
+                &counterfactual,
             ).await
         }
     }
@@ -651,6 +678,7 @@ async fn run_alpaca_loop(
     weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
     causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
     world_model: &Arc<Mutex<WorldModel>>,
+    counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -753,7 +781,7 @@ async fn run_alpaca_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, and WorldModel
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, and Counterfactual
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
@@ -761,6 +789,7 @@ async fn run_alpaca_loop(
                 save_weakness(weakness_analyzer);
                 save_causality(causal_analyzer);
                 save_worldmodel(world_model);
+                save_counterfactual(counterfactual);
 
                 // Run periodic weakness analysis on trade history
                 {
@@ -772,6 +801,27 @@ async fn run_alpaca_loop(
                         info!("[WEAKNESS] Identified {} weakness patterns:", weaknesses.len());
                         for w in weaknesses.iter().take(5) {
                             info!("  - {:?}: {:.1}% severity - {}", w.weakness_type, w.severity * 100.0, w.suggested_action);
+                        }
+                    }
+                }
+
+                // Run counterfactual analysis on recent trades
+                {
+                    let mut cf = counterfactual.lock().unwrap();
+                    let insights = cf.analyze_all_recent(50);
+                    if !insights.is_empty() {
+                        info!("[COUNTERFACTUAL] Identified {} patterns:", insights.len());
+                        for insight in insights.iter().take(5) {
+                            info!("  - {:?}: {} trades, ${:.2} avg improvement - {}",
+                                insight.insight_type, insight.evidence_count, insight.avg_improvement, insight.description);
+                        }
+                    }
+                    // Log recommendations
+                    let recommendations = cf.get_recommendations();
+                    if !recommendations.is_empty() {
+                        info!("[COUNTERFACTUAL] Top recommendations:");
+                        for rec in recommendations.iter().take(3) {
+                            info!("  - {}", rec);
                         }
                     }
                 }
@@ -823,6 +873,7 @@ async fn run_ibkr_loop(
     weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
     causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
     world_model: &Arc<Mutex<WorldModel>>,
+    counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -902,7 +953,7 @@ async fn run_ibkr_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, and WorldModel
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, and Counterfactual
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
@@ -910,6 +961,7 @@ async fn run_ibkr_loop(
                 save_weakness(weakness_analyzer);
                 save_causality(causal_analyzer);
                 save_worldmodel(world_model);
+                save_counterfactual(counterfactual);
 
                 // Run periodic weakness analysis on trade history
                 {
@@ -919,6 +971,27 @@ async fn run_ibkr_loop(
                         info!("[WEAKNESS] Identified {} weakness patterns:", weaknesses.len());
                         for w in weaknesses.iter().take(5) {
                             info!("  - {:?}: {:.1}% severity - {}", w.weakness_type, w.severity * 100.0, w.suggested_action);
+                        }
+                    }
+                }
+
+                // Run counterfactual analysis on recent trades
+                {
+                    let mut cf = counterfactual.lock().unwrap();
+                    let insights = cf.analyze_all_recent(50);
+                    if !insights.is_empty() {
+                        info!("[COUNTERFACTUAL] Identified {} patterns:", insights.len());
+                        for insight in insights.iter().take(5) {
+                            info!("  - {:?}: {} trades, ${:.2} avg improvement - {}",
+                                insight.insight_type, insight.evidence_count, insight.avg_improvement, insight.description);
+                        }
+                    }
+                    // Log recommendations
+                    let recommendations = cf.get_recommendations();
+                    if !recommendations.is_empty() {
+                        info!("[COUNTERFACTUAL] Top recommendations:");
+                        for rec in recommendations.iter().take(3) {
+                            info!("  - {}", rec);
                         }
                     }
                 }

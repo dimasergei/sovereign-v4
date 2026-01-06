@@ -33,6 +33,7 @@ use super::metalearner::{MetaLearner, calculate_accuracy};
 use super::weakness::WeaknessAnalyzer;
 use super::causality::CausalAnalyzer;
 use super::worldmodel::{WorldModel, PositionDirection};
+use super::counterfactual::CounterfactualAnalyzer;
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -199,6 +200,10 @@ pub struct SymbolAgent {
     // World model for forward planning
     /// Shared world model for market dynamics simulation
     world_model: Option<Arc<Mutex<WorldModel>>>,
+
+    // Counterfactual analysis
+    /// Shared counterfactual analyzer for learning from "what ifs"
+    counterfactual: Option<Arc<Mutex<CounterfactualAnalyzer>>>,
 }
 
 impl SymbolAgent {
@@ -239,6 +244,7 @@ impl SymbolAgent {
             weakness_analyzer: None,
             causal_analyzer: None,
             world_model: None,
+            counterfactual: None,
         }
     }
 
@@ -273,6 +279,7 @@ impl SymbolAgent {
             weakness_analyzer: None,
             causal_analyzer: None,
             world_model: None,
+            counterfactual: None,
         }
     }
 
@@ -312,6 +319,7 @@ impl SymbolAgent {
             weakness_analyzer: None,
             causal_analyzer: None,
             world_model: None,
+            counterfactual: None,
         }
     }
 
@@ -343,6 +351,7 @@ impl SymbolAgent {
             weakness_analyzer: None,
             causal_analyzer: None,
             world_model: None,
+            counterfactual: None,
         }
     }
 
@@ -1636,6 +1645,38 @@ impl SymbolAgent {
 
         let wm_lock = wm.lock().unwrap();
         wm_lock.forecast_price(&self.symbol, steps_ahead, 500)
+    }
+
+    // ==================== Counterfactual Analyzer Methods ====================
+
+    /// Attach counterfactual analyzer for learning from alternative decisions
+    pub fn attach_counterfactual_analyzer(&mut self, cf: Arc<Mutex<CounterfactualAnalyzer>>) {
+        self.counterfactual = Some(cf);
+    }
+
+    /// Check if counterfactual analyzer is attached
+    pub fn has_counterfactual_analyzer(&self) -> bool {
+        self.counterfactual.is_some()
+    }
+
+    /// Get reference to counterfactual analyzer
+    pub fn counterfactual_analyzer(&self) -> Option<&Arc<Mutex<CounterfactualAnalyzer>>> {
+        self.counterfactual.as_ref()
+    }
+
+    /// Get counterfactual recommendations for current setup
+    ///
+    /// Returns a recommendation string if there's a strong signal from historical analysis
+    pub fn get_counterfactual_recommendation(&self, sr_score: i32, volume_percentile: f64) -> Option<String> {
+        let Some(ref cf) = self.counterfactual else {
+            return None;
+        };
+
+        let cf_lock = cf.lock().unwrap();
+        let recommendations = cf_lock.get_recommendations();
+
+        // Return the first relevant recommendation
+        recommendations.first().cloned()
     }
 }
 
