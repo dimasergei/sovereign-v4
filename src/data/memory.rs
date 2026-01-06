@@ -13,6 +13,8 @@ use rust_decimal::prelude::ToPrimitive;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::core::regime::Regime;
+
 /// Market regime classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketRegime {
@@ -38,12 +40,22 @@ impl MarketRegime {
 
     pub fn from_str(s: &str) -> Self {
         match s {
-            "BULL" => MarketRegime::Bull,
-            "BEAR" => MarketRegime::Bear,
-            "SIDEWAYS" => MarketRegime::Sideways,
-            "HIGH_VOL" => MarketRegime::HighVolatility,
+            "BULL" | "TRENDING_UP" => MarketRegime::Bull,
+            "BEAR" | "TRENDING_DOWN" => MarketRegime::Bear,
+            "SIDEWAYS" | "RANGING" => MarketRegime::Sideways,
+            "HIGH_VOL" | "VOLATILE" => MarketRegime::HighVolatility,
             "LOW_VOL" => MarketRegime::LowVolatility,
             _ => MarketRegime::Unknown,
+        }
+    }
+
+    /// Convert from HMM Regime to MarketRegime
+    pub fn from_regime(regime: Regime) -> Self {
+        match regime {
+            Regime::TrendingUp => MarketRegime::Bull,
+            Regime::TrendingDown => MarketRegime::Bear,
+            Regime::Ranging => MarketRegime::Sideways,
+            Regime::Volatile => MarketRegime::HighVolatility,
         }
     }
 }
@@ -681,8 +693,8 @@ impl TradeMemory {
     // REGIME METHODS
     // =========================================================================
 
-    /// Start a new market regime
-    pub fn start_regime(&self, regime: MarketRegime) -> Result<i64> {
+    /// Start a new market regime (global)
+    pub fn start_regime_global(&self, regime: MarketRegime) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
@@ -696,6 +708,29 @@ impl TradeMemory {
         conn.execute(
             "INSERT INTO regime_history (regime, started_at) VALUES (?1, ?2)",
             rusqlite::params![regime.as_str(), now],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Start a new market regime for a specific symbol (HMM-detected)
+    pub fn start_regime(&self, symbol: &str, regime_str: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        // Close any open regime for this symbol
+        // Note: For symbol-specific regimes, we use the symbol as a prefix in the regime field
+        let regime_key = format!("{}:{}", symbol, regime_str);
+
+        conn.execute(
+            "UPDATE regime_history SET ended_at = ?1 WHERE regime LIKE ?2 AND ended_at IS NULL",
+            rusqlite::params![now, format!("{}:%", symbol)],
+        )?;
+
+        // Start new regime
+        conn.execute(
+            "INSERT INTO regime_history (regime, started_at) VALUES (?1, ?2)",
+            rusqlite::params![regime_key, now],
         )?;
 
         Ok(conn.last_insert_rowid())
@@ -991,8 +1026,8 @@ mod tests {
     fn test_regime_tracking() {
         let memory = TradeMemory::new(":memory:").unwrap();
 
-        // Start a bull regime
-        memory.start_regime(MarketRegime::Bull).unwrap();
+        // Start a bull regime (global)
+        memory.start_regime_global(MarketRegime::Bull).unwrap();
 
         // Record some trades
         memory.update_regime_stats(100.0, 5).unwrap();
@@ -1010,6 +1045,20 @@ mod tests {
         assert_eq!(stats.total_trades, 3);
         assert_eq!(stats.wins, 2);
         assert_eq!(stats.losses, 1);
+    }
+
+    #[test]
+    fn test_symbol_regime_tracking() {
+        let memory = TradeMemory::new(":memory:").unwrap();
+
+        // Start a trending up regime for AAPL
+        memory.start_regime("AAPL", "TRENDING_UP").unwrap();
+
+        // Start a different regime for MSFT
+        memory.start_regime("MSFT", "RANGING").unwrap();
+
+        // Both should be recorded separately
+        // (This is basic existence test - actual regime retrieval would need more work)
     }
 
     #[test]

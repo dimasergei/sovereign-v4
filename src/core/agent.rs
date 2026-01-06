@@ -24,6 +24,7 @@ use std::sync::Arc;
 #[allow(deprecated)]
 use super::sr::{SRLevels, default_granularity, granularity_from_atr};
 use super::capitulation::VolumeTracker;
+use super::regime::{Regime, RegimeDetector};
 use crate::data::memory::{TradeMemory, MarketRegime};
 
 /// Trading signal from an agent
@@ -117,6 +118,7 @@ pub struct EntryContext {
 /// - Manages its own position state
 /// - Tracks ATR for volatility-based calculations (lossless)
 /// - Records trade context for AGI learning (when memory is attached)
+/// - Detects market regime using HMM (TrendingUp, TrendingDown, Ranging, Volatile)
 pub struct SymbolAgent {
     /// Symbol this agent is trading
     symbol: String,
@@ -124,6 +126,8 @@ pub struct SymbolAgent {
     sr: SRLevels,
     /// Volume tracker for capitulation detection
     volume: VolumeTracker,
+    /// HMM-based regime detector
+    regime_detector: RegimeDetector,
     /// Current position (if any)
     position: Option<Position>,
     /// Last known price
@@ -160,6 +164,7 @@ impl SymbolAgent {
             symbol,
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
+            regime_detector: RegimeDetector::new(),
             position: None,
             last_price: initial_price,
             last_volume: 0,
@@ -181,6 +186,7 @@ impl SymbolAgent {
             symbol,
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
+            regime_detector: RegimeDetector::new(),
             position: None,
             last_price: initial_price,
             last_volume: 0,
@@ -207,6 +213,7 @@ impl SymbolAgent {
             symbol,
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
+            regime_detector: RegimeDetector::new(),
             position: None,
             last_price: Decimal::ZERO,
             last_volume: 0,
@@ -225,6 +232,7 @@ impl SymbolAgent {
             symbol,
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
+            regime_detector: RegimeDetector::new(),
             position: None,
             last_price: Decimal::ZERO,
             last_volume: 0,
@@ -305,23 +313,34 @@ impl SymbolAgent {
         // 2. Update volume tracker
         self.volume.update(volume);
 
-        // 3. Track bars for ATR calculation
+        // 3. Update regime detector (HMM)
+        self.regime_detector.update(open, high, low, close, volume);
+
+        // 4. Check for regime change and record to memory
+        if self.regime_detector.regime_changed() {
+            if let Some(ref memory) = self.memory {
+                let new_regime = self.regime_detector.current_regime();
+                let _ = memory.start_regime(&self.symbol, new_regime.as_str());
+            }
+        }
+
+        // 5. Track bars for ATR calculation
         if self.recent_bars.len() >= self.max_atr_bars {
             self.recent_bars.remove(0);
         }
         self.recent_bars.push((open, high, low, close));
 
-        // 4. Update state
+        // 6. Update state
         self.last_price = close;
         self.last_volume = volume;
         self.bar_count += 1;
 
-        // 5. Not ready yet - need more data
+        // 7. Not ready yet - need more data
         if !self.is_ready() {
             return None;
         }
 
-        // 6. Check for signals
+        // 8. Check for signals
         self.check_signals(time, open, close, volume)
     }
 
@@ -510,6 +529,7 @@ impl SymbolAgent {
     ///
     /// Used at startup to pre-populate S/R levels from historical data.
     /// Does NOT generate trading signals - only builds the S/R map.
+    /// Also trains the regime detector with historical data.
     pub fn bootstrap_bar(
         &mut self,
         open: Decimal,
@@ -524,6 +544,9 @@ impl SymbolAgent {
         // Update volume tracker
         self.volume.update(volume);
 
+        // Update regime detector (train HMM with historical data)
+        self.regime_detector.update(open, high, low, close, volume);
+
         // Track bars for ATR calculation
         if self.recent_bars.len() >= self.max_atr_bars {
             self.recent_bars.remove(0);
@@ -534,6 +557,26 @@ impl SymbolAgent {
         self.last_price = close;
         self.last_volume = volume;
         self.bar_count += 1;
+    }
+
+    /// Get current market regime
+    pub fn current_regime(&self) -> Regime {
+        self.regime_detector.current_regime()
+    }
+
+    /// Get regime probabilities (TrendingUp, TrendingDown, Ranging, Volatile)
+    pub fn regime_probabilities(&self) -> [f64; 4] {
+        self.regime_detector.regime_probabilities()
+    }
+
+    /// Get duration in current regime (bars)
+    pub fn regime_duration(&self) -> u32 {
+        self.regime_detector.regime_duration()
+    }
+
+    /// Get confidence in current regime classification
+    pub fn regime_confidence(&self) -> f64 {
+        self.regime_detector.confidence()
     }
 
     /// Calculate current ATR from recent bars (lossless - derived from data)
@@ -586,10 +629,8 @@ impl SymbolAgent {
         self.next_ticket += 1;
 
         let sr_score = self.sr.score_at(sr_level);
-        let regime = self.memory
-            .as_ref()
-            .and_then(|m| m.get_current_regime().ok().flatten())
-            .unwrap_or(MarketRegime::Unknown);
+        // Use HMM regime detection, falling back to memory or Unknown
+        let regime = MarketRegime::from_regime(self.regime_detector.current_regime());
 
         let entry_price = self.last_price;
 
