@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType, MemoryConsolidator};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -50,6 +50,7 @@ const COUNTERFACTUAL_PATH: &str = "sovereign_counterfactual.json";
 const MONITOR_PATH: &str = "sovereign_monitor.json";
 const SEQUENCE_PATH: &str = "sovereign_sequence.json";
 const EMBEDDINGS_PATH: &str = "sovereign_embeddings.bin";
+const CONSOLIDATION_PATH: &str = "sovereign_consolidation.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -207,6 +208,30 @@ fn save_embeddings(vector_index: &Arc<Mutex<VectorIndex>>) {
     } else {
         info!("Embeddings: Saved - {}", idx.format_summary());
     }
+}
+
+/// Save MemoryConsolidator state
+fn save_consolidation(memory_consolidator: &Arc<Mutex<MemoryConsolidator>>) {
+    let mc = memory_consolidator.lock().unwrap();
+    if let Err(e) = mc.save(CONSOLIDATION_PATH) {
+        warn!("Failed to save MemoryConsolidator: {}", e);
+    } else {
+        info!("Consolidation: Saved - {}", mc.format_summary());
+    }
+}
+
+/// Run consolidation on the memory consolidator (extract patterns)
+fn run_consolidation(memory_consolidator: &Arc<Mutex<MemoryConsolidator>>) {
+    let mut mc = memory_consolidator.lock().unwrap();
+    let pre_patterns = mc.pattern_count();
+    mc.consolidate();
+    let post_patterns = mc.pattern_count();
+    info!(
+        "Consolidation: Extracted {} new patterns ({} -> {} total)",
+        post_patterns.saturating_sub(pre_patterns),
+        pre_patterns,
+        post_patterns
+    );
 }
 
 /// Check if US stock market is open
@@ -567,6 +592,20 @@ async fn main() -> Result<()> {
         agent.attach_vector_index(Arc::clone(&vector_index));
     }
 
+    // Load MemoryConsolidator for hierarchical memory and pattern extraction
+    let memory_consolidator = Arc::new(Mutex::new(
+        MemoryConsolidator::load_or_new(CONSOLIDATION_PATH, Arc::clone(&vector_index))
+    ));
+    {
+        let mc = memory_consolidator.lock().unwrap();
+        info!("Consolidation: Loaded - {}", mc.format_summary());
+    }
+
+    // Attach MemoryConsolidator to all agents
+    for agent in agents.values_mut() {
+        agent.attach_memory_consolidator(Arc::clone(&memory_consolidator));
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -624,6 +663,7 @@ async fn main() -> Result<()> {
                 &agi_monitor,
                 &regime_predictor,
                 &vector_index,
+                &memory_consolidator,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -645,6 +685,7 @@ async fn main() -> Result<()> {
                 &agi_monitor,
                 &regime_predictor,
                 &vector_index,
+                &memory_consolidator,
             ).await
         }
     }
@@ -768,6 +809,7 @@ async fn run_alpaca_loop(
     agi_monitor: &Arc<Mutex<AGIMonitor>>,
     regime_predictor: &Arc<Mutex<RegimePredictor>>,
     vector_index: &Arc<Mutex<VectorIndex>>,
+    memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -896,6 +938,17 @@ async fn run_alpaca_loop(
                 save_monitor(agi_monitor);
                 save_sequence(regime_predictor);
                 save_embeddings(vector_index);
+                save_consolidation(memory_consolidator);
+
+                // Run weekly pattern consolidation (every 7 days at market close)
+                {
+                    let mc = memory_consolidator.lock().unwrap();
+                    // Check if we should consolidate (24 hour default interval)
+                    drop(mc);
+                    // Consolidation happens automatically via maybe_consolidate()
+                    // but we can force it here for pattern extraction
+                    run_consolidation(memory_consolidator);
+                }
 
                 // Run periodic weakness analysis on trade history
                 {
@@ -983,6 +1036,7 @@ async fn run_ibkr_loop(
     agi_monitor: &Arc<Mutex<AGIMonitor>>,
     regime_predictor: &Arc<Mutex<RegimePredictor>>,
     vector_index: &Arc<Mutex<VectorIndex>>,
+    memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -1088,6 +1142,10 @@ async fn run_ibkr_loop(
                 save_monitor(agi_monitor);
                 save_sequence(regime_predictor);
                 save_embeddings(vector_index);
+                save_consolidation(memory_consolidator);
+
+                // Run weekly pattern consolidation
+                run_consolidation(memory_consolidator);
 
                 // Run periodic weakness analysis on trade history
                 {

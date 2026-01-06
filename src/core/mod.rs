@@ -25,6 +25,7 @@ pub mod counterfactual;
 pub mod monitor;
 pub mod sequence;
 pub mod embeddings;
+pub mod consolidation;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
@@ -41,3 +42,4 @@ pub use counterfactual::{CounterfactualAnalyzer, CounterfactualResult, TradingIn
 pub use monitor::{AGIMonitor, AGIMetrics, AGIReport, PerformanceMetrics, SystemHealth, ExpertStats};
 pub use sequence::{LSTMCell, SequenceEncoder, MarketFeatures, RegimePredictor};
 pub use embeddings::{VectorIndex, TradeEmbedding, TradeContext, EmbeddingModel, IndexType, cosine_similarity};
+pub use consolidation::{MemoryConsolidator, MemoryTier, Episode, EpisodeContext, Pattern, MemoryStats, ImportanceScorer, PatternExtractor};

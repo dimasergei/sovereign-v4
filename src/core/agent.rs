@@ -35,7 +35,8 @@ use super::causality::CausalAnalyzer;
 use super::worldmodel::{WorldModel, PositionDirection};
 use super::counterfactual::CounterfactualAnalyzer;
 use super::sequence::{MarketFeatures, RegimePredictor};
-use super::embeddings::{VectorIndex, TradeContext as EmbeddingTradeContext};
+use super::embeddings::{VectorIndex, TradeContext as EmbeddingTradeContext, EMBEDDING_DIM};
+use super::consolidation::{MemoryConsolidator, EpisodeContext};
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -214,6 +215,10 @@ pub struct SymbolAgent {
     // Vector embeddings for similarity-based retrieval
     /// Shared vector index for finding similar historical trades
     vector_index: Option<Arc<Mutex<VectorIndex>>>,
+
+    // Hierarchical memory consolidation
+    /// Shared memory consolidator for pattern extraction
+    memory_consolidator: Option<Arc<Mutex<MemoryConsolidator>>>,
 }
 
 impl SymbolAgent {
@@ -257,6 +262,7 @@ impl SymbolAgent {
             counterfactual: None,
             regime_predictor: None,
             vector_index: None,
+            memory_consolidator: None,
         }
     }
 
@@ -294,6 +300,7 @@ impl SymbolAgent {
             counterfactual: None,
             regime_predictor: None,
             vector_index: None,
+            memory_consolidator: None,
         }
     }
 
@@ -336,6 +343,7 @@ impl SymbolAgent {
             counterfactual: None,
             regime_predictor: None,
             vector_index: None,
+            memory_consolidator: None,
         }
     }
 
@@ -370,6 +378,7 @@ impl SymbolAgent {
             counterfactual: None,
             regime_predictor: None,
             vector_index: None,
+            memory_consolidator: None,
         }
     }
 
@@ -1168,6 +1177,28 @@ impl SymbolAgent {
                 was_winner,
                 profit.to_f64().unwrap_or(0.0),
             );
+
+            // Also add to memory consolidator for pattern extraction
+            if self.has_memory_consolidator() {
+                let embedding = self.generate_query_embedding(
+                    entry.sr_score,
+                    entry.volume_percentile,
+                    atr_pct,
+                    distance_to_sr_pct,
+                    is_long,
+                );
+                self.add_episode_to_consolidator(
+                    entry.sr_score,
+                    entry.volume_percentile,
+                    atr_pct,
+                    distance_to_sr_pct,
+                    is_long,
+                    hold_bars.max(0) as u32,
+                    was_winner,
+                    profit.to_f64().unwrap_or(0.0),
+                    embedding,
+                );
+            }
         }
     }
 
@@ -1315,6 +1346,50 @@ impl SymbolAgent {
                 );
 
                 combined = similarity_adjusted;
+            }
+        }
+
+        // Apply pattern-based adjustment from memory consolidator
+        if self.has_memory_consolidator() {
+            // Calculate ATR percentage and distance to SR for pattern query
+            let atr_pct = self.atr()
+                .and_then(|atr| {
+                    let price_f = self.last_price.to_f64().unwrap_or(1.0);
+                    if price_f > 0.0 {
+                        Some(atr.to_f64().unwrap_or(0.0) / price_f * 100.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1.0);
+
+            let sr_price_f = sr_level.to_f64().unwrap_or(0.0);
+            let last_price_f = self.last_price.to_f64().unwrap_or(1.0);
+            let distance_to_sr_pct = if last_price_f > 0.0 {
+                ((last_price_f - sr_price_f).abs() / last_price_f * 100.0).min(5.0)
+            } else {
+                1.0
+            };
+
+            let is_long = sr_price_f < last_price_f;
+
+            if let Some((pattern_win_rate, pattern_avg_pnl, pattern_name)) = self.get_pattern_prediction(
+                sr_score,
+                volume_pct,
+                atr_pct,
+                distance_to_sr_pct,
+                is_long,
+            ) {
+                // Blend: 70% current + 30% pattern (patterns are more abstract)
+                let pattern_adjusted = combined * 0.7 + pattern_win_rate * 0.3;
+
+                info!(
+                    "[PATTERN] {} Matched '{}': {:.1}% -> {:.1}% (pattern: {:.1}% win, ${:.2} avg)",
+                    self.symbol, pattern_name, combined * 100.0, pattern_adjusted * 100.0,
+                    pattern_win_rate * 100.0, pattern_avg_pnl
+                );
+
+                combined = pattern_adjusted;
             }
         }
 
@@ -2072,6 +2147,167 @@ impl SymbolAgent {
             0.5 + win_rate
         } else {
             1.0 // No adjustment if no similar trades found
+        }
+    }
+
+    // =========================================================================
+    // HIERARCHICAL MEMORY CONSOLIDATION
+    // =========================================================================
+
+    /// Attach memory consolidator for pattern extraction
+    pub fn attach_memory_consolidator(&mut self, consolidator: Arc<Mutex<MemoryConsolidator>>) {
+        self.memory_consolidator = Some(consolidator);
+    }
+
+    /// Check if memory consolidator is attached
+    pub fn has_memory_consolidator(&self) -> bool {
+        self.memory_consolidator.is_some()
+    }
+
+    /// Get reference to memory consolidator
+    pub fn memory_consolidator(&self) -> Option<&Arc<Mutex<MemoryConsolidator>>> {
+        self.memory_consolidator.as_ref()
+    }
+
+    /// Add a trade episode to the memory consolidator
+    ///
+    /// Should be called alongside add_trade_to_index
+    pub fn add_episode_to_consolidator(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+        hold_duration: u32,
+        won: bool,
+        pnl: f64,
+        embedding: Vec<f64>,
+    ) {
+        if let Some(ref consolidator) = self.memory_consolidator {
+            if let Ok(mut mc) = consolidator.lock() {
+                let context = EpisodeContext::new(
+                    self.symbol.clone(),
+                    sr_score,
+                    volume_percentile,
+                    atr_pct,
+                    distance_to_sr_pct,
+                    self.regime_detector.current_regime().clone(),
+                    is_long,
+                    hold_duration,
+                    won,
+                    pnl,
+                );
+                mc.add_episode(context, embedding);
+                info!(
+                    "[CONSOLIDATION] {} Added episode ({} working, {} episodic)",
+                    self.symbol, mc.get_memory_stats().working_count, mc.get_memory_stats().episodic_count
+                );
+            }
+        }
+    }
+
+    /// Get pattern-based prediction from memory consolidator
+    ///
+    /// Returns (win_rate, avg_pnl, pattern_name) if a matching pattern is found
+    pub fn get_pattern_prediction(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> Option<(f64, f64, String)> {
+        let consolidator = self.memory_consolidator.as_ref()?;
+        let mc = consolidator.lock().ok()?;
+
+        // Generate query embedding
+        let embedding = self.generate_query_embedding(
+            sr_score,
+            volume_percentile,
+            atr_pct,
+            distance_to_sr_pct,
+            is_long,
+        );
+
+        mc.get_pattern_prediction(&embedding)
+    }
+
+    /// Generate an embedding for a query context
+    fn generate_query_embedding(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> Vec<f64> {
+        // Create a simple normalized embedding from features
+        // This matches the approach used in TradeContext::to_features()
+        let mut embedding = vec![0.0; EMBEDDING_DIM];
+
+        // sr_score: normalize from [-10, 0] to [0, 1]
+        embedding[0] = (sr_score as f64 + 10.0) / 10.0;
+
+        // volume_percentile: normalize from [0, 100] to [0, 1]
+        embedding[1] = volume_percentile / 100.0;
+
+        // atr_pct: normalize from [0, 5] to [0, 1]
+        embedding[2] = (atr_pct / 5.0).min(1.0);
+
+        // distance_to_sr_pct: normalize from [0, 5] to [0, 1]
+        embedding[3] = (distance_to_sr_pct / 5.0).min(1.0);
+
+        // regime: one-hot encoding (positions 4-7)
+        let regime = self.regime_detector.current_regime();
+        match regime {
+            Regime::TrendingUp => embedding[4] = 1.0,
+            Regime::TrendingDown => embedding[5] = 1.0,
+            Regime::Ranging => embedding[6] = 1.0,
+            Regime::Volatile => embedding[7] = 1.0,
+        }
+
+        // is_long: binary
+        embedding[8] = if is_long { 1.0 } else { 0.0 };
+
+        // Normalize the embedding vector
+        let magnitude: f64 = embedding.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if magnitude > 0.0 {
+            for val in &mut embedding {
+                *val /= magnitude;
+            }
+        }
+
+        embedding
+    }
+
+    /// Get pattern-based confidence factor
+    ///
+    /// Returns a multiplier (0.5 to 1.5) based on matching pattern performance
+    pub fn get_pattern_confidence_factor(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> f64 {
+        if let Some((win_rate, avg_pnl, pattern_name)) = self.get_pattern_prediction(
+            sr_score,
+            volume_percentile,
+            atr_pct,
+            distance_to_sr_pct,
+            is_long,
+        ) {
+            info!(
+                "[PATTERN] {} Matched '{}': {:.1}% win rate, ${:.2} avg PnL",
+                self.symbol, pattern_name, win_rate * 100.0, avg_pnl
+            );
+
+            // Scale win_rate to confidence factor (same as similarity)
+            0.5 + win_rate
+        } else {
+            1.0 // No adjustment if no pattern found
         }
     }
 }
