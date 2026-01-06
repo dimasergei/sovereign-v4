@@ -860,6 +860,11 @@ impl MemoryConsolidator {
         self.semantic.len()
     }
 
+    /// Get reference to all patterns
+    pub fn get_patterns(&self) -> &[Pattern] {
+        &self.semantic
+    }
+
     /// Get episodic count
     pub fn episodic_count(&self) -> usize {
         self.episodic.len()

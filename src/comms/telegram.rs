@@ -395,3 +395,85 @@ pub async fn send_selfmod_help() {
         /rollback &lt;id&gt; - Rollback an applied modification";
     let _ = send(msg).await;
 }
+
+// ==================== Codegen Commands ====================
+
+/// Send codegen help
+pub async fn send_codegen_help() {
+    let msg = "🧬 <b>Code Generation Commands</b>\n\n\
+        /codegen - Show code generation status\n\
+        /gencode list - List all generated code\n\
+        /gencode pending - List pending code proposals\n\
+        /gencode active - List active deployed code\n\
+        /gencode deploy &lt;id&gt; - Deploy pending code\n\
+        /gencode rollback &lt;id&gt; - Rollback deployed code";
+    let _ = send(msg).await;
+}
+
+/// Send codegen status
+pub async fn send_codegen_status(active: usize, pending: usize, history: usize) {
+    let msg = format!(
+        "🧬 <b>Code Generation Status</b>\n\n\
+        Active: {}\n\
+        Pending: {}\n\
+        Total Generated: {}",
+        active, pending, history
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send list of pending generated code
+pub async fn send_pending_code(code_list: &[(u64, String, String)]) {
+    if code_list.is_empty() {
+        let _ = send("⏳ <b>No Pending Code</b>\n\nNo code proposals awaiting deployment.").await;
+        return;
+    }
+
+    let mut msg = String::from("⏳ <b>Pending Code Proposals</b>\n\n");
+    for (id, code_type, description) in code_list.iter().take(10) {
+        msg.push_str(&format!(
+            "<code>{}</code> [{}]\n{}\n\n",
+            id, code_type, description
+        ));
+    }
+    let _ = send(&msg).await;
+}
+
+/// Send list of active generated code
+pub async fn send_active_code(code_list: &[(u64, String, String, u32)]) {
+    if code_list.is_empty() {
+        let _ = send("✅ <b>No Active Code</b>\n\nNo generated code is currently deployed.").await;
+        return;
+    }
+
+    let mut msg = String::from("✅ <b>Active Generated Code</b>\n\n");
+    for (id, code_type, description, executions) in code_list.iter().take(10) {
+        msg.push_str(&format!(
+            "<code>{}</code> [{}]\n{}\nExecutions: {}\n\n",
+            id, code_type, description, executions
+        ));
+    }
+    let _ = send(&msg).await;
+}
+
+/// Send code deployment confirmation
+pub async fn send_code_deploy(id: &str, success: bool, message: &str) {
+    let emoji = if success { "🚀" } else { "❌" };
+    let status = if success { "Deployed" } else { "Deploy Failed" };
+    let msg = format!(
+        "{} <b>Code {}</b>\n\nID: <code>{}</code>\n{}",
+        emoji, status, id, message
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send code rollback confirmation
+pub async fn send_code_rollback(id: &str, success: bool, message: &str) {
+    let emoji = if success { "⏪" } else { "❌" };
+    let status = if success { "Rolled Back" } else { "Rollback Failed" };
+    let msg = format!(
+        "{} <b>Code {}</b>\n\nID: <code>{}</code>\n{}",
+        emoji, status, id, message
+    );
+    let _ = send(&msg).await;
+}

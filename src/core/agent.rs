@@ -38,6 +38,7 @@ use super::sequence::{MarketFeatures, RegimePredictor};
 use super::embeddings::{VectorIndex, TradeContext as EmbeddingTradeContext, EMBEDDING_DIM};
 use super::consolidation::{MemoryConsolidator, EpisodeContext};
 use super::selfmod::{SelfModificationEngine, RuleContext, RuleAction};
+use super::codegen::{CodeDeployer, EvalContext as CodegenEvalContext};
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -224,6 +225,10 @@ pub struct SymbolAgent {
     // Autonomous self-modification
     /// Shared self-modification engine for rule learning
     self_mod: Option<Arc<Mutex<SelfModificationEngine>>>,
+
+    // Code self-modification
+    /// Shared code deployer for generated code execution
+    code_deployer: Option<Arc<Mutex<CodeDeployer>>>,
 }
 
 impl SymbolAgent {
@@ -269,6 +274,7 @@ impl SymbolAgent {
             vector_index: None,
             memory_consolidator: None,
             self_mod: None,
+            code_deployer: None,
         }
     }
 
@@ -308,6 +314,7 @@ impl SymbolAgent {
             vector_index: None,
             memory_consolidator: None,
             self_mod: None,
+            code_deployer: None,
         }
     }
 
@@ -352,6 +359,7 @@ impl SymbolAgent {
             vector_index: None,
             memory_consolidator: None,
             self_mod: None,
+            code_deployer: None,
         }
     }
 
@@ -388,6 +396,7 @@ impl SymbolAgent {
             vector_index: None,
             memory_consolidator: None,
             self_mod: None,
+            code_deployer: None,
         }
     }
 
@@ -2426,6 +2435,76 @@ impl SymbolAgent {
     /// Check if self-modification engine is attached
     pub fn has_self_mod(&self) -> bool {
         self.self_mod.is_some()
+    }
+
+    /// Attach code deployer for generated code execution
+    pub fn attach_code_deployer(&mut self, deployer: Arc<Mutex<CodeDeployer>>) {
+        self.code_deployer = Some(deployer);
+    }
+
+    /// Check if code deployer is attached
+    pub fn has_code_deployer(&self) -> bool {
+        self.code_deployer.is_some()
+    }
+
+    /// Execute code deployer filters for a potential trade
+    /// Returns true if trade is allowed (all filters pass)
+    pub fn execute_code_filters(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        confidence: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> bool {
+        if let Some(ref deployer_lock) = self.code_deployer {
+            if let Ok(deployer) = deployer_lock.lock() {
+                let ctx = CodegenEvalContext::from_trade_context(
+                    sr_score,
+                    volume_percentile,
+                    confidence,
+                    atr_pct,
+                    distance_to_sr_pct,
+                    is_long,
+                    0.0,  // current_pnl (not applicable for entry)
+                    0,    // bars_held (not applicable for entry)
+                    self.regime_detector.current_regime(),
+                );
+                return deployer.execute_filters(&ctx);
+            }
+        }
+        true // If no deployer, allow trade
+    }
+
+    /// Apply code deployer confidence adjusters
+    pub fn apply_code_adjusters(&self, base_confidence: f64, sr_score: i32, volume_percentile: f64) -> f64 {
+        if let Some(ref deployer_lock) = self.code_deployer {
+            if let Ok(deployer) = deployer_lock.lock() {
+                let mut ctx = CodegenEvalContext::new(self.regime_detector.current_regime());
+                ctx.set("confidence", base_confidence);
+                ctx.set("sr_score", sr_score as f64);
+                ctx.set("volume_percentile", volume_percentile);
+                ctx.set("volume_pct", volume_percentile);
+                return deployer.execute_adjusters(base_confidence, &ctx);
+            }
+        }
+        base_confidence
+    }
+
+    /// Check code deployer exit rules
+    /// Returns Some(reason) if exit should trigger
+    pub fn check_code_exit_rules(&self, current_pnl: f64, bars_held: u32, is_long: bool) -> Option<String> {
+        if let Some(ref deployer_lock) = self.code_deployer {
+            if let Ok(deployer) = deployer_lock.lock() {
+                let mut ctx = CodegenEvalContext::new(self.regime_detector.current_regime());
+                ctx.set("current_pnl", current_pnl);
+                ctx.set("bars_held", bars_held as f64);
+                ctx.set("is_long", if is_long { 1.0 } else { 0.0 });
+                return deployer.check_exit_rules(&ctx);
+            }
+        }
+        None
     }
 
     /// Evaluate self-modification rules for a potential trade

@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType, MemoryConsolidator, TransferabilityPredictor, SelfModificationEngine, Constitution};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType, MemoryConsolidator, TransferabilityPredictor, SelfModificationEngine, Constitution, CodeDeployer};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -53,6 +53,7 @@ const EMBEDDINGS_PATH: &str = "sovereign_embeddings.bin";
 const CONSOLIDATION_PATH: &str = "sovereign_consolidation.json";
 const TRANSFERABILITY_PATH: &str = "sovereign_transferability.json";
 const SELFMOD_PATH: &str = "sovereign_selfmod.json";
+const CODEGEN_PATH: &str = "sovereign_codegen.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -259,6 +260,77 @@ fn save_selfmod(selfmod: &Arc<Mutex<SelfModificationEngine>>) {
     }
 }
 
+/// Save CodeDeployer state
+fn save_codegen(code_deployer: &Arc<Mutex<CodeDeployer>>) {
+    let deployer = code_deployer.lock().unwrap();
+    if let Err(e) = deployer.save(CODEGEN_PATH) {
+        warn!("Failed to save CodeDeployer: {}", e);
+    } else {
+        info!("Codegen: Saved - {}", deployer.format_summary());
+    }
+}
+
+/// Run daily code generation from weaknesses and insights
+fn run_code_generation(
+    code_deployer: &Arc<Mutex<CodeDeployer>>,
+    weakness_analyzer: &Arc<Mutex<crate::core::WeaknessAnalyzer>>,
+    counterfactual: &Arc<Mutex<crate::core::CounterfactualAnalyzer>>,
+    memory_consolidator: &Arc<Mutex<crate::core::MemoryConsolidator>>,
+) {
+    let mut deployer = code_deployer.lock().unwrap();
+    let wa = weakness_analyzer.lock().unwrap();
+    let cf = counterfactual.lock().unwrap();
+    let mc = memory_consolidator.lock().unwrap();
+
+    let mut proposal_count = 0;
+
+    // Generate signal filters from weaknesses
+    for weakness in wa.get_weaknesses() {
+        let code = deployer.generator_mut().generate_signal_filter(weakness);
+        match deployer.propose_code(code) {
+            Ok(id) => {
+                info!("[CODEGEN] Proposed filter from weakness: id={}", id);
+                proposal_count += 1;
+            }
+            Err(e) => {
+                warn!("[CODEGEN] Failed to propose filter: {}", e);
+            }
+        }
+    }
+
+    // Generate confidence adjusters from insights
+    for insight in cf.get_insights() {
+        let code = deployer.generator_mut().generate_confidence_adjuster(insight);
+        match deployer.propose_code(code) {
+            Ok(id) => {
+                info!("[CODEGEN] Proposed adjuster from insight: id={}", id);
+                proposal_count += 1;
+            }
+            Err(e) => {
+                warn!("[CODEGEN] Failed to propose adjuster: {}", e);
+            }
+        }
+    }
+
+    // Generate feature extractors from discovered patterns
+    for pattern in mc.get_patterns() {
+        let code = deployer.generator_mut().generate_feature_extractor(pattern);
+        match deployer.propose_code(code) {
+            Ok(id) => {
+                info!("[CODEGEN] Proposed feature from pattern: id={}", id);
+                proposal_count += 1;
+            }
+            Err(e) => {
+                warn!("[CODEGEN] Failed to propose feature: {}", e);
+            }
+        }
+    }
+
+    if proposal_count > 0 {
+        info!("[CODEGEN] Generated {} code proposals from daily analysis", proposal_count);
+    }
+}
+
 /// Run daily self-modification analysis and proposal generation
 fn run_analyze_and_propose(
     selfmod: &Arc<Mutex<SelfModificationEngine>>,
@@ -320,8 +392,11 @@ fn discover_ml_clusters(transfer_manager: &Arc<Mutex<TransferManager>>) {
     }
 }
 
-/// Process Telegram self-modification commands
-async fn process_telegram_commands(selfmod: &Arc<Mutex<SelfModificationEngine>>) {
+/// Process Telegram self-modification and codegen commands
+async fn process_telegram_commands(
+    selfmod: &Arc<Mutex<SelfModificationEngine>>,
+    code_deployer: &Arc<Mutex<CodeDeployer>>,
+) {
     let commands = telegram::poll_commands().await;
 
     for cmd in commands {
@@ -432,6 +507,112 @@ async fn process_telegram_commands(selfmod: &Arc<Mutex<SelfModificationEngine>>)
             }
             "/selfmod" | "/selfmodhelp" => {
                 telegram::send_selfmod_help().await;
+            }
+            // ==================== Codegen Commands ====================
+            "/codegen" => {
+                let deployer = code_deployer.lock().unwrap();
+                telegram::send_codegen_status(
+                    deployer.active_count(),
+                    deployer.pending_count(),
+                    deployer.generator().history_count(),
+                ).await;
+            }
+            "/gencode" => {
+                let subcommand = cmd.args.first().map(|s| s.as_str()).unwrap_or("help");
+                match subcommand {
+                    "list" | "all" => {
+                        let deployer = code_deployer.lock().unwrap();
+                        let active: Vec<(u64, String, String, u32)> = deployer
+                            .get_active()
+                            .iter()
+                            .map(|c| (
+                                c.id,
+                                c.code_type.to_string(),
+                                c.description.clone(),
+                                c.performance.as_ref().map_or(0, |p| p.times_executed),
+                            ))
+                            .collect();
+                        drop(deployer);
+                        telegram::send_active_code(&active).await;
+                    }
+                    "pending" => {
+                        let deployer = code_deployer.lock().unwrap();
+                        let pending: Vec<(u64, String, String)> = deployer
+                            .get_pending()
+                            .iter()
+                            .map(|c| (
+                                c.id,
+                                c.code_type.to_string(),
+                                c.description.clone(),
+                            ))
+                            .collect();
+                        drop(deployer);
+                        telegram::send_pending_code(&pending).await;
+                    }
+                    "active" => {
+                        let deployer = code_deployer.lock().unwrap();
+                        let active: Vec<(u64, String, String, u32)> = deployer
+                            .get_active()
+                            .iter()
+                            .map(|c| (
+                                c.id,
+                                c.code_type.to_string(),
+                                c.description.clone(),
+                                c.performance.as_ref().map_or(0, |p| p.times_executed),
+                            ))
+                            .collect();
+                        drop(deployer);
+                        telegram::send_active_code(&active).await;
+                    }
+                    "deploy" => {
+                        if let Some(id_str) = cmd.args.get(1) {
+                            if let Ok(id) = id_str.parse::<u64>() {
+                                let mut deployer = code_deployer.lock().unwrap();
+                                match deployer.deploy(id) {
+                                    Ok(()) => {
+                                        drop(deployer);
+                                        telegram::send_code_deploy(id_str, true, "Code deployed successfully.").await;
+                                    }
+                                    Err(e) => {
+                                        drop(deployer);
+                                        telegram::send_code_deploy(id_str, false, &format!("Error: {:?}", e)).await;
+                                    }
+                                }
+                            } else {
+                                telegram::send_code_deploy(id_str, false, "Invalid ID format").await;
+                            }
+                        } else {
+                            telegram::send_code_deploy("", false, "Usage: /gencode deploy <id>").await;
+                        }
+                    }
+                    "rollback" => {
+                        if let Some(id_str) = cmd.args.get(1) {
+                            if let Ok(id) = id_str.parse::<u64>() {
+                                let mut deployer = code_deployer.lock().unwrap();
+                                match deployer.rollback(id) {
+                                    Ok(()) => {
+                                        drop(deployer);
+                                        telegram::send_code_rollback(id_str, true, "Code rolled back.").await;
+                                    }
+                                    Err(e) => {
+                                        drop(deployer);
+                                        telegram::send_code_rollback(id_str, false, &format!("Error: {:?}", e)).await;
+                                    }
+                                }
+                            } else {
+                                telegram::send_code_rollback(id_str, false, "Invalid ID format").await;
+                            }
+                        } else {
+                            telegram::send_code_rollback("", false, "Usage: /gencode rollback <id>").await;
+                        }
+                    }
+                    _ => {
+                        telegram::send_codegen_help().await;
+                    }
+                }
+            }
+            "/codegenhelp" => {
+                telegram::send_codegen_help().await;
             }
             _ => {}
         }
@@ -840,6 +1021,20 @@ async fn main() -> Result<()> {
         agent.attach_self_mod(Arc::clone(&selfmod));
     }
 
+    // Load CodeDeployer for generated code management
+    let code_deployer = Arc::new(Mutex::new(
+        CodeDeployer::load_or_new(CODEGEN_PATH, "/tmp/sovereign_sandbox")
+    ));
+    {
+        let deployer = code_deployer.lock().unwrap();
+        info!("Codegen: Loaded - {}", deployer.format_summary());
+    }
+
+    // Attach CodeDeployer to all agents
+    for agent in agents.values_mut() {
+        agent.attach_code_deployer(Arc::clone(&code_deployer));
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -900,6 +1095,7 @@ async fn main() -> Result<()> {
                 &memory_consolidator,
                 &transferability_predictor,
                 &selfmod,
+                &code_deployer,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -924,6 +1120,7 @@ async fn main() -> Result<()> {
                 &memory_consolidator,
                 &transferability_predictor,
                 &selfmod,
+                &code_deployer,
             ).await
         }
     }
@@ -1050,6 +1247,7 @@ async fn run_alpaca_loop(
     memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
     transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
     selfmod: &Arc<Mutex<SelfModificationEngine>>,
+    code_deployer: &Arc<Mutex<CodeDeployer>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -1086,7 +1284,7 @@ async fn run_alpaca_loop(
 
             // Poll for Telegram commands
             if telegram_enabled {
-                process_telegram_commands(selfmod).await;
+                process_telegram_commands(selfmod, code_deployer).await;
             }
 
             match health.check() {
@@ -1186,12 +1384,16 @@ async fn run_alpaca_loop(
                 save_consolidation(memory_consolidator);
                 save_transferability(&transferability_predictor);
                 save_selfmod(selfmod);
+                save_codegen(code_deployer);
 
                 // Run pattern consolidation
                 run_consolidation(memory_consolidator);
 
                 // Run daily self-modification analysis
                 run_analyze_and_propose(selfmod, weakness_analyzer, counterfactual);
+
+                // Run daily code generation from weaknesses and insights
+                run_code_generation(code_deployer, weakness_analyzer, counterfactual, memory_consolidator);
 
                 // Run weekly ML transfer learning and cluster discovery
                 learn_from_transfers(transfer_manager);
@@ -1286,6 +1488,7 @@ async fn run_ibkr_loop(
     memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
     transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
     selfmod: &Arc<Mutex<SelfModificationEngine>>,
+    code_deployer: &Arc<Mutex<CodeDeployer>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -1313,7 +1516,7 @@ async fn run_ibkr_loop(
 
             // Poll for Telegram commands
             if telegram_enabled {
-                process_telegram_commands(selfmod).await;
+                process_telegram_commands(selfmod, code_deployer).await;
             }
 
             match health.check() {
@@ -1399,12 +1602,16 @@ async fn run_ibkr_loop(
                 save_consolidation(memory_consolidator);
                 save_transferability(&transferability_predictor);
                 save_selfmod(selfmod);
+                save_codegen(code_deployer);
 
                 // Run pattern consolidation
                 run_consolidation(memory_consolidator);
 
                 // Run daily self-modification analysis
                 run_analyze_and_propose(selfmod, weakness_analyzer, counterfactual);
+
+                // Run daily code generation from weaknesses and insights
+                run_code_generation(code_deployer, weakness_analyzer, counterfactual, memory_consolidator);
 
                 // Run weekly ML transfer learning and cluster discovery
                 learn_from_transfers(transfer_manager);

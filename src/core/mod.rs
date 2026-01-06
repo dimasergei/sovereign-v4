@@ -28,6 +28,7 @@ pub mod embeddings;
 pub mod consolidation;
 pub mod transferability;
 pub mod selfmod;
+pub mod codegen;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
@@ -56,4 +57,9 @@ pub use selfmod::{
     SelfModificationEngine, Constitution, ConstitutionalGuard, RuleEngine,
     TradingRule, RuleCondition, RuleAction, RuleContext, RulePerformance,
     ModificationType, Creator, ApprovalStatus, PendingModification, AppliedModification,
+};
+pub use codegen::{
+    CodeDeployer, CodeGenerator, GeneratedCode, CodeType, Expression, EvalContext,
+    Sandbox, SafetyViolation, CompareOp, evaluate, evaluate_bool,
+    TestResults, BacktestResults, CodePerformance, DeploymentStatus, DeploymentRecord,
 };
