@@ -24,6 +24,7 @@ pub mod worldmodel;
 pub mod counterfactual;
 pub mod monitor;
 pub mod sequence;
+pub mod embeddings;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
@@ -39,3 +40,4 @@ pub use worldmodel::{WorldModel, MarketState, TransitionModel, Action, SimPositi
 pub use counterfactual::{CounterfactualAnalyzer, CounterfactualResult, TradingInsight, InsightType, TradeForAnalysis, Direction};
 pub use monitor::{AGIMonitor, AGIMetrics, AGIReport, PerformanceMetrics, SystemHealth, ExpertStats};
 pub use sequence::{LSTMCell, SequenceEncoder, MarketFeatures, RegimePredictor};
+pub use embeddings::{VectorIndex, TradeEmbedding, TradeContext, EmbeddingModel, IndexType, cosine_similarity};

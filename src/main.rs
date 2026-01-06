@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -49,6 +49,7 @@ const WORLDMODEL_PATH: &str = "sovereign_worldmodel.json";
 const COUNTERFACTUAL_PATH: &str = "sovereign_counterfactual.json";
 const MONITOR_PATH: &str = "sovereign_monitor.json";
 const SEQUENCE_PATH: &str = "sovereign_sequence.json";
+const EMBEDDINGS_PATH: &str = "sovereign_embeddings.bin";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -195,6 +196,16 @@ fn save_sequence(regime_predictor: &Arc<Mutex<RegimePredictor>>) {
         info!("Sequence: Saved - {} predictions, {:.1}% accuracy",
             rp.prediction_count(),
             rp.accuracy() * 100.0);
+    }
+}
+
+/// Save VectorIndex state (binary for efficiency)
+fn save_embeddings(vector_index: &Arc<Mutex<VectorIndex>>) {
+    let idx = vector_index.lock().unwrap();
+    if let Err(e) = idx.save(EMBEDDINGS_PATH) {
+        warn!("Failed to save VectorIndex: {}", e);
+    } else {
+        info!("Embeddings: Saved - {}", idx.format_summary());
     }
 }
 
@@ -542,6 +553,20 @@ async fn main() -> Result<()> {
         agent.attach_regime_predictor(Arc::clone(&regime_predictor));
     }
 
+    // Load VectorIndex for similarity-based trade retrieval
+    let vector_index = Arc::new(Mutex::new(
+        VectorIndex::load_or_new(EMBEDDINGS_PATH, IndexType::HNSW { m: 16, ef_construction: 200 })
+    ));
+    {
+        let idx = vector_index.lock().unwrap();
+        info!("Embeddings: Loaded - {}", idx.format_summary());
+    }
+
+    // Attach VectorIndex to all agents
+    for agent in agents.values_mut() {
+        agent.attach_vector_index(Arc::clone(&vector_index));
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -598,6 +623,7 @@ async fn main() -> Result<()> {
                 &counterfactual,
                 &agi_monitor,
                 &regime_predictor,
+                &vector_index,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -618,6 +644,7 @@ async fn main() -> Result<()> {
                 &counterfactual,
                 &agi_monitor,
                 &regime_predictor,
+                &vector_index,
             ).await
         }
     }
@@ -740,6 +767,7 @@ async fn run_alpaca_loop(
     counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
     agi_monitor: &Arc<Mutex<AGIMonitor>>,
     regime_predictor: &Arc<Mutex<RegimePredictor>>,
+    vector_index: &Arc<Mutex<VectorIndex>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -867,6 +895,7 @@ async fn run_alpaca_loop(
                 save_counterfactual(counterfactual);
                 save_monitor(agi_monitor);
                 save_sequence(regime_predictor);
+                save_embeddings(vector_index);
 
                 // Run periodic weakness analysis on trade history
                 {
@@ -953,6 +982,7 @@ async fn run_ibkr_loop(
     counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
     agi_monitor: &Arc<Mutex<AGIMonitor>>,
     regime_predictor: &Arc<Mutex<RegimePredictor>>,
+    vector_index: &Arc<Mutex<VectorIndex>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -1057,6 +1087,7 @@ async fn run_ibkr_loop(
                 save_counterfactual(counterfactual);
                 save_monitor(agi_monitor);
                 save_sequence(regime_predictor);
+                save_embeddings(vector_index);
 
                 // Run periodic weakness analysis on trade history
                 {

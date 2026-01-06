@@ -35,6 +35,7 @@ use super::causality::CausalAnalyzer;
 use super::worldmodel::{WorldModel, PositionDirection};
 use super::counterfactual::CounterfactualAnalyzer;
 use super::sequence::{MarketFeatures, RegimePredictor};
+use super::embeddings::{VectorIndex, TradeContext as EmbeddingTradeContext};
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -209,6 +210,10 @@ pub struct SymbolAgent {
     // Sequence modeling for regime prediction
     /// Shared regime predictor for anticipating regime changes
     regime_predictor: Option<Arc<Mutex<RegimePredictor>>>,
+
+    // Vector embeddings for similarity-based retrieval
+    /// Shared vector index for finding similar historical trades
+    vector_index: Option<Arc<Mutex<VectorIndex>>>,
 }
 
 impl SymbolAgent {
@@ -251,6 +256,7 @@ impl SymbolAgent {
             world_model: None,
             counterfactual: None,
             regime_predictor: None,
+            vector_index: None,
         }
     }
 
@@ -287,6 +293,7 @@ impl SymbolAgent {
             world_model: None,
             counterfactual: None,
             regime_predictor: None,
+            vector_index: None,
         }
     }
 
@@ -328,6 +335,7 @@ impl SymbolAgent {
             world_model: None,
             counterfactual: None,
             regime_predictor: None,
+            vector_index: None,
         }
     }
 
@@ -361,6 +369,7 @@ impl SymbolAgent {
             world_model: None,
             counterfactual: None,
             regime_predictor: None,
+            vector_index: None,
         }
     }
 
@@ -1125,6 +1134,41 @@ impl SymbolAgent {
             "[LEARNER] {} Updated after {} trade (sr_score: {}, vol: {:.0}%, regime: {:?})",
             self.symbol, outcome, entry.sr_score, entry.volume_percentile, regime_for_learner
         );
+
+        // Add trade to vector index for similarity-based retrieval
+        if self.has_vector_index() {
+            let atr_pct = self.atr()
+                .and_then(|atr| {
+                    let price_f = entry.entry_price.to_f64().unwrap_or(1.0);
+                    if price_f > 0.0 {
+                        Some(atr.to_f64().unwrap_or(0.0) / price_f * 100.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1.0);
+
+            let entry_price_f = entry.entry_price.to_f64().unwrap_or(1.0);
+            let sr_level_f = entry.sr_level.to_f64().unwrap_or(0.0);
+            let distance_to_sr_pct = if entry_price_f > 0.0 {
+                ((entry_price_f - sr_level_f).abs() / entry_price_f * 100.0).min(5.0)
+            } else {
+                1.0
+            };
+
+            let is_long = self.position.as_ref().map(|p| p.side == Side::Long).unwrap_or(true);
+
+            self.add_trade_to_index(
+                entry.sr_score,
+                entry.volume_percentile,
+                atr_pct,
+                distance_to_sr_pct,
+                is_long,
+                hold_bars.max(0) as u32,
+                was_winner,
+                profit.to_f64().unwrap_or(0.0),
+            );
+        }
     }
 
     /// Get S/R confidence based on historical effectiveness
@@ -1227,7 +1271,52 @@ impl SymbolAgent {
         };
 
         // Blend base and calibrated confidence
-        let combined = (base_confidence * 0.6) + (calibrated * 0.4);
+        let mut combined = (base_confidence * 0.6) + (calibrated * 0.4);
+
+        // Apply similarity-based adjustment from vector index
+        if self.has_vector_index() {
+            // Calculate ATR percentage and distance to SR for similarity query
+            let atr_pct = self.atr()
+                .and_then(|atr| {
+                    let price_f = self.last_price.to_f64().unwrap_or(1.0);
+                    if price_f > 0.0 {
+                        Some(atr.to_f64().unwrap_or(0.0) / price_f * 100.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1.0);
+
+            let sr_price_f = sr_level.to_f64().unwrap_or(0.0);
+            let last_price_f = self.last_price.to_f64().unwrap_or(1.0);
+            let distance_to_sr_pct = if last_price_f > 0.0 {
+                ((last_price_f - sr_price_f).abs() / last_price_f * 100.0).min(5.0)
+            } else {
+                1.0
+            };
+
+            // For now, assume long direction (can be refined based on signal type)
+            let is_long = sr_price_f < last_price_f; // Price above SR = likely long setup
+
+            if let Some((similar_win_rate, avg_pnl)) = self.get_similar_trade_performance(
+                sr_score,
+                volume_pct,
+                atr_pct,
+                distance_to_sr_pct,
+                is_long,
+            ) {
+                // Blend: 50% calculated confidence + 50% similar trade win rate
+                let similarity_adjusted = combined * 0.5 + similar_win_rate * 0.5;
+
+                info!(
+                    "[SIMILARITY] {} Adjusted confidence: {:.1}% -> {:.1}% (similar: {:.1}% win, ${:.2} avg)",
+                    self.symbol, combined * 100.0, similarity_adjusted * 100.0,
+                    similar_win_rate * 100.0, avg_pnl
+                );
+
+                combined = similarity_adjusted;
+            }
+        }
 
         info!(
             "[MEMORY] {} Combined: {:.1}% (base: {:.1}%, calibrated: {:.1}%)",
@@ -1848,6 +1937,141 @@ impl SymbolAgent {
 
         if let Some(ref mut moe) = self.moe {
             moe.update_gating(&regime_probs);
+        }
+    }
+
+    // =========================================================================
+    // VECTOR EMBEDDINGS FOR SIMILARITY-BASED RETRIEVAL
+    // =========================================================================
+
+    /// Attach vector index for similarity-based trade retrieval
+    pub fn attach_vector_index(&mut self, index: Arc<Mutex<VectorIndex>>) {
+        self.vector_index = Some(index);
+    }
+
+    /// Check if vector index is attached
+    pub fn has_vector_index(&self) -> bool {
+        self.vector_index.is_some()
+    }
+
+    /// Get reference to vector index
+    pub fn vector_index(&self) -> Option<&Arc<Mutex<VectorIndex>>> {
+        self.vector_index.as_ref()
+    }
+
+    /// Add a trade to the vector index
+    ///
+    /// Should be called after recording trade exit to memory
+    pub fn add_trade_to_index(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+        hold_duration: u32,
+        won: bool,
+        pnl: f64,
+    ) {
+        if let Some(ref index) = self.vector_index {
+            if let Ok(mut idx) = index.lock() {
+                let context = EmbeddingTradeContext::new(
+                    sr_score,
+                    volume_percentile,
+                    atr_pct,
+                    distance_to_sr_pct,
+                    self.regime_detector.current_regime().clone(),
+                    is_long,
+                    hold_duration,
+                    won,
+                    self.symbol.clone(),
+                    pnl,
+                );
+                let id = idx.add(&context);
+                info!(
+                    "[EMBEDDINGS] {} Added trade {} to index ({} total)",
+                    self.symbol, id, idx.len()
+                );
+            }
+        }
+    }
+
+    /// Get similar trade performance from vector index
+    ///
+    /// Returns (win_rate, avg_pnl) of similar historical trades
+    /// Returns None if no vector index or insufficient similar trades
+    pub fn get_similar_trade_performance(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> Option<(f64, f64)> {
+        let index = self.vector_index.as_ref()?;
+        let idx = index.lock().ok()?;
+
+        if idx.len() < 10 {
+            return None; // Need minimum data
+        }
+
+        // Create query context (hold_duration and won are unknown for current setup)
+        let query = EmbeddingTradeContext::new(
+            sr_score,
+            volume_percentile,
+            atr_pct,
+            distance_to_sr_pct,
+            self.regime_detector.current_regime().clone(),
+            is_long,
+            0,    // Unknown
+            true, // Placeholder
+            self.symbol.clone(),
+            0.0, // Unknown
+        );
+
+        // Find 20 most similar trades
+        let (avg_pnl, wins, losses) = idx.get_similar_outcomes(&query, 20);
+        let total = wins + losses;
+
+        if total < 10 {
+            return None; // Need minimum similar trades
+        }
+
+        let win_rate = wins as f64 / total as f64;
+
+        info!(
+            "[SIMILARITY] {} Found {} similar trades: {:.1}% win rate, ${:.2} avg PnL",
+            self.symbol, total, win_rate * 100.0, avg_pnl
+        );
+
+        Some((win_rate, avg_pnl))
+    }
+
+    /// Get confidence adjustment based on similar historical trades
+    ///
+    /// Returns a multiplier (0.5 to 1.5) based on how similar trades performed
+    pub fn get_similarity_confidence_factor(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> f64 {
+        if let Some((win_rate, _avg_pnl)) = self.get_similar_trade_performance(
+            sr_score,
+            volume_percentile,
+            atr_pct,
+            distance_to_sr_pct,
+            is_long,
+        ) {
+            // Scale win_rate to confidence factor:
+            // 0% win rate -> 0.5x (reduce confidence)
+            // 50% win rate -> 1.0x (neutral)
+            // 100% win rate -> 1.5x (boost confidence)
+            0.5 + win_rate
+        } else {
+            1.0 // No adjustment if no similar trades found
         }
     }
 }
