@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tracing::info;
+
+use super::regime::Regime;
+use super::transferability::{TransferabilityPredictor, TransferOutcome};
 
 /// Number of features in the calibrator model
 const NUM_FEATURES: usize = 6;
@@ -162,6 +166,19 @@ pub struct TransferManager {
     cluster_stats: HashMap<AssetCluster, ClusterStats>,
     /// Per-symbol trade counts (for tracking individual symbol maturity)
     symbol_trades: HashMap<String, u32>,
+    /// ML-based transferability predictor
+    #[serde(skip)]
+    transferability_predictor: Option<Arc<Mutex<TransferabilityPredictor>>>,
+    /// Use ML predictions instead of hardcoded clusters
+    #[serde(default)]
+    use_ml_predictions: bool,
+    /// ML prediction threshold
+    #[serde(default = "default_ml_threshold")]
+    ml_threshold: f64,
+}
+
+fn default_ml_threshold() -> f64 {
+    0.6
 }
 
 impl Default for TransferManager {
@@ -176,6 +193,52 @@ impl TransferManager {
         Self {
             cluster_stats: HashMap::new(),
             symbol_trades: HashMap::new(),
+            transferability_predictor: None,
+            use_ml_predictions: false,
+            ml_threshold: 0.6,
+        }
+    }
+
+    /// Create with ML-based transferability predictor
+    pub fn with_predictor(predictor: Arc<Mutex<TransferabilityPredictor>>) -> Self {
+        Self {
+            cluster_stats: HashMap::new(),
+            symbol_trades: HashMap::new(),
+            transferability_predictor: Some(predictor),
+            use_ml_predictions: true,
+            ml_threshold: 0.6,
+        }
+    }
+
+    /// Attach ML predictor (for deserialized instances)
+    pub fn attach_predictor(&mut self, predictor: Arc<Mutex<TransferabilityPredictor>>) {
+        self.transferability_predictor = Some(predictor);
+        self.use_ml_predictions = true;
+    }
+
+    /// Set whether to use ML predictions
+    pub fn set_use_ml(&mut self, use_ml: bool) {
+        self.use_ml_predictions = use_ml;
+    }
+
+    /// Set ML threshold
+    pub fn set_ml_threshold(&mut self, threshold: f64) {
+        self.ml_threshold = threshold;
+    }
+
+    /// Update symbol profile in ML predictor
+    pub fn update_profile(
+        &mut self,
+        symbol: &str,
+        volatility: f64,
+        trend_strength: f64,
+        regime: &Regime,
+        won: bool,
+    ) {
+        if let Some(ref predictor) = self.transferability_predictor {
+            if let Ok(mut p) = predictor.lock() {
+                p.update_profile(symbol, volatility, trend_strength, regime, won);
+            }
         }
     }
 
@@ -268,11 +331,28 @@ impl TransferManager {
 
     /// Check if knowledge should be transferred from source to target
     ///
-    /// Transfer is allowed if:
+    /// When ML predictions enabled: Uses learned transferability score
+    /// Otherwise uses hardcoded cluster rules:
     /// 1. Both symbols are in the same cluster
     /// 2. Source has >= MIN_SOURCE_TRADES_FOR_TRANSFER trades
     /// 3. Cluster win rate > MIN_WIN_RATE_FOR_TRANSFER
     pub fn should_transfer(&self, source: &str, target: &str) -> bool {
+        // Try ML prediction first if available
+        if self.use_ml_predictions {
+            if let Some(ref predictor) = self.transferability_predictor {
+                if let Ok(p) = predictor.lock() {
+                    if p.should_transfer(source, target, self.ml_threshold) {
+                        info!(
+                            "[TRANSFER] ML predicted transfer {} -> {} (threshold: {:.1}%)",
+                            source, target, self.ml_threshold * 100.0
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Fall back to cluster-based transfer
         let source_cluster = get_cluster(source);
         let target_cluster = get_cluster(target);
 
@@ -298,6 +378,77 @@ impl TransferManager {
         } else {
             false
         }
+    }
+
+    /// Get the best source symbol for transferring to target using ML predictions
+    pub fn get_best_source_ml(&self, target: &str, candidates: &[String]) -> Option<(String, f64)> {
+        if let Some(ref predictor) = self.transferability_predictor {
+            if let Ok(p) = predictor.lock() {
+                return p.get_best_source(target, candidates);
+            }
+        }
+        None
+    }
+
+    /// Record a transfer outcome for ML learning
+    pub fn record_transfer_outcome(
+        &mut self,
+        source: &str,
+        target: &str,
+        predicted_score: f64,
+        pnl_before: f64,
+        pnl_after: f64,
+        trades_evaluated: u32,
+    ) {
+        if let Some(ref predictor) = self.transferability_predictor {
+            if let Ok(mut p) = predictor.lock() {
+                let outcome = TransferOutcome {
+                    source: source.to_string(),
+                    target: target.to_string(),
+                    predicted_score,
+                    actual_success: pnl_after > pnl_before,
+                    pnl_before_transfer: pnl_before,
+                    pnl_after_transfer: pnl_after,
+                    trades_evaluated,
+                    timestamp: chrono::Utc::now(),
+                };
+                p.record_transfer_outcome(outcome);
+            }
+        }
+    }
+
+    /// Get ML transferability score between two symbols
+    pub fn get_ml_score(&self, source: &str, target: &str) -> Option<f64> {
+        if let Some(ref predictor) = self.transferability_predictor {
+            if let Ok(p) = predictor.lock() {
+                return p.predict_transferability(source, target).map(|s| s.score);
+            }
+        }
+        None
+    }
+
+    /// Discover clusters from ML embeddings
+    pub fn discover_clusters_ml(&self) -> Vec<Vec<String>> {
+        if let Some(ref predictor) = self.transferability_predictor {
+            if let Ok(p) = predictor.lock() {
+                return p.discover_clusters();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Trigger learning from transfer outcomes
+    pub fn learn_from_outcomes(&self) {
+        if let Some(ref predictor) = self.transferability_predictor {
+            if let Ok(mut p) = predictor.lock() {
+                p.learn_from_outcomes();
+            }
+        }
+    }
+
+    /// Get predictor reference
+    pub fn transferability_predictor(&self) -> Option<&Arc<Mutex<TransferabilityPredictor>>> {
+        self.transferability_predictor.as_ref()
     }
 
     /// Get trade count for a specific symbol

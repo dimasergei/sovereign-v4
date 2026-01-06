@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType, MemoryConsolidator};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType, MemoryConsolidator, TransferabilityPredictor};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -51,6 +51,7 @@ const MONITOR_PATH: &str = "sovereign_monitor.json";
 const SEQUENCE_PATH: &str = "sovereign_sequence.json";
 const EMBEDDINGS_PATH: &str = "sovereign_embeddings.bin";
 const CONSOLIDATION_PATH: &str = "sovereign_consolidation.json";
+const TRANSFERABILITY_PATH: &str = "sovereign_transferability.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -232,6 +233,38 @@ fn run_consolidation(memory_consolidator: &Arc<Mutex<MemoryConsolidator>>) {
         pre_patterns,
         post_patterns
     );
+}
+
+/// Save TransferabilityPredictor state
+fn save_transferability(transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>) {
+    let tp = transferability_predictor.lock().unwrap();
+    if let Err(e) = tp.save(TRANSFERABILITY_PATH) {
+        warn!("Failed to save TransferabilityPredictor: {}", e);
+    } else {
+        info!("Transferability: Saved - {}", tp.format_summary());
+    }
+}
+
+/// Run weekly learning from transfer outcomes
+fn learn_from_transfers(transfer_manager: &Arc<Mutex<TransferManager>>) {
+    let tm = transfer_manager.lock().unwrap();
+    tm.learn_from_outcomes();
+    info!("Transfer: Triggered learning from outcomes");
+}
+
+/// Discover and log ML-based clusters
+fn discover_ml_clusters(transfer_manager: &Arc<Mutex<TransferManager>>) {
+    let tm = transfer_manager.lock().unwrap();
+    let clusters = tm.discover_clusters_ml();
+    if clusters.is_empty() {
+        info!("Transfer: No ML clusters discovered (insufficient data)");
+    } else {
+        info!("Transfer: Discovered {} ML clusters:", clusters.len());
+        for (i, cluster) in clusters.iter().enumerate() {
+            info!("  Cluster {}: {} symbols - {:?}",
+                i + 1, cluster.len(), cluster.iter().take(5).cloned().collect::<Vec<_>>());
+        }
+    }
 }
 
 /// Check if US stock market is open
@@ -464,11 +497,22 @@ async fn main() -> Result<()> {
         info!("Calibrator: Starting fresh (no saved weights found)");
     }
 
+    // Load transferability predictor for ML-based transfer decisions
+    let transferability_predictor = Arc::new(Mutex::new(
+        TransferabilityPredictor::load_or_new(TRANSFERABILITY_PATH)
+    ));
+    {
+        let tp = transferability_predictor.lock().unwrap();
+        info!("Transferability: Loaded - {}", tp.format_summary());
+    }
+
     // Load transfer manager for cross-symbol knowledge transfer
     let transfer_manager = Arc::new(Mutex::new(TransferManager::load_or_new(TRANSFER_PATH)));
     {
-        let tm = transfer_manager.lock().unwrap();
-        info!("Transfer: {}", tm.format_summary());
+        let mut tm = transfer_manager.lock().unwrap();
+        // Attach ML predictor to transfer manager
+        tm.attach_predictor(Arc::clone(&transferability_predictor));
+        info!("Transfer: {} (ML predictions enabled)", tm.format_summary());
     }
 
     // Attach transfer manager to all agents and try cluster initialization
@@ -664,6 +708,7 @@ async fn main() -> Result<()> {
                 &regime_predictor,
                 &vector_index,
                 &memory_consolidator,
+                &transferability_predictor,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -686,6 +731,7 @@ async fn main() -> Result<()> {
                 &regime_predictor,
                 &vector_index,
                 &memory_consolidator,
+                &transferability_predictor,
             ).await
         }
     }
@@ -810,6 +856,7 @@ async fn run_alpaca_loop(
     regime_predictor: &Arc<Mutex<RegimePredictor>>,
     vector_index: &Arc<Mutex<VectorIndex>>,
     memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
+    transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -939,16 +986,14 @@ async fn run_alpaca_loop(
                 save_sequence(regime_predictor);
                 save_embeddings(vector_index);
                 save_consolidation(memory_consolidator);
+                save_transferability(&transferability_predictor);
 
-                // Run weekly pattern consolidation (every 7 days at market close)
-                {
-                    let mc = memory_consolidator.lock().unwrap();
-                    // Check if we should consolidate (24 hour default interval)
-                    drop(mc);
-                    // Consolidation happens automatically via maybe_consolidate()
-                    // but we can force it here for pattern extraction
-                    run_consolidation(memory_consolidator);
-                }
+                // Run pattern consolidation
+                run_consolidation(memory_consolidator);
+
+                // Run weekly ML transfer learning and cluster discovery
+                learn_from_transfers(transfer_manager);
+                discover_ml_clusters(transfer_manager);
 
                 // Run periodic weakness analysis on trade history
                 {
@@ -1037,6 +1082,7 @@ async fn run_ibkr_loop(
     regime_predictor: &Arc<Mutex<RegimePredictor>>,
     vector_index: &Arc<Mutex<VectorIndex>>,
     memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
+    transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -1143,9 +1189,14 @@ async fn run_ibkr_loop(
                 save_sequence(regime_predictor);
                 save_embeddings(vector_index);
                 save_consolidation(memory_consolidator);
+                save_transferability(&transferability_predictor);
 
-                // Run weekly pattern consolidation
+                // Run pattern consolidation
                 run_consolidation(memory_consolidator);
+
+                // Run weekly ML transfer learning and cluster discovery
+                learn_from_transfers(transfer_manager);
+                discover_ml_clusters(transfer_manager);
 
                 // Run periodic weakness analysis on trade history
                 {

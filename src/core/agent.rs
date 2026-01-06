@@ -1136,6 +1136,29 @@ impl SymbolAgent {
         if let Some(ref tm) = self.transfer_manager {
             let mut tm_lock = tm.lock().unwrap();
             tm_lock.update_cluster(&self.symbol, self.calibrator.get_weights(), was_winner);
+
+            // Also update ML profile for transferability prediction
+            let volatility = entry.atr
+                .and_then(|atr| {
+                    let price_f = entry.entry_price.to_f64().unwrap_or(1.0);
+                    if price_f > 0.0 {
+                        Some(atr.to_f64().unwrap_or(0.0) / price_f * 100.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1.0);
+
+            // Use regime confidence as trend indicator
+            let trend_strength = self.regime_detector.confidence();
+
+            tm_lock.update_profile(
+                &self.symbol,
+                volatility,
+                trend_strength,
+                &regime_for_learner,
+                was_winner,
+            );
         }
 
         let outcome = if was_winner { "winning" } else { "losing" };
