@@ -30,6 +30,7 @@ use super::learner::{ConfidenceCalibrator, TradeOutcome, NUM_FEATURES};
 use super::transfer::TransferManager;
 use super::moe::MixtureOfExperts;
 use super::metalearner::{MetaLearner, calculate_accuracy};
+use super::weakness::WeaknessAnalyzer;
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -184,6 +185,10 @@ pub struct SymbolAgent {
     trades_in_current_regime: Vec<TradeOutcome>,
     /// Minimum trades before reporting adaptation
     meta_adaptation_threshold: u32,
+
+    // Weakness identification and improvement
+    /// Shared weakness analyzer for self-improvement
+    weakness_analyzer: Option<Arc<Mutex<WeaknessAnalyzer>>>,
 }
 
 impl SymbolAgent {
@@ -221,6 +226,7 @@ impl SymbolAgent {
             pre_adaptation_bias: None,
             trades_in_current_regime: Vec::new(),
             meta_adaptation_threshold: 10,
+            weakness_analyzer: None,
         }
     }
 
@@ -252,6 +258,7 @@ impl SymbolAgent {
             pre_adaptation_bias: None,
             trades_in_current_regime: Vec::new(),
             meta_adaptation_threshold: 10,
+            weakness_analyzer: None,
         }
     }
 
@@ -288,6 +295,7 @@ impl SymbolAgent {
             pre_adaptation_bias: None,
             trades_in_current_regime: Vec::new(),
             meta_adaptation_threshold: 10,
+            weakness_analyzer: None,
         }
     }
 
@@ -316,6 +324,7 @@ impl SymbolAgent {
             pre_adaptation_bias: None,
             trades_in_current_regime: Vec::new(),
             meta_adaptation_threshold: 10,
+            weakness_analyzer: None,
         }
     }
 
@@ -563,6 +572,16 @@ impl SymbolAgent {
                             return None;
                         }
 
+                        // Check weakness analyzer for known weak patterns
+                        let sr_score = self.sr.score_at(s);
+                        if let Some(reason) = self.should_skip_for_weakness(sr_score, volume_percentile) {
+                            info!(
+                                "[WEAKNESS] {} Skipping BUY: {}",
+                                self.symbol, reason
+                            );
+                            return None;
+                        }
+
                         let signal = AgentSignal {
                             symbol: self.symbol.clone(),
                             signal: Signal::Buy,
@@ -599,6 +618,16 @@ impl SymbolAgent {
                             info!(
                                 "[MEMORY] {} Skipping SHORT: confidence {:.1}% below threshold {:.1}%",
                                 self.symbol, combined_confidence * 100.0, Self::MIN_CONFIDENCE_THRESHOLD * 100.0
+                            );
+                            return None;
+                        }
+
+                        // Check weakness analyzer for known weak patterns
+                        let sr_score = self.sr.score_at(r);
+                        if let Some(reason) = self.should_skip_for_weakness(sr_score, volume_percentile) {
+                            info!(
+                                "[WEAKNESS] {} Skipping SHORT: {}",
+                                self.symbol, reason
                             );
                             return None;
                         }
@@ -644,6 +673,16 @@ impl SymbolAgent {
                                 info!(
                                     "[MEMORY] {} Skipping BUY (elevated): confidence {:.1}% below threshold {:.1}%",
                                     self.symbol, combined_confidence * 100.0, Self::MIN_CONFIDENCE_THRESHOLD * 100.0
+                                );
+                                return None;
+                            }
+
+                            // Check weakness analyzer for known weak patterns
+                            let sr_score = self.sr.score_at(s);
+                            if let Some(reason) = self.should_skip_for_weakness(sr_score, volume_percentile) {
+                                info!(
+                                    "[WEAKNESS] {} Skipping BUY (elevated): {}",
+                                    self.symbol, reason
                                 );
                                 return None;
                             }
@@ -1387,6 +1426,61 @@ impl SymbolAgent {
     /// Check if meta-learner is attached
     pub fn has_meta_learner(&self) -> bool {
         self.calibrator.has_meta_learner()
+    }
+
+    // ==================== Weakness Analyzer Methods ====================
+
+    /// Attach weakness analyzer for self-directed improvement
+    pub fn attach_weakness_analyzer(&mut self, wa: Arc<Mutex<WeaknessAnalyzer>>) {
+        self.weakness_analyzer = Some(wa);
+    }
+
+    /// Check if weakness analyzer is attached
+    pub fn has_weakness_analyzer(&self) -> bool {
+        self.weakness_analyzer.is_some()
+    }
+
+    /// Get reference to weakness analyzer
+    pub fn weakness_analyzer(&self) -> Option<&Arc<Mutex<WeaknessAnalyzer>>> {
+        self.weakness_analyzer.as_ref()
+    }
+
+    /// Check if trade should be skipped due to weakness patterns
+    ///
+    /// Returns Some(reason) if trade should be skipped, None otherwise.
+    fn should_skip_for_weakness(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+    ) -> Option<String> {
+        let Some(ref wa) = self.weakness_analyzer else {
+            return None;
+        };
+
+        let wa_lock = wa.lock().unwrap();
+        let regime = self.regime_detector.current_regime();
+
+        wa_lock.should_skip_trade(
+            &regime,
+            sr_score,
+            volume_percentile,
+            &self.symbol,
+        )
+    }
+
+    /// Get position size multiplier based on weakness patterns
+    ///
+    /// Returns a multiplier (0.0-1.0) to reduce position size when
+    /// trading in conditions where we've historically performed poorly.
+    pub fn get_weakness_position_multiplier(&self) -> f64 {
+        let Some(ref wa) = self.weakness_analyzer else {
+            return 1.0;
+        };
+
+        let wa_lock = wa.lock().unwrap();
+        let regime = self.regime_detector.current_regime();
+
+        wa_lock.get_position_size_multiplier(&regime, &self.symbol)
     }
 }
 

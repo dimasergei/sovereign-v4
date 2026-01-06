@@ -18,6 +18,7 @@ pub mod metalearner;
 pub mod learner;
 pub mod transfer;
 pub mod moe;
+pub mod weakness;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
@@ -27,3 +28,4 @@ pub use metalearner::{MetaLearner, AdaptationResult};
 pub use learner::{ConfidenceCalibrator, TradeOutcome};
 pub use transfer::{TransferManager, AssetCluster, get_cluster};
 pub use moe::{MixtureOfExperts, Expert};
+pub use weakness::{WeaknessAnalyzer, Weakness, WeaknessType};

@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -43,6 +43,7 @@ const CALIBRATOR_PATH: &str = "sovereign_calibrator.json";
 const TRANSFER_PATH: &str = "sovereign_transfer.json";
 const MOE_PATH: &str = "sovereign_moe.json";
 const META_PATH: &str = "sovereign_meta.json";
+const WEAKNESS_PATH: &str = "sovereign_weakness.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -98,6 +99,16 @@ fn save_meta(meta_learner: &Arc<Mutex<MetaLearner>>) {
         warn!("Failed to save MetaLearner: {}", e);
     } else {
         info!("Meta: Saved - {}", ml.format_summary());
+    }
+}
+
+/// Save WeaknessAnalyzer state
+fn save_weakness(weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>) {
+    let wa = weakness_analyzer.lock().unwrap();
+    if let Err(e) = wa.save(WEAKNESS_PATH) {
+        warn!("Failed to save WeaknessAnalyzer: {}", e);
+    } else {
+        info!("Weakness: Saved - {} weaknesses identified", wa.weakness_count());
     }
 }
 
@@ -360,6 +371,21 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Load WeaknessAnalyzer for self-directed improvement
+    let weakness_analyzer = Arc::new(Mutex::new(WeaknessAnalyzer::load_or_new(WEAKNESS_PATH)));
+    {
+        let mut wa = weakness_analyzer.lock().unwrap();
+        // Set memory reference and symbols for live analysis
+        wa.set_memory(Arc::clone(&memory));
+        wa.set_symbols(symbols.clone());
+        info!("Weakness: Loaded - {} weaknesses identified", wa.weakness_count());
+    }
+
+    // Attach WeaknessAnalyzer to all agents
+    for agent in agents.values_mut() {
+        agent.attach_weakness_analyzer(Arc::clone(&weakness_analyzer));
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -410,6 +436,7 @@ async fn main() -> Result<()> {
                 telegram_enabled,
                 &transfer_manager,
                 &meta_learner,
+                &weakness_analyzer,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -424,6 +451,7 @@ async fn main() -> Result<()> {
                 telegram_enabled,
                 &transfer_manager,
                 &meta_learner,
+                &weakness_analyzer,
             ).await
         }
     }
@@ -540,6 +568,7 @@ async fn run_alpaca_loop(
     telegram_enabled: bool,
     transfer_manager: &Arc<Mutex<TransferManager>>,
     meta_learner: &Arc<Mutex<MetaLearner>>,
+    weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -642,11 +671,26 @@ async fn run_alpaca_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, MoE, and MetaLearner
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, and WeaknessAnalyzer
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
                 save_meta(meta_learner);
+                save_weakness(weakness_analyzer);
+
+                // Run periodic weakness analysis on trade history
+                {
+                    let mut wa = weakness_analyzer.lock().unwrap();
+                    // Get trade history from all agents to analyze weaknesses
+                    // (WeaknessAnalyzer accumulates from record_trade calls)
+                    let weaknesses = wa.analyze_all();
+                    if !weaknesses.is_empty() {
+                        info!("[WEAKNESS] Identified {} weakness patterns:", weaknesses.len());
+                        for w in weaknesses.iter().take(5) {
+                            info!("  - {:?}: {:.1}% severity - {}", w.weakness_type, w.severity * 100.0, w.suggested_action);
+                        }
+                    }
+                }
 
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();
@@ -678,6 +722,7 @@ async fn run_ibkr_loop(
     telegram_enabled: bool,
     transfer_manager: &Arc<Mutex<TransferManager>>,
     meta_learner: &Arc<Mutex<MetaLearner>>,
+    weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -757,11 +802,24 @@ async fn run_ibkr_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, MoE, and MetaLearner
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, and WeaknessAnalyzer
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
                 save_meta(meta_learner);
+                save_weakness(weakness_analyzer);
+
+                // Run periodic weakness analysis on trade history
+                {
+                    let mut wa = weakness_analyzer.lock().unwrap();
+                    let weaknesses = wa.analyze_all();
+                    if !weaknesses.is_empty() {
+                        info!("[WEAKNESS] Identified {} weakness patterns:", weaknesses.len());
+                        for w in weaknesses.iter().take(5) {
+                            info!("  - {:?}: {:.1}% severity - {}", w.weakness_type, w.severity * 100.0, w.suggested_action);
+                        }
+                    }
+                }
 
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();
