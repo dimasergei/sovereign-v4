@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -42,6 +42,7 @@ const SEP: &str = "===========================================================";
 const CALIBRATOR_PATH: &str = "sovereign_calibrator.json";
 const TRANSFER_PATH: &str = "sovereign_transfer.json";
 const MOE_PATH: &str = "sovereign_moe.json";
+const META_PATH: &str = "sovereign_meta.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -87,6 +88,16 @@ fn save_moe(agents: &HashMap<String, SymbolAgent>) {
                     moe.total_trades(), moe.format_stats(), agent.symbol());
             }
         }
+    }
+}
+
+/// Save MetaLearner state
+fn save_meta(meta_learner: &Arc<Mutex<MetaLearner>>) {
+    let ml = meta_learner.lock().unwrap();
+    if let Err(e) = ml.save(META_PATH) {
+        warn!("Failed to save MetaLearner: {}", e);
+    } else {
+        info!("Meta: Saved - {}", ml.format_summary());
     }
 }
 
@@ -297,6 +308,18 @@ async fn main() -> Result<()> {
     }
     info!("Agents: {} independent traders ready", agents.len());
 
+    // Load MetaLearner for rapid adaptation (must be before calibrator init)
+    let meta_learner = Arc::new(Mutex::new(MetaLearner::load_or_new(META_PATH)));
+    {
+        let ml = meta_learner.lock().unwrap();
+        info!("Meta: Loaded - {}", ml.format_summary());
+    }
+
+    // Attach MetaLearner to all agents
+    for agent in agents.values_mut() {
+        agent.attach_meta_learner(Arc::clone(&meta_learner));
+    }
+
     // Load learned calibrator weights if available
     let calibrator = ConfidenceCalibrator::load_or_new(CALIBRATOR_PATH);
     if calibrator.update_count() > 0 {
@@ -386,6 +409,7 @@ async fn main() -> Result<()> {
                 &mut alert_manager,
                 telegram_enabled,
                 &transfer_manager,
+                &meta_learner,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -399,6 +423,7 @@ async fn main() -> Result<()> {
                 &mut last_tickle,
                 telegram_enabled,
                 &transfer_manager,
+                &meta_learner,
             ).await
         }
     }
@@ -514,6 +539,7 @@ async fn run_alpaca_loop(
     alert_manager: &mut AlertManager,
     telegram_enabled: bool,
     transfer_manager: &Arc<Mutex<TransferManager>>,
+    meta_learner: &Arc<Mutex<MetaLearner>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -616,10 +642,11 @@ async fn run_alpaca_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, and MoE
+                // Save learned calibrator weights, transfer state, MoE, and MetaLearner
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
+                save_meta(meta_learner);
 
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();
@@ -650,6 +677,7 @@ async fn run_ibkr_loop(
     last_tickle: &mut std::time::Instant,
     telegram_enabled: bool,
     transfer_manager: &Arc<Mutex<TransferManager>>,
+    meta_learner: &Arc<Mutex<MetaLearner>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -729,10 +757,11 @@ async fn run_ibkr_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, and MoE
+                // Save learned calibrator weights, transfer state, MoE, and MetaLearner
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
+                save_meta(meta_learner);
 
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();

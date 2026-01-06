@@ -19,12 +19,14 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use super::regime::Regime;
+use super::metalearner::MetaLearner;
 
-/// Number of features in the linear model
-const NUM_FEATURES: usize = 6;
+/// Number of features in the linear model (public for metalearner)
+pub const NUM_FEATURES: usize = 6;
 
 /// Default EWC lambda (strength of weight protection)
 const DEFAULT_EWC_LAMBDA: f64 = 100.0;
@@ -74,6 +76,11 @@ pub struct ConfidenceCalibrator {
     ewc_lambda: f64,
     /// Number of consolidations performed
     consolidation_count: u32,
+
+    // Meta-learning fields (skip serialization - attached at runtime)
+    /// Shared meta-learner for fast adaptation (attached at runtime)
+    #[serde(skip)]
+    meta_learner: Option<Arc<Mutex<MetaLearner>>>,
 }
 
 impl Default for ConfidenceCalibrator {
@@ -104,6 +111,8 @@ impl ConfidenceCalibrator {
             optimal_bias: None,
             ewc_lambda: DEFAULT_EWC_LAMBDA,
             consolidation_count: 0,
+            // Meta-learning (attached at runtime)
+            meta_learner: None,
         }
     }
 
@@ -361,6 +370,100 @@ impl ConfidenceCalibrator {
             .map(|(name, weight)| format!("{}={:.3}", name, weight))
             .collect();
         format!("bias={:.3} {}", self.bias, parts.join(" "))
+    }
+
+    // ==================== Meta-Learning Methods ====================
+
+    /// Attach a shared MetaLearner for rapid adaptation
+    ///
+    /// The MetaLearner provides good initialization weights learned
+    /// across all trading experience.
+    pub fn attach_meta_learner(&mut self, ml: Arc<Mutex<MetaLearner>>) {
+        self.meta_learner = Some(ml);
+    }
+
+    /// Check if meta-learner is attached
+    pub fn has_meta_learner(&self) -> bool {
+        self.meta_learner.is_some()
+    }
+
+    /// Initialize weights from meta-learner
+    ///
+    /// Sets weights to the meta-learned initialization that adapts quickly.
+    /// Call this before init_from_cluster() - meta-init is the base,
+    /// cluster-init refines it.
+    pub fn init_from_meta(&mut self) {
+        if let Some(ref ml) = self.meta_learner {
+            let ml_lock = ml.lock().unwrap();
+            let (meta_weights, meta_bias) = ml_lock.get_initialization();
+
+            // Only apply if meta_weights have been trained (not all zeros)
+            let has_trained = meta_weights.iter().any(|&w| w.abs() > 0.001)
+                || meta_bias.abs() > 0.001;
+
+            if has_trained {
+                self.weights = meta_weights;
+                self.bias = meta_bias;
+                info!(
+                    "[META] Initialized calibrator from meta-weights (updates: {})",
+                    ml_lock.meta_update_count()
+                );
+            } else {
+                info!("[META] Meta-learner not yet trained, using default weights");
+            }
+        }
+    }
+
+    /// Report adaptation result to meta-learner
+    ///
+    /// Call this after adapting to a new regime to update meta-weights.
+    /// Computes success based on accuracy improvement.
+    pub fn report_adaptation(
+        &mut self,
+        pre_weights: &[f64; NUM_FEATURES],
+        pre_bias: f64,
+        pre_accuracy: f64,
+        post_accuracy: f64,
+        trades_used: u32,
+        regime: &Regime,
+    ) {
+        let success = post_accuracy > pre_accuracy;
+
+        if let Some(ref ml) = self.meta_learner {
+            let mut ml_lock = ml.lock().unwrap();
+
+            // Perform Reptile meta-update
+            ml_lock.meta_update(
+                pre_weights,
+                pre_bias,
+                &self.weights,
+                self.bias,
+                success,
+            );
+
+            // Record adaptation for analysis
+            let result = super::metalearner::AdaptationResult {
+                regime: *regime,
+                initial_weights: *pre_weights,
+                adapted_weights: self.weights,
+                trades_used,
+                pre_adaptation_accuracy: pre_accuracy,
+                post_adaptation_accuracy: post_accuracy,
+            };
+            ml_lock.record_adaptation(result);
+
+            info!(
+                "[META] Reported adaptation: {:.1}% -> {:.1}% ({})",
+                pre_accuracy * 100.0,
+                post_accuracy * 100.0,
+                if success { "success" } else { "failed" }
+            );
+        }
+    }
+
+    /// Get reference to meta-learner (for external access)
+    pub fn meta_learner(&self) -> Option<&Arc<Mutex<MetaLearner>>> {
+        self.meta_learner.as_ref()
     }
 }
 

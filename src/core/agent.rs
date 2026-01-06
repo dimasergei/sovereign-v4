@@ -26,9 +26,10 @@ use tracing::info;
 use super::sr::{SRLevels, default_granularity, granularity_from_atr};
 use super::capitulation::VolumeTracker;
 use super::regime::{Regime, RegimeDetector};
-use super::learner::{ConfidenceCalibrator, TradeOutcome};
+use super::learner::{ConfidenceCalibrator, TradeOutcome, NUM_FEATURES};
 use super::transfer::TransferManager;
 use super::moe::MixtureOfExperts;
+use super::metalearner::{MetaLearner, calculate_accuracy};
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -173,6 +174,16 @@ pub struct SymbolAgent {
     recent_trades: Vec<TradeOutcome>,
     /// Shared transfer manager for cross-symbol knowledge transfer
     transfer_manager: Option<Arc<Mutex<TransferManager>>>,
+
+    // Meta-learning adaptation tracking
+    /// Weights before adapting to new regime
+    pre_adaptation_weights: Option<[f64; NUM_FEATURES]>,
+    /// Bias before adapting to new regime
+    pre_adaptation_bias: Option<f64>,
+    /// Trades in current regime (for post-adaptation accuracy)
+    trades_in_current_regime: Vec<TradeOutcome>,
+    /// Minimum trades before reporting adaptation
+    meta_adaptation_threshold: u32,
 }
 
 impl SymbolAgent {
@@ -206,6 +217,10 @@ impl SymbolAgent {
             next_ticket: 1,
             recent_trades: Vec::new(),
             transfer_manager: None,
+            pre_adaptation_weights: None,
+            pre_adaptation_bias: None,
+            trades_in_current_regime: Vec::new(),
+            meta_adaptation_threshold: 10,
         }
     }
 
@@ -233,6 +248,10 @@ impl SymbolAgent {
             next_ticket: 1,
             recent_trades: Vec::new(),
             transfer_manager: None,
+            pre_adaptation_weights: None,
+            pre_adaptation_bias: None,
+            trades_in_current_regime: Vec::new(),
+            meta_adaptation_threshold: 10,
         }
     }
 
@@ -265,6 +284,10 @@ impl SymbolAgent {
             next_ticket: 1,
             recent_trades: Vec::new(),
             transfer_manager: None,
+            pre_adaptation_weights: None,
+            pre_adaptation_bias: None,
+            trades_in_current_regime: Vec::new(),
+            meta_adaptation_threshold: 10,
         }
     }
 
@@ -289,6 +312,10 @@ impl SymbolAgent {
             next_ticket: 1,
             recent_trades: Vec::new(),
             transfer_manager: None,
+            pre_adaptation_weights: None,
+            pre_adaptation_bias: None,
+            trades_in_current_regime: Vec::new(),
+            meta_adaptation_threshold: 10,
         }
     }
 
@@ -337,7 +364,11 @@ impl SymbolAgent {
         self.moe = moe;
     }
 
-    /// Initialize calibrator from cluster prior if available
+    /// Initialize calibrator from meta-learner and/or cluster prior if available
+    ///
+    /// Priority order:
+    /// 1. Meta-learner initialization (rapid adaptation foundation)
+    /// 2. Cluster prior refinement (symbol-specific patterns)
     ///
     /// If this symbol's cluster has learned weights (>= 20 trades) and
     /// this calibrator has < 10 updates, initialize from cluster prior.
@@ -347,6 +378,11 @@ impl SymbolAgent {
             return;
         }
 
+        // Step 1: Initialize from meta-learner first (base initialization)
+        // This gives weights that have been shown to adapt quickly
+        self.calibrator.init_from_meta();
+
+        // Step 2: Refine with cluster prior if available
         let Some(ref tm) = self.transfer_manager else {
             return;
         };
@@ -443,10 +479,16 @@ impl SymbolAgent {
                 let _ = memory.start_regime(&self.symbol, new_regime.as_str());
             }
 
-            // 4a. EWC consolidation on regime change if performance was good
+            // 4a. Report meta-learning adaptation from the previous regime
+            self.maybe_report_meta_adaptation();
+
+            // 4b. Prepare for new regime (store pre-adaptation weights)
+            self.prepare_for_new_regime();
+
+            // 4c. EWC consolidation on regime change if performance was good
             self.maybe_consolidate_ewc();
 
-            // 4b. MoE expert consolidation for the previous regime
+            // 4d. MoE expert consolidation for the previous regime
             self.maybe_consolidate_moe_expert();
         }
 
@@ -977,17 +1019,21 @@ impl SymbolAgent {
         }
 
         // Track trade outcome for EWC Fisher computation
-        self.recent_trades.push(TradeOutcome {
+        let trade_outcome = TradeOutcome {
             sr_score: entry.sr_score,
             volume_pct: entry.volume_percentile,
             regime: regime_for_learner,
             won: was_winner,
-        });
+        };
+        self.recent_trades.push(trade_outcome.clone());
 
         // Keep only the most recent trades (cap at 100)
         if self.recent_trades.len() > 100 {
             self.recent_trades.remove(0);
         }
+
+        // Track trade in current regime for meta-learning
+        self.track_trade_in_regime(trade_outcome);
 
         // Update transfer manager for cross-symbol knowledge transfer
         if let Some(ref tm) = self.transfer_manager {
@@ -1239,6 +1285,108 @@ impl SymbolAgent {
     /// Check if calibrator has been consolidated (EWC is active)
     pub fn is_ewc_active(&self) -> bool {
         self.calibrator.is_consolidated()
+    }
+
+    // ==================== Meta-Learning Methods ====================
+
+    /// Prepare for a new regime by storing pre-adaptation state
+    ///
+    /// Called when regime changes to capture the starting point for adaptation.
+    fn prepare_for_new_regime(&mut self) {
+        // Store current weights as pre-adaptation baseline
+        self.pre_adaptation_weights = Some(*self.calibrator.get_weights());
+        self.pre_adaptation_bias = Some(self.calibrator.get_bias());
+
+        // Clear trades from previous regime
+        self.trades_in_current_regime.clear();
+
+        info!(
+            "[META] {} Prepared for new regime: {} (tracking adaptation)",
+            self.symbol,
+            self.regime_detector.current_regime()
+        );
+    }
+
+    /// Report meta-learning adaptation to the MetaLearner
+    ///
+    /// Called on regime change to report how well we adapted in the previous regime.
+    fn maybe_report_meta_adaptation(&mut self) {
+        // Need pre-adaptation weights to report
+        let Some(pre_weights) = self.pre_adaptation_weights else {
+            return;
+        };
+        let Some(pre_bias) = self.pre_adaptation_bias else {
+            return;
+        };
+
+        // Need enough trades in current regime
+        if self.trades_in_current_regime.len() < self.meta_adaptation_threshold as usize {
+            info!(
+                "[META] {} Skipping adaptation report: only {} trades (need {})",
+                self.symbol,
+                self.trades_in_current_regime.len(),
+                self.meta_adaptation_threshold
+            );
+            return;
+        }
+
+        // Get previous regime for reporting
+        let Some(prev_regime) = self.regime_detector.previous_regime() else {
+            return;
+        };
+
+        // Calculate pre-adaptation accuracy (using pre-weights on current regime's trades)
+        let pre_accuracy = calculate_accuracy(
+            &pre_weights,
+            pre_bias,
+            &self.trades_in_current_regime,
+        );
+
+        // Calculate post-adaptation accuracy (using current weights)
+        let post_accuracy = calculate_accuracy(
+            self.calibrator.get_weights(),
+            self.calibrator.get_bias(),
+            &self.trades_in_current_regime,
+        );
+
+        // Report to calibrator's meta-learner
+        self.calibrator.report_adaptation(
+            &pre_weights,
+            pre_bias,
+            pre_accuracy,
+            post_accuracy,
+            self.trades_in_current_regime.len() as u32,
+            &prev_regime,
+        );
+
+        info!(
+            "[META] {} Reported {} adaptation: {:.1}% -> {:.1}% ({} trades)",
+            self.symbol,
+            prev_regime,
+            pre_accuracy * 100.0,
+            post_accuracy * 100.0,
+            self.trades_in_current_regime.len()
+        );
+    }
+
+    /// Track a trade in the current regime (for meta-learning)
+    fn track_trade_in_regime(&mut self, trade: TradeOutcome) {
+        self.trades_in_current_regime.push(trade);
+
+        // Keep only last 100 trades per regime
+        if self.trades_in_current_regime.len() > 100 {
+            self.trades_in_current_regime.remove(0);
+        }
+    }
+
+    /// Attach meta-learner to calibrator
+    pub fn attach_meta_learner(&mut self, ml: Arc<Mutex<MetaLearner>>) {
+        self.calibrator.attach_meta_learner(ml);
+    }
+
+    /// Check if meta-learner is attached
+    pub fn has_meta_learner(&self) -> bool {
+        self.calibrator.has_meta_learner()
     }
 }
 
