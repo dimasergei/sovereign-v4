@@ -28,6 +28,7 @@ use super::capitulation::VolumeTracker;
 use super::regime::{Regime, RegimeDetector};
 use super::learner::{ConfidenceCalibrator, TradeOutcome};
 use super::transfer::TransferManager;
+use super::moe::MixtureOfExperts;
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -134,6 +135,7 @@ const EWC_MIN_WIN_RATE: f64 = 0.55;
 /// - Detects market regime using HMM (TrendingUp, TrendingDown, Ranging, Volatile)
 /// - Uses learned confidence calibrator for adaptive trade filtering
 /// - Applies Elastic Weight Consolidation (EWC) to prevent catastrophic forgetting
+/// - Supports Mixture of Experts (MoE) for regime-specialized calibration
 pub struct SymbolAgent {
     /// Symbol this agent is trading
     symbol: String,
@@ -145,6 +147,10 @@ pub struct SymbolAgent {
     regime_detector: RegimeDetector,
     /// Learned confidence calibrator
     calibrator: ConfidenceCalibrator,
+    /// Mixture of Experts for regime-specialized calibration (optional)
+    moe: Option<MixtureOfExperts>,
+    /// Whether to use MoE for confidence prediction
+    use_moe: bool,
     /// Current position (if any)
     position: Option<Position>,
     /// Last known price
@@ -187,6 +193,8 @@ impl SymbolAgent {
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
             calibrator: ConfidenceCalibrator::new(),
+            moe: None,
+            use_moe: false,
             position: None,
             last_price: initial_price,
             last_volume: 0,
@@ -212,6 +220,8 @@ impl SymbolAgent {
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
             calibrator: ConfidenceCalibrator::new(),
+            moe: None,
+            use_moe: false,
             position: None,
             last_price: initial_price,
             last_volume: 0,
@@ -242,6 +252,8 @@ impl SymbolAgent {
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
             calibrator: ConfidenceCalibrator::new(),
+            moe: None,
+            use_moe: false,
             position: None,
             last_price: Decimal::ZERO,
             last_volume: 0,
@@ -264,6 +276,8 @@ impl SymbolAgent {
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
             calibrator: ConfidenceCalibrator::new(),
+            moe: None,
+            use_moe: false,
             position: None,
             last_price: Decimal::ZERO,
             last_volume: 0,
@@ -286,6 +300,41 @@ impl SymbolAgent {
     /// Attach transfer manager for cross-symbol knowledge transfer
     pub fn attach_transfer_manager(&mut self, tm: Arc<Mutex<TransferManager>>) {
         self.transfer_manager = Some(tm);
+    }
+
+    /// Attach Mixture of Experts for regime-specialized calibration
+    pub fn attach_moe(&mut self, moe: MixtureOfExperts) {
+        self.moe = Some(moe);
+    }
+
+    /// Enable MoE for confidence prediction
+    pub fn enable_moe(&mut self) {
+        self.use_moe = true;
+    }
+
+    /// Disable MoE (fall back to single calibrator)
+    pub fn disable_moe(&mut self) {
+        self.use_moe = false;
+    }
+
+    /// Check if MoE is enabled
+    pub fn is_moe_enabled(&self) -> bool {
+        self.use_moe && self.moe.is_some()
+    }
+
+    /// Get reference to MoE
+    pub fn moe(&self) -> Option<&MixtureOfExperts> {
+        self.moe.as_ref()
+    }
+
+    /// Get mutable reference to MoE
+    pub fn moe_mut(&mut self) -> Option<&mut MixtureOfExperts> {
+        self.moe.as_mut()
+    }
+
+    /// Set MoE (for loading from persistence)
+    pub fn set_moe(&mut self, moe: Option<MixtureOfExperts>) {
+        self.moe = moe;
     }
 
     /// Initialize calibrator from cluster prior if available
@@ -396,6 +445,9 @@ impl SymbolAgent {
 
             // 4a. EWC consolidation on regime change if performance was good
             self.maybe_consolidate_ewc();
+
+            // 4b. MoE expert consolidation for the previous regime
+            self.maybe_consolidate_moe_expert();
         }
 
         // 5. Track bars for ATR calculation
@@ -909,6 +961,21 @@ impl SymbolAgent {
             0.01, // Learning rate
         );
 
+        // Update MoE if enabled (routes to appropriate expert)
+        if let Some(ref mut moe) = self.moe {
+            moe.update(
+                entry.sr_score,
+                entry.volume_percentile,
+                &regime_for_learner,
+                was_winner,
+                0.01, // Learning rate
+            );
+
+            // Update gating weights based on current regime probabilities
+            let regime_probs = self.regime_detector.regime_probabilities();
+            moe.update_gating(&regime_probs);
+        }
+
         // Track trade outcome for EWC Fisher computation
         self.recent_trades.push(TradeOutcome {
             sr_score: entry.sr_score,
@@ -1004,20 +1071,35 @@ impl SymbolAgent {
         0.50
     }
 
-    /// Get combined confidence from S/R, regime, and learned calibrator
+    /// Get combined confidence from S/R, regime, and learned calibrator/MoE
     ///
     /// Base confidence: 70% S/R confidence, 30% regime confidence
-    /// Final: 60% base confidence + 40% calibrator prediction
+    /// Final: 60% base confidence + 40% calibrator/MoE prediction
+    ///
+    /// If MoE is enabled, uses blended expert predictions instead of single calibrator.
     pub fn get_combined_confidence(&self, sr_level: Decimal) -> f64 {
         let sr_conf = self.get_sr_confidence(sr_level);
         let regime_conf = self.get_regime_confidence();
         let base_confidence = (sr_conf * 0.7) + (regime_conf * 0.3);
 
-        // Get calibrator prediction
+        // Get calibrator/MoE prediction
         let sr_score = self.sr.score_at(sr_level);
         let volume_pct = self.volume.percentile(self.last_volume);
         let regime = self.regime_detector.current_regime();
-        let calibrated = self.calibrator.predict(sr_score, volume_pct, &regime);
+
+        let calibrated = if self.is_moe_enabled() {
+            // Use MoE blended prediction
+            let moe = self.moe.as_ref().unwrap();
+            let pred = moe.predict(sr_score, volume_pct, &regime);
+            info!(
+                "[MOE] {} Using MoE prediction: {:.1}%",
+                self.symbol, pred * 100.0
+            );
+            pred
+        } else {
+            // Use single calibrator
+            self.calibrator.predict(sr_score, volume_pct, &regime)
+        };
 
         // Blend base and calibrated confidence
         let combined = (base_confidence * 0.6) + (calibrated * 0.4);
@@ -1098,6 +1180,55 @@ impl SymbolAgent {
 
         // Clear recent trades for next regime
         self.recent_trades.clear();
+    }
+
+    /// Consolidate MoE expert for the previous regime
+    ///
+    /// When regime changes, consolidate the expert that was active to protect
+    /// its learned weights. Filter recent trades by the previous regime.
+    fn maybe_consolidate_moe_expert(&mut self) {
+        let Some(ref mut moe) = self.moe else {
+            return;
+        };
+
+        let Some(prev_regime) = self.regime_detector.previous_regime() else {
+            return;
+        };
+
+        // Filter trades from the previous regime
+        let regime_trades: Vec<_> = self.recent_trades
+            .iter()
+            .filter(|t| t.regime == prev_regime)
+            .cloned()
+            .collect();
+
+        // Need enough trades from this regime
+        if regime_trades.len() < EWC_MIN_TRADES {
+            info!(
+                "[MOE] {} Skipping {} expert consolidation: only {} trades",
+                self.symbol, prev_regime, regime_trades.len()
+            );
+            return;
+        }
+
+        // Check win rate for this regime's trades
+        let wins = regime_trades.iter().filter(|t| t.won).count();
+        let win_rate = wins as f64 / regime_trades.len() as f64;
+
+        if win_rate < EWC_MIN_WIN_RATE {
+            info!(
+                "[MOE] {} Skipping {} expert consolidation: win rate {:.1}%",
+                self.symbol, prev_regime, win_rate * 100.0
+            );
+            return;
+        }
+
+        // Consolidate the expert for the previous regime
+        info!(
+            "[MOE] {} Consolidating {} expert: {} trades, {:.1}% win rate",
+            self.symbol, prev_regime, regime_trades.len(), win_rate * 100.0
+        );
+        moe.consolidate_expert(&prev_regime, &regime_trades);
     }
 
     /// Get count of recent trades tracked for EWC

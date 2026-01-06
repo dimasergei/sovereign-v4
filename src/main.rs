@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -41,6 +41,7 @@ use crate::config::Config;
 const SEP: &str = "===========================================================";
 const CALIBRATOR_PATH: &str = "sovereign_calibrator.json";
 const TRANSFER_PATH: &str = "sovereign_transfer.json";
+const MOE_PATH: &str = "sovereign_moe.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -67,6 +68,25 @@ fn save_transfer(transfer_manager: &Arc<Mutex<TransferManager>>) {
         warn!("Failed to save transfer state: {}", e);
     } else {
         info!("Transfer: Saved state - {}", tm.format_summary());
+    }
+}
+
+/// Save the best MoE from all agents (one with most trades)
+fn save_moe(agents: &HashMap<String, SymbolAgent>) {
+    // Find the agent with the most MoE trades
+    let best = agents.values()
+        .filter_map(|a| a.moe().map(|m| (a, m)))
+        .max_by_key(|(_, m)| m.total_trades());
+
+    if let Some((agent, moe)) = best {
+        if moe.total_trades() > 0 {
+            if let Err(e) = moe.save(MOE_PATH) {
+                warn!("Failed to save MoE: {}", e);
+            } else {
+                info!("MoE: Saved {} trades - {} (from {})",
+                    moe.total_trades(), moe.format_stats(), agent.symbol());
+            }
+        }
     }
 }
 
@@ -299,6 +319,22 @@ async fn main() -> Result<()> {
     for agent in agents.values_mut() {
         agent.attach_transfer_manager(Arc::clone(&transfer_manager));
         agent.maybe_init_from_cluster();
+    }
+
+    // Load MoE for regime-specialized calibration
+    let moe = MixtureOfExperts::load_or_new(MOE_PATH);
+    if moe.total_trades() > 0 {
+        info!("MoE: Loaded with {} trades - {}", moe.total_trades(), moe.format_stats());
+        for agent in agents.values_mut() {
+            agent.attach_moe(moe.clone());
+            agent.enable_moe();
+        }
+    } else {
+        info!("MoE: Starting fresh (no saved state found), attaching empty MoE");
+        for agent in agents.values_mut() {
+            agent.attach_moe(MixtureOfExperts::new());
+            agent.enable_moe();
+        }
     }
 
     // Initialize portfolio
@@ -580,9 +616,10 @@ async fn run_alpaca_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights and transfer state
+                // Save learned calibrator weights, transfer state, and MoE
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
+                save_moe(agents);
 
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();
@@ -692,9 +729,10 @@ async fn run_ibkr_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights and transfer state
+                // Save learned calibrator weights, transfer state, and MoE
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
+                save_moe(agents);
 
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();

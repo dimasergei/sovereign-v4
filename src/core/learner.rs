@@ -116,7 +116,7 @@ impl ConfidenceCalibrator {
     }
 
     /// Predict from pre-encoded features
-    fn predict_from_features(&self, features: &[f64; NUM_FEATURES]) -> f64 {
+    pub fn predict_from_features(&self, features: &[f64; NUM_FEATURES]) -> f64 {
         // Dot product: sum(weights * features) + bias
         let mut z = self.bias;
         for i in 0..NUM_FEATURES {
