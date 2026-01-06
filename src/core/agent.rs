@@ -34,6 +34,7 @@ use super::weakness::WeaknessAnalyzer;
 use super::causality::CausalAnalyzer;
 use super::worldmodel::{WorldModel, PositionDirection};
 use super::counterfactual::CounterfactualAnalyzer;
+use super::sequence::{MarketFeatures, RegimePredictor};
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -204,6 +205,10 @@ pub struct SymbolAgent {
     // Counterfactual analysis
     /// Shared counterfactual analyzer for learning from "what ifs"
     counterfactual: Option<Arc<Mutex<CounterfactualAnalyzer>>>,
+
+    // Sequence modeling for regime prediction
+    /// Shared regime predictor for anticipating regime changes
+    regime_predictor: Option<Arc<Mutex<RegimePredictor>>>,
 }
 
 impl SymbolAgent {
@@ -245,6 +250,7 @@ impl SymbolAgent {
             causal_analyzer: None,
             world_model: None,
             counterfactual: None,
+            regime_predictor: None,
         }
     }
 
@@ -280,6 +286,7 @@ impl SymbolAgent {
             causal_analyzer: None,
             world_model: None,
             counterfactual: None,
+            regime_predictor: None,
         }
     }
 
@@ -320,6 +327,7 @@ impl SymbolAgent {
             causal_analyzer: None,
             world_model: None,
             counterfactual: None,
+            regime_predictor: None,
         }
     }
 
@@ -352,6 +360,7 @@ impl SymbolAgent {
             causal_analyzer: None,
             world_model: None,
             counterfactual: None,
+            regime_predictor: None,
         }
     }
 
@@ -1070,6 +1079,9 @@ impl SymbolAgent {
         );
 
         // Update MoE if enabled (routes to appropriate expert)
+        // Calculate regime probs first to avoid borrow conflict
+        let regime_probs = self.get_predicted_regime_probs_for_gating();
+
         if let Some(ref mut moe) = self.moe {
             moe.update(
                 entry.sr_score,
@@ -1079,8 +1091,9 @@ impl SymbolAgent {
                 0.01, // Learning rate
             );
 
-            // Update gating weights based on current regime probabilities
-            let regime_probs = self.regime_detector.regime_probabilities();
+            // Update gating weights based on PREDICTED regime probabilities (soft gating)
+            // This uses LSTM-predicted probabilities for forward-looking blending,
+            // not just the current HMM-detected regime
             moe.update_gating(&regime_probs);
         }
 
@@ -1667,7 +1680,7 @@ impl SymbolAgent {
     /// Get counterfactual recommendations for current setup
     ///
     /// Returns a recommendation string if there's a strong signal from historical analysis
-    pub fn get_counterfactual_recommendation(&self, sr_score: i32, volume_percentile: f64) -> Option<String> {
+    pub fn get_counterfactual_recommendation(&self, _sr_score: i32, _volume_percentile: f64) -> Option<String> {
         let Some(ref cf) = self.counterfactual else {
             return None;
         };
@@ -1677,6 +1690,165 @@ impl SymbolAgent {
 
         // Return the first relevant recommendation
         recommendations.first().cloned()
+    }
+
+    // ==================== Sequence/Regime Prediction Methods ====================
+
+    /// Attach regime predictor for anticipating regime changes
+    pub fn attach_regime_predictor(&mut self, predictor: Arc<Mutex<RegimePredictor>>) {
+        self.regime_predictor = Some(predictor);
+    }
+
+    /// Check if regime predictor is attached
+    pub fn has_regime_predictor(&self) -> bool {
+        self.regime_predictor.is_some()
+    }
+
+    /// Get reference to regime predictor
+    pub fn regime_predictor(&self) -> Option<&Arc<Mutex<RegimePredictor>>> {
+        self.regime_predictor.as_ref()
+    }
+
+    /// Push market features to the regime predictor
+    ///
+    /// Should be called on each bar to build the sequence
+    pub fn push_market_features(&self, return_1bar: f64, volatility: f64, sr_score: i32, volume_percentile: f64) {
+        if let Some(ref predictor) = self.regime_predictor {
+            if let Ok(mut pred) = predictor.lock() {
+                let features = MarketFeatures::new(
+                    return_1bar,
+                    volatility,
+                    self.regime_detector.current_regime().clone(),
+                    sr_score,
+                    volume_percentile,
+                );
+                pred.push_features(features);
+            }
+        }
+    }
+
+    /// Predict if a regime change is coming
+    ///
+    /// Returns the predicted regime and confidence if a change is likely
+    pub fn predict_regime_change(&self) -> Option<(Regime, f64)> {
+        let Some(ref predictor) = self.regime_predictor else {
+            return None;
+        };
+
+        let Ok(mut pred) = predictor.lock() else {
+            return None;
+        };
+
+        let current_regime = self.regime_detector.current_regime();
+        pred.predict_regime_change(&current_regime)
+    }
+
+    /// Get regime probabilities from the predictor
+    ///
+    /// Returns [TrendingUp, TrendingDown, Ranging, Volatile] probabilities
+    pub fn get_regime_probabilities(&self) -> Option<[f64; 4]> {
+        let Some(ref predictor) = self.regime_predictor else {
+            return None;
+        };
+
+        let Ok(mut pred) = predictor.lock() else {
+            return None;
+        };
+
+        if !pred.is_ready() {
+            return None;
+        }
+
+        // Use current state for prediction
+        let features = MarketFeatures::new(
+            0.0, // Will be overwritten by sequence
+            0.0,
+            self.regime_detector.current_regime().clone(),
+            0,
+            50.0,
+        );
+        Some(pred.predict_next_regime(features))
+    }
+
+    /// Update regime predictor with actual regime (for learning)
+    pub fn update_regime_predictor(&self) {
+        if let Some(ref predictor) = self.regime_predictor {
+            if let Ok(mut pred) = predictor.lock() {
+                let regime = self.regime_detector.current_regime();
+                pred.update(&regime);
+            }
+        }
+    }
+
+    /// Check if regime change is predicted and should reduce position size
+    ///
+    /// Returns a scaling factor (0.0 to 1.0) for position sizing
+    pub fn get_regime_transition_factor(&self) -> f64 {
+        if let Some((_, confidence)) = self.predict_regime_change() {
+            // If regime change is predicted, reduce position size proportionally
+            // Higher confidence in change = lower position size
+            (1.0 - confidence).max(0.3) // Never go below 30%
+        } else {
+            1.0 // Full position if no change predicted
+        }
+    }
+
+    /// Get regime probabilities for MoE soft gating
+    ///
+    /// Uses LSTM-predicted probabilities if available for forward-looking blending,
+    /// falling back to current HMM regime probabilities if predictor is not ready.
+    ///
+    /// This enables the MoE to proactively weight experts based on where the
+    /// market is predicted to go, not just where it currently is.
+    fn get_predicted_regime_probs_for_gating(&self) -> [f64; 4] {
+        // Try to get LSTM-predicted regime probabilities
+        if let Some(ref predictor) = self.regime_predictor {
+            if let Ok(mut pred) = predictor.lock() {
+                if pred.is_ready() {
+                    // Build current features for prediction
+                    let features = MarketFeatures::new(
+                        0.0, // Will use sequence buffer
+                        0.0,
+                        self.regime_detector.current_regime().clone(),
+                        0,
+                        50.0,
+                    );
+                    let predicted = pred.predict_next_regime(features);
+
+                    // Blend predicted with current for stability (70% predicted, 30% current)
+                    let current = self.regime_detector.regime_probabilities();
+                    let mut blended = [0.0; 4];
+                    for i in 0..4 {
+                        blended[i] = predicted[i] * 0.7 + current[i] * 0.3;
+                    }
+
+                    info!(
+                        "[SEQUENCE] {} MoE gating: predicted [{:.2}, {:.2}, {:.2}, {:.2}], current [{:.2}, {:.2}, {:.2}, {:.2}]",
+                        self.symbol,
+                        predicted[0], predicted[1], predicted[2], predicted[3],
+                        current[0], current[1], current[2], current[3]
+                    );
+
+                    return blended;
+                }
+            }
+        }
+
+        // Fallback to current HMM regime probabilities
+        self.regime_detector.regime_probabilities()
+    }
+
+    /// Update MoE gating with predicted regime probabilities
+    ///
+    /// Call this periodically (e.g., on each bar) to keep MoE gating
+    /// aligned with predicted regime transitions.
+    pub fn update_moe_gating_from_prediction(&mut self) {
+        // Calculate regime probs first to avoid borrow conflict
+        let regime_probs = self.get_predicted_regime_probs_for_gating();
+
+        if let Some(ref mut moe) = self.moe {
+            moe.update_gating(&regime_probs);
+        }
     }
 }
 

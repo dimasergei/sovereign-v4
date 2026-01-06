@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -48,6 +48,7 @@ const CAUSALITY_PATH: &str = "sovereign_causality.json";
 const WORLDMODEL_PATH: &str = "sovereign_worldmodel.json";
 const COUNTERFACTUAL_PATH: &str = "sovereign_counterfactual.json";
 const MONITOR_PATH: &str = "sovereign_monitor.json";
+const SEQUENCE_PATH: &str = "sovereign_sequence.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -182,6 +183,18 @@ fn save_monitor(monitor: &Arc<Mutex<AGIMonitor>>) {
         warn!("Failed to save AGIMonitor: {}", e);
     } else {
         info!("Monitor: Saved - {}", mon.format_summary());
+    }
+}
+
+/// Save RegimePredictor state
+fn save_sequence(regime_predictor: &Arc<Mutex<RegimePredictor>>) {
+    let rp = regime_predictor.lock().unwrap();
+    if let Err(e) = rp.save(SEQUENCE_PATH) {
+        warn!("Failed to save RegimePredictor: {}", e);
+    } else {
+        info!("Sequence: Saved - {} predictions, {:.1}% accuracy",
+            rp.prediction_count(),
+            rp.accuracy() * 100.0);
     }
 }
 
@@ -515,6 +528,20 @@ async fn main() -> Result<()> {
         info!("Monitor: Loaded - {}", mon.format_summary());
     }
 
+    // Load RegimePredictor for LSTM-based regime transition prediction
+    let regime_predictor = Arc::new(Mutex::new(RegimePredictor::load_or_new(SEQUENCE_PATH)));
+    {
+        let rp = regime_predictor.lock().unwrap();
+        info!("Sequence: Loaded - {} predictions, {:.1}% accuracy",
+            rp.prediction_count(),
+            rp.accuracy() * 100.0);
+    }
+
+    // Attach RegimePredictor to all agents
+    for agent in agents.values_mut() {
+        agent.attach_regime_predictor(Arc::clone(&regime_predictor));
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -570,6 +597,7 @@ async fn main() -> Result<()> {
                 &world_model,
                 &counterfactual,
                 &agi_monitor,
+                &regime_predictor,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -589,6 +617,7 @@ async fn main() -> Result<()> {
                 &world_model,
                 &counterfactual,
                 &agi_monitor,
+                &regime_predictor,
             ).await
         }
     }
@@ -710,6 +739,7 @@ async fn run_alpaca_loop(
     world_model: &Arc<Mutex<WorldModel>>,
     counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
     agi_monitor: &Arc<Mutex<AGIMonitor>>,
+    regime_predictor: &Arc<Mutex<RegimePredictor>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -836,6 +866,7 @@ async fn run_alpaca_loop(
                 save_worldmodel(world_model);
                 save_counterfactual(counterfactual);
                 save_monitor(agi_monitor);
+                save_sequence(regime_predictor);
 
                 // Run periodic weakness analysis on trade history
                 {
@@ -921,6 +952,7 @@ async fn run_ibkr_loop(
     world_model: &Arc<Mutex<WorldModel>>,
     counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
     agi_monitor: &Arc<Mutex<AGIMonitor>>,
+    regime_predictor: &Arc<Mutex<RegimePredictor>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -1024,6 +1056,7 @@ async fn run_ibkr_loop(
                 save_worldmodel(world_model);
                 save_counterfactual(counterfactual);
                 save_monitor(agi_monitor);
+                save_sequence(regime_predictor);
 
                 // Run periodic weakness analysis on trade history
                 {
