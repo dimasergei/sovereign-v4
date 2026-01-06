@@ -19,10 +19,15 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tracing::info;
 
 #[allow(deprecated)]
 use super::sr::{SRLevels, default_granularity, granularity_from_atr};
 use super::capitulation::VolumeTracker;
+use super::regime::{Regime, RegimeDetector};
+use super::learner::ConfidenceCalibrator;
+use crate::data::memory::{TradeMemory, MarketRegime};
 
 /// Trading signal from an agent
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +84,34 @@ pub struct AgentSignal {
     /// LOSSLESS: Volume percentile (0-100) derived from all observed data
     /// 100 = highest ever, 50 = median, etc.
     pub volume_percentile: f64,
+    /// Conviction score (0-100) based on historical confidence
+    /// Derived from S/R effectiveness and regime performance
+    pub conviction: u8,
+}
+
+/// Entry context for outcome tracking (AGI learning)
+#[derive(Debug, Clone)]
+pub struct EntryContext {
+    /// Unique trade ticket
+    pub ticket: u64,
+    /// S/R level that triggered entry
+    pub sr_level: Decimal,
+    /// S/R score at entry (0 = strongest, negative = weaker)
+    pub sr_score: i32,
+    /// Volume percentile at entry
+    pub volume_percentile: f64,
+    /// ATR at entry
+    pub atr: Option<Decimal>,
+    /// Market regime at entry
+    pub regime: MarketRegime,
+    /// Bar count at entry (for hold duration)
+    pub entry_bar_count: u64,
+    /// Entry price for MAE/MFE calculation
+    pub entry_price: Decimal,
+    /// Maximum adverse excursion (worst drawdown during trade)
+    pub mae: f64,
+    /// Maximum favorable excursion (best profit during trade)
+    pub mfe: f64,
 }
 
 /// Independent trading agent for a single symbol
@@ -89,6 +122,9 @@ pub struct AgentSignal {
 /// - Generates buy/sell signals based on S/R + capitulation
 /// - Manages its own position state
 /// - Tracks ATR for volatility-based calculations (lossless)
+/// - Records trade context for AGI learning (when memory is attached)
+/// - Detects market regime using HMM (TrendingUp, TrendingDown, Ranging, Volatile)
+/// - Uses learned confidence calibrator for adaptive trade filtering
 pub struct SymbolAgent {
     /// Symbol this agent is trading
     symbol: String,
@@ -96,6 +132,10 @@ pub struct SymbolAgent {
     sr: SRLevels,
     /// Volume tracker for capitulation detection
     volume: VolumeTracker,
+    /// HMM-based regime detector
+    regime_detector: RegimeDetector,
+    /// Learned confidence calibrator
+    calibrator: ConfidenceCalibrator,
     /// Current position (if any)
     position: Option<Position>,
     /// Last known price
@@ -108,6 +148,12 @@ pub struct SymbolAgent {
     recent_bars: Vec<(Decimal, Decimal, Decimal, Decimal)>,
     /// Maximum bars to keep for ATR (operational limit)
     max_atr_bars: usize,
+    /// Persistent memory for AGI learning (optional)
+    memory: Option<Arc<TradeMemory>>,
+    /// Pending entry context for outcome tracking
+    pending_entry: Option<EntryContext>,
+    /// Next ticket number for trade identification
+    next_ticket: u64,
 }
 
 impl SymbolAgent {
@@ -126,12 +172,40 @@ impl SymbolAgent {
             symbol,
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
+            regime_detector: RegimeDetector::new(),
+            calibrator: ConfidenceCalibrator::new(),
             position: None,
             last_price: initial_price,
             last_volume: 0,
             bar_count: 0,
             recent_bars: Vec::with_capacity(20),
             max_atr_bars: 20, // Operational limit for ATR calculation
+            memory: None,
+            pending_entry: None,
+            next_ticket: 1,
+        }
+    }
+
+    /// Create agent with memory for AGI learning
+    #[allow(deprecated)]
+    pub fn new_with_memory(symbol: String, initial_price: Decimal, memory: Arc<TradeMemory>) -> Self {
+        let granularity = default_granularity(&symbol, initial_price);
+
+        Self {
+            symbol,
+            sr: SRLevels::new(granularity),
+            volume: VolumeTracker::new(),
+            regime_detector: RegimeDetector::new(),
+            calibrator: ConfidenceCalibrator::new(),
+            position: None,
+            last_price: initial_price,
+            last_volume: 0,
+            bar_count: 0,
+            recent_bars: Vec::with_capacity(20),
+            max_atr_bars: 20,
+            memory: Some(memory),
+            pending_entry: None,
+            next_ticket: 1,
         }
     }
 
@@ -149,12 +223,17 @@ impl SymbolAgent {
             symbol,
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
+            regime_detector: RegimeDetector::new(),
+            calibrator: ConfidenceCalibrator::new(),
             position: None,
             last_price: Decimal::ZERO,
             last_volume: 0,
             bar_count: 0,
             recent_bars: Vec::with_capacity(20),
             max_atr_bars: 20,
+            memory: None,
+            pending_entry: None,
+            next_ticket: 1,
         }
     }
 
@@ -164,13 +243,23 @@ impl SymbolAgent {
             symbol,
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
+            regime_detector: RegimeDetector::new(),
+            calibrator: ConfidenceCalibrator::new(),
             position: None,
             last_price: Decimal::ZERO,
             last_volume: 0,
             bar_count: 0,
             recent_bars: Vec::with_capacity(20),
             max_atr_bars: 20,
+            memory: None,
+            pending_entry: None,
+            next_ticket: 1,
         }
+    }
+
+    /// Attach memory for AGI learning
+    pub fn attach_memory(&mut self, memory: Arc<TradeMemory>) {
+        self.memory = Some(memory);
     }
 
     /// Get the symbol this agent is trading
@@ -236,29 +325,44 @@ impl SymbolAgent {
         // 2. Update volume tracker
         self.volume.update(volume);
 
-        // 3. Track bars for ATR calculation
+        // 3. Update regime detector (HMM)
+        self.regime_detector.update(open, high, low, close, volume);
+
+        // 4. Check for regime change and record to memory
+        if self.regime_detector.regime_changed() {
+            if let Some(ref memory) = self.memory {
+                let new_regime = self.regime_detector.current_regime();
+                let _ = memory.start_regime(&self.symbol, new_regime.as_str());
+            }
+        }
+
+        // 5. Track bars for ATR calculation
         if self.recent_bars.len() >= self.max_atr_bars {
             self.recent_bars.remove(0);
         }
         self.recent_bars.push((open, high, low, close));
 
-        // 4. Update state
+        // 6. Update state
         self.last_price = close;
         self.last_volume = volume;
         self.bar_count += 1;
 
-        // 5. Not ready yet - need more data
+        // 7. Not ready yet - need more data
         if !self.is_ready() {
             return None;
         }
 
-        // 6. Check for signals
+        // 8. Check for signals
         self.check_signals(time, open, close, volume)
     }
+
+    /// Minimum confidence threshold for taking trades
+    const MIN_CONFIDENCE_THRESHOLD: f64 = 0.45;
 
     /// Check for trading signals based on current state
     ///
     /// LOSSLESS: Uses percentile-based volume checks derived from data distribution.
+    /// AGI FEEDBACK: Uses historical S/R and regime effectiveness to set conviction.
     fn check_signals(
         &mut self,
         time: DateTime<Utc>,
@@ -289,51 +393,83 @@ impl SymbolAgent {
             None => {
                 // No position - look for entries
                 if is_buy_capitulation && at_support {
-                    let signal = AgentSignal {
-                        symbol: self.symbol.clone(),
-                        signal: Signal::Buy,
-                        price: close,
-                        reason: format!(
-                            "Volume capitulation at support ({:.0}th percentile)",
-                            volume_percentile
-                        ),
-                        support,
-                        resistance,
-                        volume_percentile,
-                    };
+                    if let Some(s) = support {
+                        // AGI FEEDBACK: Calculate combined confidence for this S/R level
+                        let combined_confidence = self.get_combined_confidence(s);
+                        let conviction = (combined_confidence * 100.0) as u8;
 
-                    self.position = Some(Position {
-                        side: Side::Long,
-                        entry_price: close,
-                        entry_time: time,
-                        quantity: Decimal::ZERO,
-                    });
+                        // Skip trade if confidence too low
+                        if combined_confidence < Self::MIN_CONFIDENCE_THRESHOLD {
+                            info!(
+                                "[MEMORY] {} Skipping BUY: confidence {:.1}% below threshold {:.1}%",
+                                self.symbol, combined_confidence * 100.0, Self::MIN_CONFIDENCE_THRESHOLD * 100.0
+                            );
+                            return None;
+                        }
 
-                    return Some(signal);
+                        let signal = AgentSignal {
+                            symbol: self.symbol.clone(),
+                            signal: Signal::Buy,
+                            price: close,
+                            reason: format!(
+                                "Volume capitulation at support ({:.0}th pctl, {:.0}% conf)",
+                                volume_percentile, combined_confidence * 100.0
+                            ),
+                            support,
+                            resistance,
+                            volume_percentile,
+                            conviction,
+                        };
+
+                        self.position = Some(Position {
+                            side: Side::Long,
+                            entry_price: close,
+                            entry_time: time,
+                            quantity: Decimal::ZERO,
+                        });
+
+                        return Some(signal);
+                    }
                 }
 
                 if is_sell_capitulation && at_resistance {
-                    let signal = AgentSignal {
-                        symbol: self.symbol.clone(),
-                        signal: Signal::Short,
-                        price: close,
-                        reason: format!(
-                            "Volume capitulation at resistance ({:.0}th percentile)",
-                            volume_percentile
-                        ),
-                        support,
-                        resistance,
-                        volume_percentile,
-                    };
+                    if let Some(r) = resistance {
+                        // AGI FEEDBACK: Calculate combined confidence for this S/R level
+                        let combined_confidence = self.get_combined_confidence(r);
+                        let conviction = (combined_confidence * 100.0) as u8;
 
-                    self.position = Some(Position {
-                        side: Side::Short,
-                        entry_price: close,
-                        entry_time: time,
-                        quantity: Decimal::ZERO,
-                    });
+                        // Skip trade if confidence too low
+                        if combined_confidence < Self::MIN_CONFIDENCE_THRESHOLD {
+                            info!(
+                                "[MEMORY] {} Skipping SHORT: confidence {:.1}% below threshold {:.1}%",
+                                self.symbol, combined_confidence * 100.0, Self::MIN_CONFIDENCE_THRESHOLD * 100.0
+                            );
+                            return None;
+                        }
 
-                    return Some(signal);
+                        let signal = AgentSignal {
+                            symbol: self.symbol.clone(),
+                            signal: Signal::Short,
+                            price: close,
+                            reason: format!(
+                                "Volume capitulation at resistance ({:.0}th pctl, {:.0}% conf)",
+                                volume_percentile, combined_confidence * 100.0
+                            ),
+                            support,
+                            resistance,
+                            volume_percentile,
+                            conviction,
+                        };
+
+                        self.position = Some(Position {
+                            side: Side::Short,
+                            entry_price: close,
+                            entry_time: time,
+                            quantity: Decimal::ZERO,
+                        });
+
+                        return Some(signal);
+                    }
                 }
 
                 // LOSSLESS alternative entry: at support on down day with elevated volume
@@ -343,17 +479,31 @@ impl SymbolAgent {
                     if let Some(s) = support {
                         let touched_support = self.sr.is_near(close.min(open), s);
                         if touched_support {
+                            // AGI FEEDBACK: Calculate combined confidence for this S/R level
+                            let combined_confidence = self.get_combined_confidence(s);
+                            let conviction = (combined_confidence * 100.0) as u8;
+
+                            // Skip trade if confidence too low
+                            if combined_confidence < Self::MIN_CONFIDENCE_THRESHOLD {
+                                info!(
+                                    "[MEMORY] {} Skipping BUY (elevated): confidence {:.1}% below threshold {:.1}%",
+                                    self.symbol, combined_confidence * 100.0, Self::MIN_CONFIDENCE_THRESHOLD * 100.0
+                                );
+                                return None;
+                            }
+
                             let signal = AgentSignal {
                                 symbol: self.symbol.clone(),
                                 signal: Signal::Buy,
                                 price: close,
                                 reason: format!(
-                                    "Price at support with elevated volume ({:.0}th percentile)",
-                                    volume_percentile
+                                    "Support with elevated volume ({:.0}th pctl, {:.0}% conf)",
+                                    volume_percentile, combined_confidence * 100.0
                                 ),
                                 support,
                                 resistance,
                                 volume_percentile,
+                                conviction,
                             };
 
                             self.position = Some(Position {
@@ -373,6 +523,7 @@ impl SymbolAgent {
                 match pos.side {
                     Side::Long => {
                         if at_resistance {
+                            // Exit signals don't need confidence check - always exit at target
                             let signal = AgentSignal {
                                 symbol: self.symbol.clone(),
                                 signal: Signal::Sell,
@@ -384,6 +535,7 @@ impl SymbolAgent {
                                 support,
                                 resistance,
                                 volume_percentile,
+                                conviction: 100, // Exit signals are always high conviction
                             };
 
                             self.position = None;
@@ -404,6 +556,7 @@ impl SymbolAgent {
                                 support,
                                 resistance,
                                 volume_percentile,
+                                conviction: 100, // Exit signals are always high conviction
                             };
 
                             self.position = None;
@@ -441,6 +594,7 @@ impl SymbolAgent {
     ///
     /// Used at startup to pre-populate S/R levels from historical data.
     /// Does NOT generate trading signals - only builds the S/R map.
+    /// Also trains the regime detector with historical data.
     pub fn bootstrap_bar(
         &mut self,
         open: Decimal,
@@ -455,6 +609,9 @@ impl SymbolAgent {
         // Update volume tracker
         self.volume.update(volume);
 
+        // Update regime detector (train HMM with historical data)
+        self.regime_detector.update(open, high, low, close, volume);
+
         // Track bars for ATR calculation
         if self.recent_bars.len() >= self.max_atr_bars {
             self.recent_bars.remove(0);
@@ -465,6 +622,26 @@ impl SymbolAgent {
         self.last_price = close;
         self.last_volume = volume;
         self.bar_count += 1;
+    }
+
+    /// Get current market regime
+    pub fn current_regime(&self) -> Regime {
+        self.regime_detector.current_regime()
+    }
+
+    /// Get regime probabilities (TrendingUp, TrendingDown, Ranging, Volatile)
+    pub fn regime_probabilities(&self) -> [f64; 4] {
+        self.regime_detector.regime_probabilities()
+    }
+
+    /// Get duration in current regime (bars)
+    pub fn regime_duration(&self) -> u32 {
+        self.regime_detector.regime_duration()
+    }
+
+    /// Get confidence in current regime classification
+    pub fn regime_confidence(&self) -> f64 {
+        self.regime_detector.confidence()
     }
 
     /// Calculate current ATR from recent bars (lossless - derived from data)
@@ -498,6 +675,298 @@ impl SymbolAgent {
         // Simple average of true ranges
         let sum: Decimal = true_ranges.iter().copied().sum();
         Some(sum / Decimal::from(true_ranges.len()))
+    }
+
+    // =========================================================================
+    // AGI MEMORY INTEGRATION METHODS
+    // =========================================================================
+
+    /// Record entry context when opening a trade (for AGI learning)
+    ///
+    /// Call this after a trade is confirmed to record the full context
+    /// for later outcome analysis.
+    pub fn record_entry_context(
+        &mut self,
+        sr_level: Decimal,
+        volume_percentile: f64,
+    ) {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+
+        let sr_score = self.sr.score_at(sr_level);
+        // Use HMM regime detection, falling back to memory or Unknown
+        let regime = MarketRegime::from_regime(self.regime_detector.current_regime());
+
+        let entry_price = self.last_price;
+
+        // Store pending entry for MAE/MFE tracking
+        self.pending_entry = Some(EntryContext {
+            ticket,
+            sr_level,
+            sr_score,
+            volume_percentile,
+            atr: self.atr(),
+            regime,
+            entry_bar_count: self.bar_count,
+            entry_price,
+            mae: 0.0,
+            mfe: 0.0,
+        });
+
+        // Record to persistent memory
+        if let Some(ref memory) = self.memory {
+            let _ = memory.record_trade_entry(
+                &self.symbol,
+                ticket,
+                match self.position {
+                    Some(ref p) if p.side == Side::Long => "BUY",
+                    Some(ref p) if p.side == Side::Short => "SHORT",
+                    _ => "UNKNOWN",
+                },
+                entry_price,
+                sr_level,
+                sr_score,
+                volume_percentile,
+                self.atr().unwrap_or(Decimal::ZERO),
+                regime.as_str(),
+                self.bar_count,
+            );
+
+            // Record S/R touch
+            let _ = memory.record_sr_touch(
+                &self.symbol,
+                sr_level.to_f64().unwrap_or(0.0),
+                self.sr.is_near(entry_price, sr_level).then(|| 1.0).unwrap_or(0.0),
+            );
+        }
+    }
+
+    /// Update MAE/MFE during trade (call on each bar while in position)
+    pub fn update_excursions(&mut self, current_price: Decimal) {
+        if let Some(ref mut entry) = self.pending_entry {
+            if let Some(ref pos) = self.position {
+                let pnl_pct = match pos.side {
+                    Side::Long => ((current_price - entry.entry_price) / entry.entry_price)
+                        .to_f64().unwrap_or(0.0) * 100.0,
+                    Side::Short => ((entry.entry_price - current_price) / entry.entry_price)
+                        .to_f64().unwrap_or(0.0) * 100.0,
+                };
+
+                if pnl_pct < entry.mae {
+                    entry.mae = pnl_pct;
+                }
+                if pnl_pct > entry.mfe {
+                    entry.mfe = pnl_pct;
+                }
+            }
+        }
+    }
+
+    /// Record exit outcome when closing a trade (for AGI learning)
+    ///
+    /// Call this after a trade is closed to record the outcome and
+    /// update S/R effectiveness and volume calibration.
+    pub fn record_exit_outcome(
+        &mut self,
+        exit_price: Decimal,
+        hit_tp: bool,
+        hit_sl: bool,
+    ) {
+        let Some(entry) = self.pending_entry.take() else {
+            return;
+        };
+
+        let profit = match self.position {
+            Some(ref p) if p.side == Side::Long => exit_price - entry.entry_price,
+            Some(ref p) if p.side == Side::Short => entry.entry_price - exit_price,
+            _ => Decimal::ZERO,
+        };
+
+        let profit_pct = if !entry.entry_price.is_zero() {
+            (profit / entry.entry_price).to_f64().unwrap_or(0.0) * 100.0
+        } else {
+            0.0
+        };
+
+        let hold_bars = (self.bar_count - entry.entry_bar_count) as i64;
+        let was_winner = profit > Decimal::ZERO;
+        let bounced = was_winner; // Simplified: winner = bounced at S/R
+
+        if let Some(ref memory) = self.memory {
+            // Record trade exit
+            let _ = memory.record_trade_exit(
+                entry.ticket,
+                exit_price,
+                profit,
+                profit_pct,
+                hit_tp,
+                hit_sl,
+                hold_bars,
+                entry.mae,
+                entry.mfe,
+            );
+
+            // Update S/R effectiveness
+            let _ = memory.record_sr_trade_outcome(
+                &self.symbol,
+                entry.sr_level.to_f64().unwrap_or(0.0),
+                self.atr().map(|a| a.to_f64().unwrap_or(1.0) / 2.0).unwrap_or(1.0),
+                bounced,
+                profit.to_f64().unwrap_or(0.0),
+            );
+
+            // Update volume calibration
+            let _ = memory.update_volume_calibration(
+                &self.symbol,
+                entry.volume_percentile,
+                was_winner,
+            );
+
+            // Update regime stats
+            let _ = memory.update_regime_stats(
+                profit.to_f64().unwrap_or(0.0),
+                hold_bars,
+            );
+        }
+
+        // Update calibrator with trade outcome (always, even without memory)
+        // Convert entry's MarketRegime back to Regime for the learner
+        let regime_for_learner = match entry.regime {
+            MarketRegime::Bull => Regime::TrendingUp,
+            MarketRegime::Bear => Regime::TrendingDown,
+            MarketRegime::Sideways => Regime::Ranging,
+            MarketRegime::HighVolatility | MarketRegime::LowVolatility => Regime::Volatile,
+            MarketRegime::Unknown => self.regime_detector.current_regime(),
+        };
+
+        self.calibrator.update_from_trade(
+            entry.sr_score,
+            entry.volume_percentile,
+            &regime_for_learner,
+            was_winner,
+            0.01, // Learning rate
+        );
+
+        let outcome = if was_winner { "winning" } else { "losing" };
+        info!(
+            "[LEARNER] {} Updated after {} trade (sr_score: {}, vol: {:.0}%, regime: {:?})",
+            self.symbol, outcome, entry.sr_score, entry.volume_percentile, regime_for_learner
+        );
+    }
+
+    /// Get S/R confidence based on historical effectiveness
+    ///
+    /// Returns a confidence score 0.0-1.0 based on:
+    /// - Historical win rate at this level (if >= 5 trades)
+    /// - Fallback to S/R score heuristic
+    pub fn get_sr_confidence(&self, price_level: Decimal) -> f64 {
+        let price_f = price_level.to_f64().unwrap_or(0.0);
+        let granularity = self.atr()
+            .map(|a| a.to_f64().unwrap_or(1.0) / 2.0)
+            .unwrap_or(1.0);
+
+        // Try to get historical win rate from memory (requires >= 5 trades)
+        if let Some(ref memory) = self.memory {
+            if let Ok(Some((win_rate, trade_count))) = memory.get_sr_win_rate_with_count(
+                &self.symbol,
+                price_f,
+                granularity,
+            ) {
+                if trade_count >= 5 {
+                    info!(
+                        "[MEMORY] {} S/R {:.2}: {:.1}% from {} trades",
+                        self.symbol, price_f, win_rate * 100.0, trade_count
+                    );
+                    return win_rate;
+                }
+            }
+        }
+
+        // Fallback to S/R score-based confidence heuristic
+        let score = self.sr.score_at(price_level);
+        let confidence = match score {
+            0 => 0.65,           // Never crossed - strongest
+            -1 => 0.60,          // Crossed once
+            -2 => 0.55,          // Crossed twice
+            -3 => 0.50,          // Crossed 3 times
+            _ => 0.45,           // Crossed 4+ times - weakest
+        };
+
+        confidence
+    }
+
+    /// Get regime confidence based on historical win rate in current regime
+    ///
+    /// Returns win rate if >= 10 trades in this regime, else 0.50 (neutral)
+    pub fn get_regime_confidence(&self) -> f64 {
+        let current_regime = self.regime_detector.current_regime();
+        let regime_str = current_regime.as_str();
+
+        if let Some(ref memory) = self.memory {
+            if let Ok(regime_stats) = memory.get_win_rate_by_regime() {
+                for (regime, win_rate, trade_count) in regime_stats {
+                    // Match current regime (handle both symbol-prefixed and global regimes)
+                    if regime == regime_str || regime.ends_with(&format!(":{}", regime_str)) {
+                        if trade_count >= 10 {
+                            info!(
+                                "[MEMORY] {} Regime {}: {:.1}% from {} trades",
+                                self.symbol, regime_str, win_rate * 100.0, trade_count
+                            );
+                            return win_rate;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Not enough data - return neutral
+        0.50
+    }
+
+    /// Get combined confidence from S/R, regime, and learned calibrator
+    ///
+    /// Base confidence: 70% S/R confidence, 30% regime confidence
+    /// Final: 60% base confidence + 40% calibrator prediction
+    pub fn get_combined_confidence(&self, sr_level: Decimal) -> f64 {
+        let sr_conf = self.get_sr_confidence(sr_level);
+        let regime_conf = self.get_regime_confidence();
+        let base_confidence = (sr_conf * 0.7) + (regime_conf * 0.3);
+
+        // Get calibrator prediction
+        let sr_score = self.sr.score_at(sr_level);
+        let volume_pct = self.volume.percentile(self.last_volume);
+        let regime = self.regime_detector.current_regime();
+        let calibrated = self.calibrator.predict(sr_score, volume_pct, &regime);
+
+        // Blend base and calibrated confidence
+        let combined = (base_confidence * 0.6) + (calibrated * 0.4);
+
+        info!(
+            "[MEMORY] {} Combined: {:.1}% (base: {:.1}%, calibrated: {:.1}%)",
+            self.symbol, combined * 100.0, base_confidence * 100.0, calibrated * 100.0
+        );
+
+        combined
+    }
+
+    /// Get pending entry ticket (for external tracking)
+    pub fn pending_ticket(&self) -> Option<u64> {
+        self.pending_entry.as_ref().map(|e| e.ticket)
+    }
+
+    /// Get reference to calibrator
+    pub fn calibrator(&self) -> &ConfidenceCalibrator {
+        &self.calibrator
+    }
+
+    /// Get mutable reference to calibrator
+    pub fn calibrator_mut(&mut self) -> &mut ConfidenceCalibrator {
+        &mut self.calibrator
+    }
+
+    /// Set calibrator (for loading from persistence)
+    pub fn set_calibrator(&mut self, calibrator: ConfidenceCalibrator) {
+        self.calibrator = calibrator;
     }
 }
 
