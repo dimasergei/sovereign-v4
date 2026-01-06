@@ -20,6 +20,7 @@ use rust_decimal::prelude::ToPrimitive;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::info;
 
 #[allow(deprecated)]
 use super::sr::{SRLevels, default_granularity, granularity_from_atr};
@@ -82,6 +83,9 @@ pub struct AgentSignal {
     /// LOSSLESS: Volume percentile (0-100) derived from all observed data
     /// 100 = highest ever, 50 = median, etc.
     pub volume_percentile: f64,
+    /// Conviction score (0-100) based on historical confidence
+    /// Derived from S/R effectiveness and regime performance
+    pub conviction: u8,
 }
 
 /// Entry context for outcome tracking (AGI learning)
@@ -344,9 +348,13 @@ impl SymbolAgent {
         self.check_signals(time, open, close, volume)
     }
 
+    /// Minimum confidence threshold for taking trades
+    const MIN_CONFIDENCE_THRESHOLD: f64 = 0.45;
+
     /// Check for trading signals based on current state
     ///
     /// LOSSLESS: Uses percentile-based volume checks derived from data distribution.
+    /// AGI FEEDBACK: Uses historical S/R and regime effectiveness to set conviction.
     fn check_signals(
         &mut self,
         time: DateTime<Utc>,
@@ -377,51 +385,83 @@ impl SymbolAgent {
             None => {
                 // No position - look for entries
                 if is_buy_capitulation && at_support {
-                    let signal = AgentSignal {
-                        symbol: self.symbol.clone(),
-                        signal: Signal::Buy,
-                        price: close,
-                        reason: format!(
-                            "Volume capitulation at support ({:.0}th percentile)",
-                            volume_percentile
-                        ),
-                        support,
-                        resistance,
-                        volume_percentile,
-                    };
+                    if let Some(s) = support {
+                        // AGI FEEDBACK: Calculate combined confidence for this S/R level
+                        let combined_confidence = self.get_combined_confidence(s);
+                        let conviction = (combined_confidence * 100.0) as u8;
 
-                    self.position = Some(Position {
-                        side: Side::Long,
-                        entry_price: close,
-                        entry_time: time,
-                        quantity: Decimal::ZERO,
-                    });
+                        // Skip trade if confidence too low
+                        if combined_confidence < Self::MIN_CONFIDENCE_THRESHOLD {
+                            info!(
+                                "[MEMORY] {} Skipping BUY: confidence {:.1}% below threshold {:.1}%",
+                                self.symbol, combined_confidence * 100.0, Self::MIN_CONFIDENCE_THRESHOLD * 100.0
+                            );
+                            return None;
+                        }
 
-                    return Some(signal);
+                        let signal = AgentSignal {
+                            symbol: self.symbol.clone(),
+                            signal: Signal::Buy,
+                            price: close,
+                            reason: format!(
+                                "Volume capitulation at support ({:.0}th pctl, {:.0}% conf)",
+                                volume_percentile, combined_confidence * 100.0
+                            ),
+                            support,
+                            resistance,
+                            volume_percentile,
+                            conviction,
+                        };
+
+                        self.position = Some(Position {
+                            side: Side::Long,
+                            entry_price: close,
+                            entry_time: time,
+                            quantity: Decimal::ZERO,
+                        });
+
+                        return Some(signal);
+                    }
                 }
 
                 if is_sell_capitulation && at_resistance {
-                    let signal = AgentSignal {
-                        symbol: self.symbol.clone(),
-                        signal: Signal::Short,
-                        price: close,
-                        reason: format!(
-                            "Volume capitulation at resistance ({:.0}th percentile)",
-                            volume_percentile
-                        ),
-                        support,
-                        resistance,
-                        volume_percentile,
-                    };
+                    if let Some(r) = resistance {
+                        // AGI FEEDBACK: Calculate combined confidence for this S/R level
+                        let combined_confidence = self.get_combined_confidence(r);
+                        let conviction = (combined_confidence * 100.0) as u8;
 
-                    self.position = Some(Position {
-                        side: Side::Short,
-                        entry_price: close,
-                        entry_time: time,
-                        quantity: Decimal::ZERO,
-                    });
+                        // Skip trade if confidence too low
+                        if combined_confidence < Self::MIN_CONFIDENCE_THRESHOLD {
+                            info!(
+                                "[MEMORY] {} Skipping SHORT: confidence {:.1}% below threshold {:.1}%",
+                                self.symbol, combined_confidence * 100.0, Self::MIN_CONFIDENCE_THRESHOLD * 100.0
+                            );
+                            return None;
+                        }
 
-                    return Some(signal);
+                        let signal = AgentSignal {
+                            symbol: self.symbol.clone(),
+                            signal: Signal::Short,
+                            price: close,
+                            reason: format!(
+                                "Volume capitulation at resistance ({:.0}th pctl, {:.0}% conf)",
+                                volume_percentile, combined_confidence * 100.0
+                            ),
+                            support,
+                            resistance,
+                            volume_percentile,
+                            conviction,
+                        };
+
+                        self.position = Some(Position {
+                            side: Side::Short,
+                            entry_price: close,
+                            entry_time: time,
+                            quantity: Decimal::ZERO,
+                        });
+
+                        return Some(signal);
+                    }
                 }
 
                 // LOSSLESS alternative entry: at support on down day with elevated volume
@@ -431,17 +471,31 @@ impl SymbolAgent {
                     if let Some(s) = support {
                         let touched_support = self.sr.is_near(close.min(open), s);
                         if touched_support {
+                            // AGI FEEDBACK: Calculate combined confidence for this S/R level
+                            let combined_confidence = self.get_combined_confidence(s);
+                            let conviction = (combined_confidence * 100.0) as u8;
+
+                            // Skip trade if confidence too low
+                            if combined_confidence < Self::MIN_CONFIDENCE_THRESHOLD {
+                                info!(
+                                    "[MEMORY] {} Skipping BUY (elevated): confidence {:.1}% below threshold {:.1}%",
+                                    self.symbol, combined_confidence * 100.0, Self::MIN_CONFIDENCE_THRESHOLD * 100.0
+                                );
+                                return None;
+                            }
+
                             let signal = AgentSignal {
                                 symbol: self.symbol.clone(),
                                 signal: Signal::Buy,
                                 price: close,
                                 reason: format!(
-                                    "Price at support with elevated volume ({:.0}th percentile)",
-                                    volume_percentile
+                                    "Support with elevated volume ({:.0}th pctl, {:.0}% conf)",
+                                    volume_percentile, combined_confidence * 100.0
                                 ),
                                 support,
                                 resistance,
                                 volume_percentile,
+                                conviction,
                             };
 
                             self.position = Some(Position {
@@ -461,6 +515,7 @@ impl SymbolAgent {
                 match pos.side {
                     Side::Long => {
                         if at_resistance {
+                            // Exit signals don't need confidence check - always exit at target
                             let signal = AgentSignal {
                                 symbol: self.symbol.clone(),
                                 signal: Signal::Sell,
@@ -472,6 +527,7 @@ impl SymbolAgent {
                                 support,
                                 resistance,
                                 volume_percentile,
+                                conviction: 100, // Exit signals are always high conviction
                             };
 
                             self.position = None;
@@ -492,6 +548,7 @@ impl SymbolAgent {
                                 support,
                                 resistance,
                                 volume_percentile,
+                                conviction: 100, // Exit signals are always high conviction
                             };
 
                             self.position = None;
@@ -768,30 +825,86 @@ impl SymbolAgent {
     /// Get S/R confidence based on historical effectiveness
     ///
     /// Returns a confidence score 0.0-1.0 based on:
-    /// - Historical win rate at this level (if available)
-    /// - Fallback to S/R score (0 = strongest)
+    /// - Historical win rate at this level (if >= 5 trades)
+    /// - Fallback to S/R score heuristic
     pub fn get_sr_confidence(&self, price_level: Decimal) -> f64 {
-        // Try to get historical win rate from memory
-        if let Some(ref memory) = self.memory {
-            let granularity = self.atr()
-                .map(|a| a.to_f64().unwrap_or(1.0) / 2.0)
-                .unwrap_or(1.0);
+        let price_f = price_level.to_f64().unwrap_or(0.0);
+        let granularity = self.atr()
+            .map(|a| a.to_f64().unwrap_or(1.0) / 2.0)
+            .unwrap_or(1.0);
 
-            if let Ok(Some(win_rate)) = memory.get_sr_win_rate(
+        // Try to get historical win rate from memory (requires >= 5 trades)
+        if let Some(ref memory) = self.memory {
+            if let Ok(Some((win_rate, trade_count))) = memory.get_sr_win_rate_with_count(
                 &self.symbol,
-                price_level.to_f64().unwrap_or(0.0),
+                price_f,
                 granularity,
             ) {
-                return win_rate;
+                if trade_count >= 5 {
+                    info!(
+                        "[MEMORY] {} S/R {:.2}: {:.1}% from {} trades",
+                        self.symbol, price_f, win_rate * 100.0, trade_count
+                    );
+                    return win_rate;
+                }
             }
         }
 
-        // Fallback to S/R score-based confidence
-        // Score of 0 = never crossed = 100% confidence
-        // Score of -10 = crossed 10 times = lower confidence
+        // Fallback to S/R score-based confidence heuristic
         let score = self.sr.score_at(price_level);
-        let confidence = 1.0 / (1.0 + (-score as f64).abs() * 0.1);
-        confidence.clamp(0.0, 1.0)
+        let confidence = match score {
+            0 => 0.65,           // Never crossed - strongest
+            -1 => 0.60,          // Crossed once
+            -2 => 0.55,          // Crossed twice
+            -3 => 0.50,          // Crossed 3 times
+            _ => 0.45,           // Crossed 4+ times - weakest
+        };
+
+        confidence
+    }
+
+    /// Get regime confidence based on historical win rate in current regime
+    ///
+    /// Returns win rate if >= 10 trades in this regime, else 0.50 (neutral)
+    pub fn get_regime_confidence(&self) -> f64 {
+        let current_regime = self.regime_detector.current_regime();
+        let regime_str = current_regime.as_str();
+
+        if let Some(ref memory) = self.memory {
+            if let Ok(regime_stats) = memory.get_win_rate_by_regime() {
+                for (regime, win_rate, trade_count) in regime_stats {
+                    // Match current regime (handle both symbol-prefixed and global regimes)
+                    if regime == regime_str || regime.ends_with(&format!(":{}", regime_str)) {
+                        if trade_count >= 10 {
+                            info!(
+                                "[MEMORY] {} Regime {}: {:.1}% from {} trades",
+                                self.symbol, regime_str, win_rate * 100.0, trade_count
+                            );
+                            return win_rate;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Not enough data - return neutral
+        0.50
+    }
+
+    /// Get combined confidence from S/R and regime
+    ///
+    /// Weighted average: 70% S/R confidence, 30% regime confidence
+    pub fn get_combined_confidence(&self, sr_level: Decimal) -> f64 {
+        let sr_conf = self.get_sr_confidence(sr_level);
+        let regime_conf = self.get_regime_confidence();
+        let combined = (sr_conf * 0.7) + (regime_conf * 0.3);
+
+        info!(
+            "[MEMORY] {} Combined confidence: {:.1}% (S/R: {:.1}%, Regime: {:.1}%)",
+            self.symbol, combined * 100.0, sr_conf * 100.0, regime_conf * 100.0
+        );
+
+        combined
     }
 
     /// Get pending entry ticket (for external tracking)

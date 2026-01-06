@@ -335,6 +335,39 @@ impl TradeMemory {
         }
     }
 
+    /// Get win rate and trade count for a specific S/R level
+    /// Returns (win_rate, trade_count) if found
+    pub fn get_sr_win_rate_with_count(
+        &self,
+        symbol: &str,
+        price_level: f64,
+        granularity: f64,
+    ) -> Result<Option<(f64, i32)>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT bounce_count, touch_count FROM sr_effectiveness
+             WHERE symbol = ?1 AND ABS(price_level - ?2) < ?3"
+        )?;
+
+        let result = stmt.query_row(
+            rusqlite::params![symbol, price_level, granularity / 2.0],
+            |row| {
+                let bounces: i32 = row.get(0)?;
+                let touches: i32 = row.get(1)?;
+                Ok((bounces, touches))
+            },
+        );
+
+        match result {
+            Ok((bounces, touches)) if touches > 0 => {
+                let win_rate = bounces as f64 / touches as f64;
+                Ok(Some((win_rate, touches)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Get S/R effectiveness for a symbol
     pub fn get_sr_effectiveness(&self, symbol: &str, min_touches: i32) -> Result<Vec<SrEffectiveness>> {
         let conn = self.conn.lock().unwrap();
