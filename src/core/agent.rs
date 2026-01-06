@@ -26,6 +26,7 @@ use tracing::info;
 use super::sr::{SRLevels, default_granularity, granularity_from_atr};
 use super::capitulation::VolumeTracker;
 use super::regime::{Regime, RegimeDetector};
+use super::learner::ConfidenceCalibrator;
 use crate::data::memory::{TradeMemory, MarketRegime};
 
 /// Trading signal from an agent
@@ -123,6 +124,7 @@ pub struct EntryContext {
 /// - Tracks ATR for volatility-based calculations (lossless)
 /// - Records trade context for AGI learning (when memory is attached)
 /// - Detects market regime using HMM (TrendingUp, TrendingDown, Ranging, Volatile)
+/// - Uses learned confidence calibrator for adaptive trade filtering
 pub struct SymbolAgent {
     /// Symbol this agent is trading
     symbol: String,
@@ -132,6 +134,8 @@ pub struct SymbolAgent {
     volume: VolumeTracker,
     /// HMM-based regime detector
     regime_detector: RegimeDetector,
+    /// Learned confidence calibrator
+    calibrator: ConfidenceCalibrator,
     /// Current position (if any)
     position: Option<Position>,
     /// Last known price
@@ -169,6 +173,7 @@ impl SymbolAgent {
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
+            calibrator: ConfidenceCalibrator::new(),
             position: None,
             last_price: initial_price,
             last_volume: 0,
@@ -191,6 +196,7 @@ impl SymbolAgent {
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
+            calibrator: ConfidenceCalibrator::new(),
             position: None,
             last_price: initial_price,
             last_volume: 0,
@@ -218,6 +224,7 @@ impl SymbolAgent {
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
+            calibrator: ConfidenceCalibrator::new(),
             position: None,
             last_price: Decimal::ZERO,
             last_volume: 0,
@@ -237,6 +244,7 @@ impl SymbolAgent {
             sr: SRLevels::new(granularity),
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
+            calibrator: ConfidenceCalibrator::new(),
             position: None,
             last_price: Decimal::ZERO,
             last_volume: 0,
@@ -820,6 +828,30 @@ impl SymbolAgent {
                 hold_bars,
             );
         }
+
+        // Update calibrator with trade outcome (always, even without memory)
+        // Convert entry's MarketRegime back to Regime for the learner
+        let regime_for_learner = match entry.regime {
+            MarketRegime::Bull => Regime::TrendingUp,
+            MarketRegime::Bear => Regime::TrendingDown,
+            MarketRegime::Sideways => Regime::Ranging,
+            MarketRegime::HighVolatility | MarketRegime::LowVolatility => Regime::Volatile,
+            MarketRegime::Unknown => self.regime_detector.current_regime(),
+        };
+
+        self.calibrator.update_from_trade(
+            entry.sr_score,
+            entry.volume_percentile,
+            &regime_for_learner,
+            was_winner,
+            0.01, // Learning rate
+        );
+
+        let outcome = if was_winner { "winning" } else { "losing" };
+        info!(
+            "[LEARNER] {} Updated after {} trade (sr_score: {}, vol: {:.0}%, regime: {:?})",
+            self.symbol, outcome, entry.sr_score, entry.volume_percentile, regime_for_learner
+        );
     }
 
     /// Get S/R confidence based on historical effectiveness
@@ -891,17 +923,27 @@ impl SymbolAgent {
         0.50
     }
 
-    /// Get combined confidence from S/R and regime
+    /// Get combined confidence from S/R, regime, and learned calibrator
     ///
-    /// Weighted average: 70% S/R confidence, 30% regime confidence
+    /// Base confidence: 70% S/R confidence, 30% regime confidence
+    /// Final: 60% base confidence + 40% calibrator prediction
     pub fn get_combined_confidence(&self, sr_level: Decimal) -> f64 {
         let sr_conf = self.get_sr_confidence(sr_level);
         let regime_conf = self.get_regime_confidence();
-        let combined = (sr_conf * 0.7) + (regime_conf * 0.3);
+        let base_confidence = (sr_conf * 0.7) + (regime_conf * 0.3);
+
+        // Get calibrator prediction
+        let sr_score = self.sr.score_at(sr_level);
+        let volume_pct = self.volume.percentile(self.last_volume);
+        let regime = self.regime_detector.current_regime();
+        let calibrated = self.calibrator.predict(sr_score, volume_pct, &regime);
+
+        // Blend base and calibrated confidence
+        let combined = (base_confidence * 0.6) + (calibrated * 0.4);
 
         info!(
-            "[MEMORY] {} Combined confidence: {:.1}% (S/R: {:.1}%, Regime: {:.1}%)",
-            self.symbol, combined * 100.0, sr_conf * 100.0, regime_conf * 100.0
+            "[MEMORY] {} Combined: {:.1}% (base: {:.1}%, calibrated: {:.1}%)",
+            self.symbol, combined * 100.0, base_confidence * 100.0, calibrated * 100.0
         );
 
         combined
@@ -910,6 +952,21 @@ impl SymbolAgent {
     /// Get pending entry ticket (for external tracking)
     pub fn pending_ticket(&self) -> Option<u64> {
         self.pending_entry.as_ref().map(|e| e.ticket)
+    }
+
+    /// Get reference to calibrator
+    pub fn calibrator(&self) -> &ConfidenceCalibrator {
+        &self.calibrator
+    }
+
+    /// Get mutable reference to calibrator
+    pub fn calibrator_mut(&mut self) -> &mut ConfidenceCalibrator {
+        &mut self.calibrator
+    }
+
+    /// Set calibrator (for loading from persistence)
+    pub fn set_calibrator(&mut self, calibrator: ConfidenceCalibrator) {
+        self.calibrator = calibrator;
     }
 }
 

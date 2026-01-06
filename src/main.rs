@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator};
 use crate::core::health::HealthStatus;
 use crate::universe::{Universe, Sector};
 use crate::portfolio::{Portfolio, PortfolioPosition};
@@ -38,6 +38,25 @@ use crate::comms::telegram;
 use crate::config::Config;
 
 const SEP: &str = "===========================================================";
+const CALIBRATOR_PATH: &str = "sovereign_calibrator.json";
+
+/// Save the best calibrator from all agents (one with most updates)
+fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
+    // Find the agent with the most calibrator updates
+    let best = agents.values()
+        .max_by_key(|a| a.calibrator().update_count());
+
+    if let Some(agent) = best {
+        let cal = agent.calibrator();
+        if cal.update_count() > 0 {
+            if let Err(e) = cal.save(CALIBRATOR_PATH) {
+                warn!("Failed to save calibrator: {}", e);
+            } else {
+                info!("Calibrator: Saved {} updates to {}", cal.update_count(), CALIBRATOR_PATH);
+            }
+        }
+    }
+}
 
 /// Check if US stock market is open
 fn is_market_open() -> bool {
@@ -245,6 +264,17 @@ async fn main() -> Result<()> {
         }
     }
     info!("Agents: {} independent traders ready", agents.len());
+
+    // Load learned calibrator weights if available
+    let calibrator = ConfidenceCalibrator::load_or_new(CALIBRATOR_PATH);
+    if calibrator.update_count() > 0 {
+        info!("Calibrator: Loaded with {} updates, applying to all agents", calibrator.update_count());
+        for agent in agents.values_mut() {
+            agent.set_calibrator(calibrator.clone());
+        }
+    } else {
+        info!("Calibrator: Starting fresh (no saved weights found)");
+    }
 
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
@@ -521,6 +551,10 @@ async fn run_alpaca_loop(
         if now.hour() == 21 && now.minute() >= 5 && now.minute() < 15 {
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
+
+                // Save learned calibrator weights
+                save_calibrator(agents);
+
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();
                     telegram::send_daily_summary(
@@ -627,6 +661,10 @@ async fn run_ibkr_loop(
         if now.hour() == 21 && now.minute() >= 5 && now.minute() < 15 {
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
+
+                // Save learned calibrator weights
+                save_calibrator(agents);
+
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();
                     telegram::send_daily_summary(
