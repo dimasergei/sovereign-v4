@@ -10,16 +10,33 @@
 //! - Regime one-hot encoding (4 values)
 //!
 //! The model learns from trade outcomes to adjust confidence predictions.
+//!
+//! Includes Elastic Weight Consolidation (EWC) to prevent catastrophic
+//! forgetting when market regimes change. EWC protects weights that were
+//! important for good performance in previous regimes.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use tracing::info;
 
 use super::regime::Regime;
 
 /// Number of features in the linear model
 const NUM_FEATURES: usize = 6;
+
+/// Default EWC lambda (strength of weight protection)
+const DEFAULT_EWC_LAMBDA: f64 = 100.0;
+
+/// Trade outcome for EWC Fisher computation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeOutcome {
+    pub sr_score: i32,
+    pub volume_pct: f64,
+    pub regime: Regime,
+    pub won: bool,
+}
 
 /// Sigmoid activation function
 fn sigmoid(x: f64) -> f64 {
@@ -43,6 +60,20 @@ pub struct ConfidenceCalibrator {
     bias: f64,
     /// Number of updates performed (for tracking)
     update_count: u64,
+
+    // EWC (Elastic Weight Consolidation) fields
+    /// Fisher Information matrix diagonal (importance of each weight)
+    fisher: [f64; NUM_FEATURES],
+    /// Fisher Information for bias
+    fisher_bias: f64,
+    /// Optimal weights at consolidation point
+    optimal_weights: Option<[f64; NUM_FEATURES]>,
+    /// Optimal bias at consolidation point
+    optimal_bias: Option<f64>,
+    /// EWC penalty strength (higher = more protection of old weights)
+    ewc_lambda: f64,
+    /// Number of consolidations performed
+    consolidation_count: u32,
 }
 
 impl Default for ConfidenceCalibrator {
@@ -66,6 +97,13 @@ impl ConfidenceCalibrator {
             weights: [0.3, 0.2, 0.1, 0.1, 0.1, 0.2],
             bias: 0.5,
             update_count: 0,
+            // EWC fields initialized to defaults
+            fisher: [0.0; NUM_FEATURES],
+            fisher_bias: 0.0,
+            optimal_weights: None,
+            optimal_bias: None,
+            ewc_lambda: DEFAULT_EWC_LAMBDA,
+            consolidation_count: 0,
         }
     }
 
@@ -114,26 +152,15 @@ impl ConfidenceCalibrator {
         ]
     }
 
-    /// Update weights using simple gradient descent
+    /// Update weights using gradient descent with EWC penalty
     ///
-    /// Performs one step of gradient descent:
-    /// w_i += learning_rate * (target - prediction) * feature_i
+    /// Performs one step of gradient descent with optional EWC regularization:
+    /// w_i += learning_rate * ((target - prediction) * feature_i - ewc_penalty)
     ///
-    /// This is the gradient of binary cross-entropy loss with respect to weights.
+    /// If EWC has been consolidated, the penalty prevents catastrophic forgetting.
     pub fn update(&mut self, features: &[f64; NUM_FEATURES], target: f64, learning_rate: f64) {
-        let prediction = self.predict_from_features(features);
-        let error = target - prediction;
-
-        // Gradient descent update
-        // For sigmoid output with BCE loss, gradient simplifies to: (target - pred) * feature
-        for i in 0..NUM_FEATURES {
-            self.weights[i] += learning_rate * error * features[i];
-        }
-
-        // Update bias
-        self.bias += learning_rate * error;
-
-        self.update_count += 1;
+        // Delegate to update_with_ewc which handles both regular and EWC updates
+        self.update_with_ewc(features, target, learning_rate);
     }
 
     /// Update from raw inputs
@@ -148,6 +175,122 @@ impl ConfidenceCalibrator {
         let features = Self::encode_features(sr_score, volume_percentile, regime);
         let target = if won { 1.0 } else { 0.0 };
         self.update(&features, target, learning_rate);
+    }
+
+    // ==================== EWC Methods ====================
+
+    /// Compute Fisher Information from recent trade outcomes
+    ///
+    /// Fisher Information measures the importance of each weight by computing
+    /// the expected squared gradient over recent data. Higher values indicate
+    /// weights that are more important for current performance.
+    pub fn compute_fisher(&mut self, recent_trades: &[TradeOutcome]) {
+        if recent_trades.is_empty() {
+            return;
+        }
+
+        // Reset fisher to zero
+        self.fisher = [0.0; NUM_FEATURES];
+        self.fisher_bias = 0.0;
+
+        // Compute average squared gradient over recent trades
+        for trade in recent_trades {
+            let features = Self::encode_features(trade.sr_score, trade.volume_pct, &trade.regime);
+            let prediction = self.predict_from_features(&features);
+            let target = if trade.won { 1.0 } else { 0.0 };
+            let error = target - prediction;
+
+            // Gradient squared for each weight
+            for i in 0..NUM_FEATURES {
+                let grad = error * features[i];
+                self.fisher[i] += grad * grad;
+            }
+            // Gradient squared for bias
+            self.fisher_bias += error * error;
+        }
+
+        // Average over number of trades
+        let n = recent_trades.len() as f64;
+        for i in 0..NUM_FEATURES {
+            self.fisher[i] /= n;
+        }
+        self.fisher_bias /= n;
+    }
+
+    /// Consolidate current weights as the optimal reference point
+    ///
+    /// Call this when performance is good and you want to protect
+    /// the current weights from being forgotten during future learning.
+    /// Typically called after a regime change when the model has adapted well.
+    pub fn consolidate(&mut self) {
+        self.optimal_weights = Some(self.weights);
+        self.optimal_bias = Some(self.bias);
+        self.consolidation_count += 1;
+        info!(
+            "EWC consolidation #{}: protected weights {:?}",
+            self.consolidation_count, self.weights
+        );
+    }
+
+    /// Update weights with EWC penalty to prevent catastrophic forgetting
+    ///
+    /// The EWC penalty adds a quadratic term that penalizes moving away from
+    /// optimal weights, weighted by Fisher Information (importance).
+    ///
+    /// Loss = BCE + (lambda/2) * sum_i(F_i * (w_i - w*_i)^2)
+    ///
+    /// Gradient includes: (target - pred) * feature - lambda * F_i * (w_i - w*_i)
+    pub fn update_with_ewc(&mut self, features: &[f64; NUM_FEATURES], target: f64, learning_rate: f64) {
+        let prediction = self.predict_from_features(features);
+        let error = target - prediction;
+
+        // Standard gradient descent with EWC penalty
+        for i in 0..NUM_FEATURES {
+            let mut grad = error * features[i];
+
+            // Add EWC penalty if we have optimal weights
+            if let Some(ref optimal) = self.optimal_weights {
+                let ewc_penalty = self.ewc_lambda * self.fisher[i] * (self.weights[i] - optimal[i]);
+                grad -= ewc_penalty;
+            }
+
+            self.weights[i] += learning_rate * grad;
+        }
+
+        // Update bias with EWC penalty
+        let mut bias_grad = error;
+        if let Some(optimal_bias) = self.optimal_bias {
+            let ewc_penalty = self.ewc_lambda * self.fisher_bias * (self.bias - optimal_bias);
+            bias_grad -= ewc_penalty;
+        }
+        self.bias += learning_rate * bias_grad;
+
+        self.update_count += 1;
+    }
+
+    /// Get EWC lambda (penalty strength)
+    pub fn get_ewc_lambda(&self) -> f64 {
+        self.ewc_lambda
+    }
+
+    /// Set EWC lambda (penalty strength)
+    pub fn set_ewc_lambda(&mut self, lambda: f64) {
+        self.ewc_lambda = lambda;
+    }
+
+    /// Get Fisher Information values
+    pub fn get_fisher(&self) -> &[f64; NUM_FEATURES] {
+        &self.fisher
+    }
+
+    /// Check if model has been consolidated (has optimal weights)
+    pub fn is_consolidated(&self) -> bool {
+        self.optimal_weights.is_some()
+    }
+
+    /// Get consolidation count
+    pub fn consolidation_count(&self) -> u32 {
+        self.consolidation_count
     }
 
     /// Get current weights
@@ -386,5 +529,165 @@ mod tests {
         let mut cal = ConfidenceCalibrator::new();
         cal.set_bias(0.75);
         assert!((cal.get_bias() - 0.75).abs() < 0.001);
+    }
+
+    // ==================== EWC Tests ====================
+
+    #[test]
+    fn test_ewc_consolidation() {
+        let mut cal = ConfidenceCalibrator::new();
+
+        // Initially not consolidated
+        assert!(!cal.is_consolidated());
+        assert_eq!(cal.consolidation_count(), 0);
+
+        // Create some trade outcomes
+        let trades = vec![
+            TradeOutcome { sr_score: 0, volume_pct: 80.0, regime: Regime::TrendingUp, won: true },
+            TradeOutcome { sr_score: -2, volume_pct: 70.0, regime: Regime::TrendingUp, won: true },
+            TradeOutcome { sr_score: -3, volume_pct: 60.0, regime: Regime::TrendingUp, won: false },
+        ];
+
+        // Compute Fisher Information
+        cal.compute_fisher(&trades);
+
+        // Fisher should now have non-zero values
+        let fisher = cal.get_fisher();
+        assert!(fisher.iter().any(|&f| f > 0.0));
+
+        // Consolidate
+        cal.consolidate();
+
+        // Now consolidated
+        assert!(cal.is_consolidated());
+        assert_eq!(cal.consolidation_count(), 1);
+    }
+
+    #[test]
+    fn test_ewc_prevents_forgetting() {
+        let mut cal = ConfidenceCalibrator::new();
+
+        // Train on winning pattern in TrendingUp
+        let trending_up_trades: Vec<TradeOutcome> = (0..20).map(|_| {
+            TradeOutcome { sr_score: 0, volume_pct: 85.0, regime: Regime::TrendingUp, won: true }
+        }).collect();
+
+        for trade in &trending_up_trades {
+            let features = ConfidenceCalibrator::encode_features(trade.sr_score, trade.volume_pct, &trade.regime);
+            cal.update(&features, 1.0, 0.1);
+        }
+
+        // Record prediction for the good pattern
+        let good_pred_before = cal.predict(0, 85.0, &Regime::TrendingUp);
+
+        // Compute Fisher and consolidate (protect these weights)
+        cal.compute_fisher(&trending_up_trades);
+        cal.consolidate();
+
+        // Now train on different pattern (Volatile with weak S/R)
+        for _ in 0..20 {
+            cal.update_from_trade(-8, 40.0, &Regime::Volatile, false, 0.1);
+        }
+
+        // Check prediction for original good pattern - should be somewhat protected
+        let good_pred_after = cal.predict(0, 85.0, &Regime::TrendingUp);
+
+        // EWC should prevent complete forgetting
+        // The prediction shouldn't drop too much (with EWC, it's penalized for moving away)
+        // Without EWC, the prediction would drop significantly more
+        assert!(good_pred_after > good_pred_before * 0.5,
+            "EWC should prevent catastrophic forgetting: before={:.3}, after={:.3}",
+            good_pred_before, good_pred_after);
+    }
+
+    #[test]
+    fn test_fisher_computation() {
+        let mut cal = ConfidenceCalibrator::new();
+
+        // Create uniform trades
+        let trades: Vec<TradeOutcome> = (0..10).map(|i| {
+            TradeOutcome {
+                sr_score: -(i % 5) as i32,
+                volume_pct: 50.0 + (i * 5) as f64,
+                regime: Regime::Ranging,
+                won: i % 2 == 0,
+            }
+        }).collect();
+
+        // Compute Fisher
+        cal.compute_fisher(&trades);
+
+        let fisher = cal.get_fisher();
+
+        // All Fisher values should be non-negative
+        for &f in fisher {
+            assert!(f >= 0.0, "Fisher values must be non-negative");
+        }
+
+        // At least some features should have positive Fisher (indicating importance)
+        assert!(fisher.iter().any(|&f| f > 0.0), "Some features should have positive Fisher");
+    }
+
+    #[test]
+    fn test_ewc_lambda() {
+        let mut cal = ConfidenceCalibrator::new();
+
+        // Check default lambda
+        assert!((cal.get_ewc_lambda() - 100.0).abs() < 0.001);
+
+        // Set new lambda
+        cal.set_ewc_lambda(200.0);
+        assert!((cal.get_ewc_lambda() - 200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_update_with_ewc_without_consolidation() {
+        let mut cal = ConfidenceCalibrator::new();
+        let features = ConfidenceCalibrator::encode_features(0, 70.0, &Regime::TrendingUp);
+
+        let pred_before = cal.predict_from_features(&features);
+
+        // Update without prior consolidation (should work like normal update)
+        cal.update_with_ewc(&features, 1.0, 0.1);
+
+        let pred_after = cal.predict_from_features(&features);
+
+        // Prediction should increase toward target
+        assert!(pred_after > pred_before);
+    }
+
+    #[test]
+    fn test_ewc_save_load() {
+        let mut cal = ConfidenceCalibrator::new();
+
+        // Create trades and consolidate
+        let trades = vec![
+            TradeOutcome { sr_score: 0, volume_pct: 80.0, regime: Regime::TrendingUp, won: true },
+            TradeOutcome { sr_score: -2, volume_pct: 70.0, regime: Regime::TrendingUp, won: true },
+        ];
+        cal.compute_fisher(&trades);
+        cal.consolidate();
+        cal.set_ewc_lambda(150.0);
+
+        // Save
+        let path = "/tmp/test_calibrator_ewc.json";
+        cal.save(path).unwrap();
+
+        // Load and verify EWC state
+        let loaded = ConfidenceCalibrator::load(path).unwrap();
+        assert!(loaded.is_consolidated());
+        assert_eq!(loaded.consolidation_count(), 1);
+        assert!((loaded.get_ewc_lambda() - 150.0).abs() < 0.001);
+
+        // Compare Fisher values with tolerance for floating point
+        let cal_fisher = cal.get_fisher();
+        let loaded_fisher = loaded.get_fisher();
+        for i in 0..6 {
+            assert!((cal_fisher[i] - loaded_fisher[i]).abs() < 1e-10,
+                "Fisher[{}] mismatch: {} vs {}", i, cal_fisher[i], loaded_fisher[i]);
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(path);
     }
 }

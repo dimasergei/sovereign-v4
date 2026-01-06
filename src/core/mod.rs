@@ -20,4 +20,4 @@ pub mod learner;
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
 pub use health::HealthMonitor;
 pub use regime::{Regime, RegimeDetector};
-pub use learner::ConfidenceCalibrator;
+pub use learner::{ConfidenceCalibrator, TradeOutcome};

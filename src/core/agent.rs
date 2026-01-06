@@ -26,7 +26,7 @@ use tracing::info;
 use super::sr::{SRLevels, default_granularity, granularity_from_atr};
 use super::capitulation::VolumeTracker;
 use super::regime::{Regime, RegimeDetector};
-use super::learner::ConfidenceCalibrator;
+use super::learner::{ConfidenceCalibrator, TradeOutcome};
 use crate::data::memory::{TradeMemory, MarketRegime};
 
 /// Trading signal from an agent
@@ -114,6 +114,12 @@ pub struct EntryContext {
     pub mfe: f64,
 }
 
+/// Minimum trades required before considering EWC consolidation
+const EWC_MIN_TRADES: usize = 10;
+
+/// Minimum win rate required for EWC consolidation (consider weights worth protecting)
+const EWC_MIN_WIN_RATE: f64 = 0.55;
+
 /// Independent trading agent for a single symbol
 ///
 /// Each agent:
@@ -125,6 +131,7 @@ pub struct EntryContext {
 /// - Records trade context for AGI learning (when memory is attached)
 /// - Detects market regime using HMM (TrendingUp, TrendingDown, Ranging, Volatile)
 /// - Uses learned confidence calibrator for adaptive trade filtering
+/// - Applies Elastic Weight Consolidation (EWC) to prevent catastrophic forgetting
 pub struct SymbolAgent {
     /// Symbol this agent is trading
     symbol: String,
@@ -154,6 +161,8 @@ pub struct SymbolAgent {
     pending_entry: Option<EntryContext>,
     /// Next ticket number for trade identification
     next_ticket: u64,
+    /// Recent trade outcomes for EWC Fisher computation
+    recent_trades: Vec<TradeOutcome>,
 }
 
 impl SymbolAgent {
@@ -183,6 +192,7 @@ impl SymbolAgent {
             memory: None,
             pending_entry: None,
             next_ticket: 1,
+            recent_trades: Vec::new(),
         }
     }
 
@@ -206,6 +216,7 @@ impl SymbolAgent {
             memory: Some(memory),
             pending_entry: None,
             next_ticket: 1,
+            recent_trades: Vec::new(),
         }
     }
 
@@ -234,6 +245,7 @@ impl SymbolAgent {
             memory: None,
             pending_entry: None,
             next_ticket: 1,
+            recent_trades: Vec::new(),
         }
     }
 
@@ -254,6 +266,7 @@ impl SymbolAgent {
             memory: None,
             pending_entry: None,
             next_ticket: 1,
+            recent_trades: Vec::new(),
         }
     }
 
@@ -334,6 +347,9 @@ impl SymbolAgent {
                 let new_regime = self.regime_detector.current_regime();
                 let _ = memory.start_regime(&self.symbol, new_regime.as_str());
             }
+
+            // 4a. EWC consolidation on regime change if performance was good
+            self.maybe_consolidate_ewc();
         }
 
         // 5. Track bars for ATR calculation
@@ -847,6 +863,19 @@ impl SymbolAgent {
             0.01, // Learning rate
         );
 
+        // Track trade outcome for EWC Fisher computation
+        self.recent_trades.push(TradeOutcome {
+            sr_score: entry.sr_score,
+            volume_pct: entry.volume_percentile,
+            regime: regime_for_learner,
+            won: was_winner,
+        });
+
+        // Keep only the most recent trades (cap at 100)
+        if self.recent_trades.len() > 100 {
+            self.recent_trades.remove(0);
+        }
+
         let outcome = if was_winner { "winning" } else { "losing" };
         info!(
             "[LEARNER] {} Updated after {} trade (sr_score: {}, vol: {:.0}%, regime: {:?})",
@@ -967,6 +996,66 @@ impl SymbolAgent {
     /// Set calibrator (for loading from persistence)
     pub fn set_calibrator(&mut self, calibrator: ConfidenceCalibrator) {
         self.calibrator = calibrator;
+    }
+
+    // =========================================================================
+    // EWC (ELASTIC WEIGHT CONSOLIDATION) METHODS
+    // =========================================================================
+
+    /// Check if EWC consolidation should happen and perform it
+    ///
+    /// Consolidation occurs when:
+    /// 1. We have enough recent trades (>= EWC_MIN_TRADES)
+    /// 2. Recent win rate is good (>= EWC_MIN_WIN_RATE)
+    ///
+    /// This protects learned weights that produced good results in the
+    /// current regime from being forgotten when adapting to a new regime.
+    fn maybe_consolidate_ewc(&mut self) {
+        // Need enough trades to compute meaningful Fisher Information
+        if self.recent_trades.len() < EWC_MIN_TRADES {
+            info!(
+                "[EWC] {} Skipping consolidation: only {} trades (need {})",
+                self.symbol, self.recent_trades.len(), EWC_MIN_TRADES
+            );
+            return;
+        }
+
+        // Calculate recent win rate
+        let wins = self.recent_trades.iter().filter(|t| t.won).count();
+        let win_rate = wins as f64 / self.recent_trades.len() as f64;
+
+        if win_rate < EWC_MIN_WIN_RATE {
+            info!(
+                "[EWC] {} Skipping consolidation: win rate {:.1}% < {:.1}%",
+                self.symbol, win_rate * 100.0, EWC_MIN_WIN_RATE * 100.0
+            );
+            return;
+        }
+
+        // Good performance - consolidate weights
+        info!(
+            "[EWC] {} Consolidating: {} trades, {:.1}% win rate",
+            self.symbol, self.recent_trades.len(), win_rate * 100.0
+        );
+
+        // Compute Fisher Information from recent trades
+        self.calibrator.compute_fisher(&self.recent_trades);
+
+        // Store current weights as optimal
+        self.calibrator.consolidate();
+
+        // Clear recent trades for next regime
+        self.recent_trades.clear();
+    }
+
+    /// Get count of recent trades tracked for EWC
+    pub fn recent_trade_count(&self) -> usize {
+        self.recent_trades.len()
+    }
+
+    /// Check if calibrator has been consolidated (EWC is active)
+    pub fn is_ewc_active(&self) -> bool {
+        self.calibrator.is_consolidated()
     }
 }
 
