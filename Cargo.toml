@@ -56,6 +56,10 @@ tokio-test = "0.4"
 name = "sovereign"
 path = "src/main.rs"
 
+[[bin]]
+name = "integration_test"
+path = "src/bin/integration_test.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
