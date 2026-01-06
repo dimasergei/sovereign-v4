@@ -1416,6 +1416,29 @@ impl SymbolAgent {
             }
         }
 
+        // Apply causal intervention adjustment
+        if let Some(ref ca) = self.causal_analyzer {
+            let sr_price_f = sr_level.to_f64().unwrap_or(0.0);
+            let last_price_f = self.last_price.to_f64().unwrap_or(1.0);
+            let is_long = sr_price_f < last_price_f;
+
+            if let Ok(ca_lock) = ca.lock() {
+                let intervention_adjusted = ca_lock.get_intervention_adjusted_confidence(
+                    &self.symbol,
+                    is_long,
+                    combined,
+                );
+
+                if (intervention_adjusted - combined).abs() > 0.01 {
+                    info!(
+                        "[CAUSAL] {} Intervention analysis: {:.1}% -> {:.1}% (entry effect)",
+                        self.symbol, combined * 100.0, intervention_adjusted * 100.0
+                    );
+                    combined = intervention_adjusted;
+                }
+            }
+        }
+
         info!(
             "[MEMORY] {} Combined: {:.1}% (base: {:.1}%, calibrated: {:.1}%)",
             self.symbol, combined * 100.0, base_confidence * 100.0, calibrated * 100.0

@@ -37,7 +37,13 @@ pub use learner::{Calibrator, ConfidenceCalibrator, TradeOutcome};
 pub use transfer::{TransferManager, AssetCluster, get_cluster};
 pub use moe::{MixtureOfExperts, Expert};
 pub use weakness::{WeaknessAnalyzer, Weakness, WeaknessType};
-pub use causality::{CausalAnalyzer, CausalGraph, CausalRelationship, CausalDirection};
+pub use causality::{
+    CausalAnalyzer, CausalGraph, CausalRelationship, CausalDirection,
+    // Do-calculus types
+    InterventionType, CausalQuery, QueryResult, EstimationMethod,
+    CausalModel, StructuralEquation, DoCalculusEngine, DoRule,
+    blocks_backdoor, find_minimal_adjustment,
+};
 pub use worldmodel::{WorldModel, MarketState, TransitionModel, Action, SimPosition, SimulationResult, PriceForecast, PositionDirection};
 pub use counterfactual::{CounterfactualAnalyzer, CounterfactualResult, TradingInsight, InsightType, TradeForAnalysis, Direction};
 pub use monitor::{AGIMonitor, AGIMetrics, AGIReport, PerformanceMetrics, SystemHealth, ExpertStats};

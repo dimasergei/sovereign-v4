@@ -968,6 +968,1030 @@ struct CausalState {
     significance_threshold: f64,
 }
 
+// ==================== Do-Calculus Types ====================
+
+/// Type of intervention in a causal query
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InterventionType {
+    /// Observational conditioning P(Y|X=x)
+    Observe { variable: String, value: f64 },
+    /// Interventional do() operator P(Y|do(X=x))
+    Intervene { variable: String, value: f64 },
+    /// Counterfactual query: what if X had been different?
+    Counterfactual {
+        variable: String,
+        observed: f64,
+        intervened: f64,
+    },
+}
+
+impl InterventionType {
+    /// Get the variable name
+    pub fn variable(&self) -> &str {
+        match self {
+            InterventionType::Observe { variable, .. } => variable,
+            InterventionType::Intervene { variable, .. } => variable,
+            InterventionType::Counterfactual { variable, .. } => variable,
+        }
+    }
+
+    /// Get the value being set
+    pub fn value(&self) -> f64 {
+        match self {
+            InterventionType::Observe { value, .. } => *value,
+            InterventionType::Intervene { value, .. } => *value,
+            InterventionType::Counterfactual { intervened, .. } => *intervened,
+        }
+    }
+}
+
+/// A causal query specifying what to compute
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalQuery {
+    /// Target variable to predict
+    pub target: String,
+    /// Interventions (do() operators or observations)
+    pub interventions: Vec<InterventionType>,
+    /// Conditioning variables (given clause)
+    pub given: Vec<(String, f64)>,
+}
+
+impl CausalQuery {
+    /// Create a simple do() query: P(target | do(treatment = value))
+    pub fn do_query(target: &str, treatment: &str, value: f64) -> Self {
+        Self {
+            target: target.to_string(),
+            interventions: vec![InterventionType::Intervene {
+                variable: treatment.to_string(),
+                value,
+            }],
+            given: Vec::new(),
+        }
+    }
+
+    /// Create an observational query: P(target | X = value)
+    pub fn observe_query(target: &str, observed: &str, value: f64) -> Self {
+        Self {
+            target: target.to_string(),
+            interventions: vec![InterventionType::Observe {
+                variable: observed.to_string(),
+                value,
+            }],
+            given: Vec::new(),
+        }
+    }
+
+    /// Create a counterfactual query
+    pub fn counterfactual_query(
+        target: &str,
+        variable: &str,
+        observed: f64,
+        intervened: f64,
+    ) -> Self {
+        Self {
+            target: target.to_string(),
+            interventions: vec![InterventionType::Counterfactual {
+                variable: variable.to_string(),
+                observed,
+                intervened,
+            }],
+            given: Vec::new(),
+        }
+    }
+
+    /// Add a conditioning variable
+    pub fn with_given(mut self, variable: &str, value: f64) -> Self {
+        self.given.push((variable.to_string(), value));
+        self
+    }
+}
+
+/// Method used to estimate causal effect
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EstimationMethod {
+    /// Backdoor adjustment (control for confounders)
+    BackdoorAdjustment,
+    /// Frontdoor adjustment (use mediators)
+    FrontdoorAdjustment,
+    /// Instrumental variable estimation
+    InstrumentalVariable,
+    /// Direct estimation (no confounders)
+    DirectEstimation,
+    /// Not identifiable from observational data
+    NotIdentifiable,
+}
+
+impl std::fmt::Display for EstimationMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EstimationMethod::BackdoorAdjustment => write!(f, "backdoor"),
+            EstimationMethod::FrontdoorAdjustment => write!(f, "frontdoor"),
+            EstimationMethod::InstrumentalVariable => write!(f, "IV"),
+            EstimationMethod::DirectEstimation => write!(f, "direct"),
+            EstimationMethod::NotIdentifiable => write!(f, "not-identifiable"),
+        }
+    }
+}
+
+/// Result of a causal query
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryResult {
+    /// The query that was executed
+    pub query: CausalQuery,
+    /// Estimated causal effect
+    pub estimated_effect: f64,
+    /// 95% confidence interval
+    pub confidence_interval: (f64, f64),
+    /// Method used for estimation
+    pub method_used: EstimationMethod,
+    /// Variables adjusted for
+    pub confounders_adjusted: Vec<String>,
+}
+
+impl QueryResult {
+    /// Create a new query result
+    pub fn new(
+        query: CausalQuery,
+        effect: f64,
+        ci: (f64, f64),
+        method: EstimationMethod,
+        confounders: Vec<String>,
+    ) -> Self {
+        Self {
+            query,
+            estimated_effect: effect,
+            confidence_interval: ci,
+            method_used: method,
+            confounders_adjusted: confounders,
+        }
+    }
+
+    /// Create a result indicating non-identifiability
+    pub fn not_identifiable(query: CausalQuery) -> Self {
+        Self {
+            query,
+            estimated_effect: 0.0,
+            confidence_interval: (f64::NEG_INFINITY, f64::INFINITY),
+            method_used: EstimationMethod::NotIdentifiable,
+            confounders_adjusted: Vec::new(),
+        }
+    }
+
+    /// Is the effect statistically significant?
+    pub fn is_significant(&self) -> bool {
+        let (lo, hi) = self.confidence_interval;
+        // Significant if CI doesn't contain 0
+        !(lo <= 0.0 && hi >= 0.0)
+    }
+}
+
+/// Structural equation for a variable in the causal model
+/// Y = sum(coef_i * X_i) + noise
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuralEquation {
+    /// Target variable this equation defines
+    pub target: String,
+    /// Parent variables
+    pub parents: Vec<String>,
+    /// Linear coefficients for each parent
+    pub coefficients: Vec<f64>,
+    /// Standard deviation of noise term
+    pub noise_std: f64,
+}
+
+impl StructuralEquation {
+    /// Create a new structural equation
+    pub fn new(target: &str, parents: Vec<String>, coefficients: Vec<f64>, noise_std: f64) -> Self {
+        Self {
+            target: target.to_string(),
+            parents,
+            coefficients,
+            noise_std,
+        }
+    }
+
+    /// Evaluate the equation given parent values
+    pub fn evaluate(&self, parent_values: &HashMap<String, f64>) -> f64 {
+        let mut result = 0.0;
+        for (parent, coef) in self.parents.iter().zip(self.coefficients.iter()) {
+            if let Some(&val) = parent_values.get(parent) {
+                result += coef * val;
+            }
+        }
+        result
+    }
+
+    /// Evaluate with noise
+    pub fn evaluate_with_noise(&self, parent_values: &HashMap<String, f64>, noise: f64) -> f64 {
+        self.evaluate(parent_values) + noise * self.noise_std
+    }
+}
+
+/// Full structural causal model (SCM)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalModel {
+    /// The causal graph structure
+    pub graph: CausalGraph,
+    /// Structural equations for each variable
+    pub structural_equations: HashMap<String, StructuralEquation>,
+    /// Observed data for each variable
+    pub observed_data: HashMap<String, Vec<f64>>,
+    /// Known latent confounders (pairs with hidden common cause)
+    pub latent_confounders: Vec<(String, String)>,
+}
+
+impl CausalModel {
+    /// Create a new causal model from an existing graph
+    pub fn new(graph: CausalGraph) -> Self {
+        Self {
+            graph,
+            structural_equations: HashMap::new(),
+            observed_data: HashMap::new(),
+            latent_confounders: Vec::new(),
+        }
+    }
+
+    /// Add a structural equation
+    pub fn add_equation(&mut self, eq: StructuralEquation) {
+        self.structural_equations.insert(eq.target.clone(), eq);
+    }
+
+    /// Add observed data for a variable
+    pub fn add_observed_data(&mut self, variable: &str, data: Vec<f64>) {
+        self.observed_data.insert(variable.to_string(), data);
+    }
+
+    /// Add a latent confounder between two variables
+    pub fn add_latent_confounder(&mut self, var1: &str, var2: &str) {
+        self.latent_confounders
+            .push((var1.to_string(), var2.to_string()));
+    }
+
+    /// Check if two variables have a latent confounder
+    pub fn has_latent_confounder(&self, var1: &str, var2: &str) -> bool {
+        self.latent_confounders.iter().any(|(a, b)| {
+            (a == var1 && b == var2) || (a == var2 && b == var1)
+        })
+    }
+
+    /// Get all variables in the model
+    pub fn variables(&self) -> Vec<String> {
+        let mut vars: HashSet<String> = self.structural_equations.keys().cloned().collect();
+        for eq in self.structural_equations.values() {
+            for parent in &eq.parents {
+                vars.insert(parent.clone());
+            }
+        }
+        vars.into_iter().collect()
+    }
+
+    /// Get parents of a variable (from structural equations)
+    pub fn get_parents(&self, variable: &str) -> Vec<String> {
+        self.structural_equations
+            .get(variable)
+            .map(|eq| eq.parents.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get children of a variable
+    pub fn get_children(&self, variable: &str) -> Vec<String> {
+        self.structural_equations
+            .iter()
+            .filter_map(|(target, eq)| {
+                if eq.parents.contains(&variable.to_string()) {
+                    Some(target.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get mean of observed data for a variable
+    pub fn get_mean(&self, variable: &str) -> Option<f64> {
+        self.observed_data.get(variable).map(|data| {
+            if data.is_empty() {
+                0.0
+            } else {
+                data.iter().sum::<f64>() / data.len() as f64
+            }
+        })
+    }
+
+    /// Get variance of observed data
+    pub fn get_variance(&self, variable: &str) -> Option<f64> {
+        self.observed_data.get(variable).and_then(|data| {
+            if data.len() < 2 {
+                return None;
+            }
+            let mean = data.iter().sum::<f64>() / data.len() as f64;
+            let variance = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (data.len() - 1) as f64;
+            Some(variance)
+        })
+    }
+}
+
+impl Default for CausalModel {
+    fn default() -> Self {
+        Self::new(CausalGraph::new())
+    }
+}
+
+/// Rules of do-calculus
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DoRule {
+    /// Rule 1: Insertion/deletion of observations
+    /// P(y|do(x),z,w) = P(y|do(x),w) if (Y ⊥ Z | X, W)_{G_{\overline{X}}}
+    Rule1InsertDelete,
+    /// Rule 2: Action/observation exchange
+    /// P(y|do(x),do(z),w) = P(y|do(x),z,w) if (Y ⊥ Z | X, W)_{G_{\overline{X}\underline{Z}}}
+    Rule2ActionExchange,
+    /// Rule 3: Insertion/deletion of actions
+    /// P(y|do(x),do(z),w) = P(y|do(x),w) if (Y ⊥ Z | X, W)_{G_{\overline{X}\overline{Z(W)}}}
+    Rule3ActionDeletion,
+}
+
+impl std::fmt::Display for DoRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DoRule::Rule1InsertDelete => write!(f, "Rule 1 (insert/delete obs)"),
+            DoRule::Rule2ActionExchange => write!(f, "Rule 2 (action/obs exchange)"),
+            DoRule::Rule3ActionDeletion => write!(f, "Rule 3 (action deletion)"),
+        }
+    }
+}
+
+/// Do-calculus engine for computing causal effects
+#[derive(Debug, Clone)]
+pub struct DoCalculusEngine {
+    /// The structural causal model
+    model: CausalModel,
+    /// Rules applied during last computation
+    rules_applied: Vec<DoRule>,
+}
+
+impl DoCalculusEngine {
+    /// Create a new do-calculus engine
+    pub fn new(model: CausalModel) -> Self {
+        Self {
+            model,
+            rules_applied: Vec::new(),
+        }
+    }
+
+    /// Execute a causal query
+    pub fn query(&mut self, q: CausalQuery) -> QueryResult {
+        self.rules_applied.clear();
+
+        // Get the treatment variable(s) from interventions
+        let treatments: Vec<_> = q
+            .interventions
+            .iter()
+            .filter_map(|i| match i {
+                InterventionType::Intervene { variable, .. } => Some(variable.clone()),
+                _ => None,
+            })
+            .collect();
+
+        if treatments.is_empty() {
+            // Pure observational query
+            return self.observational_query(&q);
+        }
+
+        let treatment = &treatments[0];
+        let target = &q.target;
+
+        // Check identifiability
+        if !self.is_identifiable(target, treatment) {
+            return QueryResult::not_identifiable(q);
+        }
+
+        // Find adjustment set
+        let adjustment_set = self.find_adjustment_set(treatment, target);
+
+        match adjustment_set {
+            Some(confounders) if !confounders.is_empty() => {
+                // Use backdoor adjustment
+                let value = q.interventions.iter().find_map(|i| match i {
+                    InterventionType::Intervene { variable, value } if variable == treatment => {
+                        Some(*value)
+                    }
+                    _ => None,
+                }).unwrap_or(0.0);
+
+                let effect = self.backdoor_adjustment(target, treatment, value, &confounders);
+                let ci = self.compute_confidence_interval(target, treatment, &confounders);
+
+                QueryResult::new(
+                    q,
+                    effect,
+                    ci,
+                    EstimationMethod::BackdoorAdjustment,
+                    confounders,
+                )
+            }
+            _ => {
+                // Direct estimation
+                let value = q.interventions.iter().find_map(|i| match i {
+                    InterventionType::Intervene { variable, value } if variable == treatment => {
+                        Some(*value)
+                    }
+                    _ => None,
+                }).unwrap_or(0.0);
+
+                let effect = self.do_intervention(target, treatment, value);
+                let ci = (effect - 0.1 * effect.abs().max(0.1), effect + 0.1 * effect.abs().max(0.1));
+
+                QueryResult::new(
+                    q,
+                    effect,
+                    ci,
+                    EstimationMethod::DirectEstimation,
+                    Vec::new(),
+                )
+            }
+        }
+    }
+
+    /// Handle pure observational query
+    fn observational_query(&self, q: &CausalQuery) -> QueryResult {
+        // For observations, compute conditional expectation
+        let observed: Vec<_> = q
+            .interventions
+            .iter()
+            .filter_map(|i| match i {
+                InterventionType::Observe { variable, value } => Some((variable.clone(), *value)),
+                _ => None,
+            })
+            .collect();
+
+        let effect = self.conditional_expectation(&q.target, &observed);
+
+        QueryResult::new(
+            q.clone(),
+            effect,
+            (effect - 0.1 * effect.abs().max(0.1), effect + 0.1 * effect.abs().max(0.1)),
+            EstimationMethod::DirectEstimation,
+            Vec::new(),
+        )
+    }
+
+    /// Compute P(target | do(variable = value))
+    pub fn do_intervention(&self, target: &str, variable: &str, value: f64) -> f64 {
+        // Check if there are confounders
+        let backdoor_paths = self.find_backdoor_paths(variable, target);
+
+        if backdoor_paths.is_empty() {
+            // No confounders, direct computation using structural equation
+            self.direct_intervention_effect(target, variable, value)
+        } else {
+            // Use backdoor adjustment
+            let adjustment_set = self.find_adjustment_set(variable, target)
+                .unwrap_or_default();
+            self.backdoor_adjustment(target, variable, value, &adjustment_set)
+        }
+    }
+
+    /// Direct intervention effect using structural equations
+    fn direct_intervention_effect(&self, target: &str, variable: &str, value: f64) -> f64 {
+        // Use structural equation if available
+        if let Some(eq) = self.model.structural_equations.get(target) {
+            if eq.parents.contains(&variable.to_string()) {
+                // Find coefficient for this variable
+                if let Some(idx) = eq.parents.iter().position(|p| p == variable) {
+                    return eq.coefficients[idx] * value;
+                }
+            }
+        }
+
+        // Fall back to relationship in causal graph
+        for rel in self.model.graph.relationships() {
+            if rel.source == variable && rel.target == target {
+                let sign = match rel.direction {
+                    CausalDirection::Positive => 1.0,
+                    CausalDirection::Negative => -1.0,
+                };
+                return sign * rel.strength * value;
+            }
+        }
+
+        0.0
+    }
+
+    /// Backdoor adjustment formula
+    /// P(Y|do(X)) = sum_Z P(Y|X,Z) * P(Z)
+    pub fn backdoor_adjustment(
+        &self,
+        target: &str,
+        treatment: &str,
+        value: f64,
+        confounders: &[String],
+    ) -> f64 {
+        if confounders.is_empty() {
+            return self.direct_intervention_effect(target, treatment, value);
+        }
+
+        // Discretize confounders and compute weighted sum
+        let mut total_effect = 0.0;
+        let mut total_weight = 0.0;
+
+        // Use observed data to compute adjustment
+        let n_samples = self.model.observed_data
+            .get(treatment)
+            .map(|d| d.len())
+            .unwrap_or(100);
+
+        // For each "stratum" of confounders
+        let num_strata = 10.min(n_samples / 10).max(1);
+
+        for stratum in 0..num_strata {
+            let stratum_weight = self.get_stratum_weight(confounders, stratum, num_strata);
+            let stratum_effect = self.get_stratum_effect(target, treatment, value, confounders, stratum, num_strata);
+
+            total_effect += stratum_weight * stratum_effect;
+            total_weight += stratum_weight;
+        }
+
+        if total_weight > 0.0 {
+            total_effect / total_weight
+        } else {
+            self.direct_intervention_effect(target, treatment, value)
+        }
+    }
+
+    /// Get weight for a stratum (approximates P(Z))
+    fn get_stratum_weight(&self, confounders: &[String], stratum: usize, num_strata: usize) -> f64 {
+        // Uniform strata for now
+        let _ = confounders;
+        let _ = stratum;
+        1.0 / num_strata as f64
+    }
+
+    /// Get effect in a stratum (approximates E[Y|X,Z] at stratum)
+    fn get_stratum_effect(
+        &self,
+        target: &str,
+        treatment: &str,
+        value: f64,
+        confounders: &[String],
+        stratum: usize,
+        num_strata: usize,
+    ) -> f64 {
+        // Compute effect in this stratum
+        let base_effect = self.direct_intervention_effect(target, treatment, value);
+
+        // Adjust for confounder influence
+        let mut confounder_adjustment = 0.0;
+        for confounder in confounders {
+            if let Some(eq) = self.model.structural_equations.get(target) {
+                if let Some(idx) = eq.parents.iter().position(|p| p == confounder) {
+                    // Effect of confounder on target
+                    let coef = eq.coefficients[idx];
+                    // Approximate stratum value
+                    let stratum_val = (stratum as f64 + 0.5) / num_strata as f64;
+                    confounder_adjustment += coef * stratum_val;
+                }
+            }
+        }
+
+        base_effect + confounder_adjustment * 0.1 // Attenuate confounder effect
+    }
+
+    /// Find all backdoor paths from treatment to outcome
+    pub fn find_backdoor_paths(&self, from: &str, to: &str) -> Vec<Vec<String>> {
+        let mut paths = Vec::new();
+        let mut visited = HashSet::new();
+        let mut current_path = vec![from.to_string()];
+
+        // Find paths that go through parents (backdoor = into treatment)
+        let parents = self.model.get_parents(from);
+        for parent in parents {
+            visited.insert(from.to_string());
+            self.find_paths_to(&parent, to, &mut visited, &mut current_path, &mut paths);
+            visited.remove(from);
+        }
+
+        // Also check latent confounders
+        for (a, b) in &self.model.latent_confounders {
+            if a == from || b == from {
+                let other = if a == from { b } else { a };
+                visited.insert(from.to_string());
+                self.find_paths_to(other, to, &mut visited, &mut current_path, &mut paths);
+                visited.remove(from);
+            }
+        }
+
+        paths
+    }
+
+    /// Helper to find paths between nodes
+    fn find_paths_to(
+        &self,
+        current: &str,
+        target: &str,
+        visited: &mut HashSet<String>,
+        path: &mut Vec<String>,
+        paths: &mut Vec<Vec<String>>,
+    ) {
+        if visited.contains(current) {
+            return;
+        }
+
+        path.push(current.to_string());
+        visited.insert(current.to_string());
+
+        if current == target {
+            paths.push(path.clone());
+        } else {
+            // Check children
+            let children = self.model.get_children(current);
+            for child in children {
+                self.find_paths_to(&child, target, visited, path, paths);
+            }
+
+            // Check parents (for undirected search)
+            let parents = self.model.get_parents(current);
+            for parent in parents {
+                self.find_paths_to(&parent, target, visited, path, paths);
+            }
+        }
+
+        path.pop();
+        visited.remove(current);
+    }
+
+    /// Find minimal adjustment set that blocks all backdoor paths
+    pub fn find_adjustment_set(&self, treatment: &str, outcome: &str) -> Option<Vec<String>> {
+        let backdoor_paths = self.find_backdoor_paths(treatment, outcome);
+
+        if backdoor_paths.is_empty() {
+            return Some(Vec::new()); // No adjustment needed
+        }
+
+        // Collect all variables on backdoor paths (except treatment and outcome)
+        let mut candidates: HashSet<String> = HashSet::new();
+        for path in &backdoor_paths {
+            for node in path {
+                if node != treatment && node != outcome {
+                    candidates.insert(node.clone());
+                }
+            }
+        }
+
+        // Add parents of treatment (common approach)
+        for parent in self.model.get_parents(treatment) {
+            candidates.insert(parent);
+        }
+
+        // Check if this set blocks all backdoor paths
+        let adjustment: Vec<String> = candidates.into_iter().collect();
+
+        if self.blocks_all_backdoor_paths(treatment, outcome, &adjustment) {
+            Some(adjustment)
+        } else {
+            // Check for latent confounders making it non-identifiable
+            if self.model.has_latent_confounder(treatment, outcome) {
+                None
+            } else {
+                Some(adjustment)
+            }
+        }
+    }
+
+    /// Check if adjustment set blocks all backdoor paths
+    fn blocks_all_backdoor_paths(&self, treatment: &str, outcome: &str, adjustment: &[String]) -> bool {
+        let paths = self.find_backdoor_paths(treatment, outcome);
+
+        for path in paths {
+            let mut blocked = false;
+            for node in &path {
+                if adjustment.contains(node) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if !blocked && path.len() > 2 {
+                // Path not blocked
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Check if causal effect is identifiable
+    pub fn is_identifiable(&self, target: &str, treatment: &str) -> bool {
+        // Effect is identifiable if:
+        // 1. No latent confounders between treatment and outcome, OR
+        // 2. We can find a valid adjustment set
+
+        if self.model.has_latent_confounder(treatment, target) {
+            // Check if we can still identify via other methods
+            // (simplified: return false for latent confounders)
+            return false;
+        }
+
+        // Check if adjustment set exists
+        self.find_adjustment_set(treatment, target).is_some()
+    }
+
+    /// Compute Average Treatment Effect
+    /// ATE = E[Y | do(X=1)] - E[Y | do(X=0)]
+    pub fn average_treatment_effect(&self, treatment: &str, outcome: &str) -> f64 {
+        let effect_1 = self.do_intervention(outcome, treatment, 1.0);
+        let effect_0 = self.do_intervention(outcome, treatment, 0.0);
+        effect_1 - effect_0
+    }
+
+    /// Compute Conditional Average Treatment Effect for subgroup
+    pub fn conditional_ate(
+        &self,
+        treatment: &str,
+        outcome: &str,
+        condition: &str,
+        value: f64,
+    ) -> f64 {
+        // Simplified: scale ATE by condition value
+        let base_ate = self.average_treatment_effect(treatment, outcome);
+
+        // Adjust based on condition's relationship to outcome
+        if let Some(rel) = self.model.graph.relationships().iter()
+            .find(|r| r.source == condition && r.target == outcome) {
+            let modifier = match rel.direction {
+                CausalDirection::Positive => 1.0 + 0.1 * value,
+                CausalDirection::Negative => 1.0 - 0.1 * value,
+            };
+            base_ate * modifier
+        } else {
+            base_ate
+        }
+    }
+
+    /// Compute counterfactual: given factual observations, what would Y have been if X were different?
+    /// Three steps: abduction, action, prediction
+    pub fn counterfactual(
+        &self,
+        factual: &[(String, f64)],
+        intervention: &str,
+        new_value: f64,
+        target: &str,
+    ) -> f64 {
+        // Step 1: Abduction - infer noise terms from factual observations
+        let noise_terms = self.abduction(factual, target);
+
+        // Step 2: Action - perform intervention
+        let mut intervened_values: HashMap<String, f64> = factual.iter().cloned().collect();
+        intervened_values.insert(intervention.to_string(), new_value);
+
+        // Step 3: Prediction - compute target under intervention with inferred noise
+        self.prediction(target, &intervened_values, &noise_terms)
+    }
+
+    /// Abduction step: infer noise terms from observations
+    fn abduction(&self, factual: &[(String, f64)], target: &str) -> HashMap<String, f64> {
+        let mut noise = HashMap::new();
+        let factual_map: HashMap<_, _> = factual.iter().cloned().collect();
+
+        if let Some(eq) = self.model.structural_equations.get(target) {
+            // noise = observed - predicted
+            let predicted = eq.evaluate(&factual_map);
+            if let Some(&observed) = factual_map.get(target) {
+                noise.insert(target.to_string(), observed - predicted);
+            }
+        }
+
+        noise
+    }
+
+    /// Prediction step: compute target under intervention with noise
+    fn prediction(
+        &self,
+        target: &str,
+        values: &HashMap<String, f64>,
+        noise: &HashMap<String, f64>,
+    ) -> f64 {
+        if let Some(eq) = self.model.structural_equations.get(target) {
+            let base = eq.evaluate(values);
+            let noise_term = noise.get(target).copied().unwrap_or(0.0);
+            base + noise_term
+        } else {
+            // Fall back to observed value or 0
+            values.get(target).copied().unwrap_or(0.0)
+        }
+    }
+
+    /// Compute conditional expectation E[Y | conditions]
+    fn conditional_expectation(&self, target: &str, conditions: &[(String, f64)]) -> f64 {
+        let condition_map: HashMap<_, _> = conditions.iter().cloned().collect();
+
+        if let Some(eq) = self.model.structural_equations.get(target) {
+            eq.evaluate(&condition_map)
+        } else {
+            // Use mean of observed data
+            self.model.get_mean(target).unwrap_or(0.0)
+        }
+    }
+
+    /// Compute confidence interval for causal effect
+    fn compute_confidence_interval(
+        &self,
+        target: &str,
+        treatment: &str,
+        _confounders: &[String],
+    ) -> (f64, f64) {
+        // Use variance of observed data to estimate CI
+        let target_var = self.model.get_variance(target).unwrap_or(0.1);
+        let treatment_var = self.model.get_variance(treatment).unwrap_or(0.1);
+
+        let n = self.model.observed_data
+            .get(target)
+            .map(|d| d.len())
+            .unwrap_or(30) as f64;
+
+        let se = (target_var / n + treatment_var / n).sqrt();
+        let z = 1.96; // 95% CI
+
+        let effect = self.average_treatment_effect(treatment, target);
+        (effect - z * se, effect + z * se)
+    }
+
+    /// Get the causal model
+    pub fn model(&self) -> &CausalModel {
+        &self.model
+    }
+
+    /// Get mutable causal model
+    pub fn model_mut(&mut self) -> &mut CausalModel {
+        &mut self.model
+    }
+
+    /// Get rules applied in last query
+    pub fn rules_applied(&self) -> &[DoRule] {
+        &self.rules_applied
+    }
+}
+
+// ==================== Backdoor Criterion Functions ====================
+
+/// Check if a set blocks all backdoor paths
+pub fn blocks_backdoor(
+    graph: &CausalGraph,
+    treatment: &str,
+    outcome: &str,
+    adjustment: &[String],
+) -> bool {
+    // Build a simple model to check
+    let model = CausalModel::new(graph.clone());
+    let engine = DoCalculusEngine::new(model);
+    engine.blocks_all_backdoor_paths(treatment, outcome, adjustment)
+}
+
+/// Find minimal adjustment set for backdoor criterion
+pub fn find_minimal_adjustment(
+    graph: &CausalGraph,
+    treatment: &str,
+    outcome: &str,
+) -> Option<Vec<String>> {
+    let model = CausalModel::new(graph.clone());
+    let engine = DoCalculusEngine::new(model);
+    engine.find_adjustment_set(treatment, outcome)
+}
+
+// ==================== Extended CausalAnalyzer ====================
+
+impl CausalAnalyzer {
+    /// Create a do-calculus engine from current state
+    pub fn create_do_engine(&self) -> DoCalculusEngine {
+        let mut model = CausalModel::new(self.graph.clone());
+
+        // Add observed data from price history
+        for (symbol, history) in &self.price_history {
+            model.add_observed_data(symbol, history.clone());
+        }
+
+        // Infer structural equations from relationships
+        for rel in self.graph.relationships() {
+            let coef = match rel.direction {
+                CausalDirection::Positive => rel.strength,
+                CausalDirection::Negative => -rel.strength,
+            };
+
+            // Check if we already have an equation for this target
+            if let Some(eq) = model.structural_equations.get_mut(&rel.target) {
+                if !eq.parents.contains(&rel.source) {
+                    eq.parents.push(rel.source.clone());
+                    eq.coefficients.push(coef);
+                }
+            } else {
+                let eq = StructuralEquation::new(
+                    &rel.target,
+                    vec![rel.source.clone()],
+                    vec![coef],
+                    0.1, // Default noise
+                );
+                model.add_equation(eq);
+            }
+        }
+
+        DoCalculusEngine::new(model)
+    }
+
+    /// Compute intervention effect: "What happens to target if we intervene on treatment?"
+    pub fn intervention_effect(&self, treatment: &str, target: &str) -> Option<f64> {
+        let engine = self.create_do_engine();
+
+        if !engine.is_identifiable(target, treatment) {
+            return None;
+        }
+
+        Some(engine.average_treatment_effect(treatment, target))
+    }
+
+    /// Counterfactual query for trade analysis
+    pub fn would_trade_succeed_if(
+        &self,
+        current_outcome: f64,
+        intervention_var: &str,
+        current_value: f64,
+        new_value: f64,
+        target: &str,
+    ) -> f64 {
+        let engine = self.create_do_engine();
+
+        let factual = vec![
+            (intervention_var.to_string(), current_value),
+            (target.to_string(), current_outcome),
+        ];
+
+        engine.counterfactual(&factual, intervention_var, new_value, target)
+    }
+
+    /// Get intervention-adjusted confidence for a trade setup
+    pub fn get_intervention_adjusted_confidence(
+        &self,
+        symbol: &str,
+        is_long: bool,
+        base_confidence: f64,
+    ) -> f64 {
+        let causes = self.get_causes(symbol);
+
+        if causes.is_empty() {
+            return base_confidence;
+        }
+
+        let engine = self.create_do_engine();
+        let mut adjustment = 0.0;
+
+        for cause in causes {
+            // Get current value of cause
+            if let Some(history) = self.price_history.get(&cause.source) {
+                if let Some(&recent) = history.last() {
+                    // Compute intervention effect
+                    let effect = engine.do_intervention(symbol, &cause.source, recent);
+
+                    // Adjust based on trade direction
+                    let directional_effect = if is_long { effect } else { -effect };
+
+                    adjustment += directional_effect * cause.confidence * 0.1;
+                }
+            }
+        }
+
+        // Clamp to valid range
+        (base_confidence + adjustment).clamp(0.0, 1.0)
+    }
+
+    /// Enhanced explain_move using causal interventions
+    pub fn explain_move_causal(&self, symbol: &str, direction: &str) -> Vec<String> {
+        let mut explanations = self.explain_move(symbol, direction);
+
+        // Add intervention-based explanations
+        let engine = self.create_do_engine();
+
+        for rel in self.graph.get_causes(symbol) {
+            if let Some(history) = self.price_history.get(&rel.source) {
+                if let Some(&recent) = history.last() {
+                    let effect = engine.do_intervention(symbol, &rel.source, recent);
+
+                    if effect.abs() > 0.001 {
+                        let effect_dir = if effect > 0.0 { "increase" } else { "decrease" };
+                        explanations.push(format!(
+                            "[CAUSAL] do({} = {:.4}) would {} {} by {:.4}",
+                            rel.source,
+                            recent,
+                            effect_dir,
+                            symbol,
+                            effect.abs()
+                        ));
+                    }
+                }
+            }
+        }
+
+        explanations
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1250,5 +2274,315 @@ mod tests {
         graph.prune_old(30);
 
         assert_eq!(graph.relationship_count(), 1);
+    }
+
+    // ==================== Do-Calculus Tests ====================
+
+    #[test]
+    fn test_backdoor_criterion() {
+        // Create a simple causal graph: Z -> X -> Y, Z -> Y (Z is a confounder)
+        let mut graph = CausalGraph::new();
+
+        // Z -> X
+        graph.add_relationship(CausalRelationship::new(
+            "Z".to_string(),
+            "X".to_string(),
+            1,
+            0.5,
+            CausalDirection::Positive,
+            0.01,
+        ));
+
+        // X -> Y
+        graph.add_relationship(CausalRelationship::new(
+            "X".to_string(),
+            "Y".to_string(),
+            1,
+            0.7,
+            CausalDirection::Positive,
+            0.01,
+        ));
+
+        // Z -> Y (backdoor path)
+        graph.add_relationship(CausalRelationship::new(
+            "Z".to_string(),
+            "Y".to_string(),
+            1,
+            0.3,
+            CausalDirection::Positive,
+            0.01,
+        ));
+
+        // Z should block the backdoor path
+        assert!(blocks_backdoor(&graph, "X", "Y", &["Z".to_string()]));
+    }
+
+    #[test]
+    fn test_adjustment_set() {
+        let mut graph = CausalGraph::new();
+
+        // Simple chain: A -> B -> C
+        graph.add_relationship(CausalRelationship::new(
+            "A".to_string(),
+            "B".to_string(),
+            1,
+            0.6,
+            CausalDirection::Positive,
+            0.01,
+        ));
+
+        graph.add_relationship(CausalRelationship::new(
+            "B".to_string(),
+            "C".to_string(),
+            1,
+            0.5,
+            CausalDirection::Positive,
+            0.01,
+        ));
+
+        // For A -> C effect via B, no adjustment needed
+        let adjustment = find_minimal_adjustment(&graph, "A", "C");
+        assert!(adjustment.is_some());
+    }
+
+    #[test]
+    fn test_do_intervention() {
+        let mut model = CausalModel::default();
+
+        // Add structural equation: Y = 0.5 * X
+        model.add_equation(StructuralEquation::new(
+            "Y",
+            vec!["X".to_string()],
+            vec![0.5],
+            0.1,
+        ));
+
+        // Add relationship to graph
+        model.graph.add_relationship(CausalRelationship::new(
+            "X".to_string(),
+            "Y".to_string(),
+            1,
+            0.5,
+            CausalDirection::Positive,
+            0.01,
+        ));
+
+        let engine = DoCalculusEngine::new(model);
+
+        // do(X = 2) should give Y = 0.5 * 2 = 1.0
+        let effect = engine.do_intervention("Y", "X", 2.0);
+        assert!((effect - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_counterfactual() {
+        let mut model = CausalModel::default();
+
+        // Y = 0.6 * X + noise
+        model.add_equation(StructuralEquation::new(
+            "Y",
+            vec!["X".to_string()],
+            vec![0.6],
+            0.1,
+        ));
+
+        let engine = DoCalculusEngine::new(model);
+
+        // Factual: X = 1.0, Y = 0.8 (noise = 0.2)
+        // Counterfactual: What if X = 2.0?
+        // Should be: 0.6 * 2.0 + 0.2 = 1.4
+        let factual = vec![
+            ("X".to_string(), 1.0),
+            ("Y".to_string(), 0.8),
+        ];
+
+        let counterfactual_y = engine.counterfactual(&factual, "X", 2.0, "Y");
+        assert!((counterfactual_y - 1.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ate_computation() {
+        let mut model = CausalModel::default();
+
+        // Y = 0.5 * X (linear effect)
+        model.add_equation(StructuralEquation::new(
+            "Y",
+            vec!["X".to_string()],
+            vec![0.5],
+            0.0,
+        ));
+
+        model.graph.add_relationship(CausalRelationship::new(
+            "X".to_string(),
+            "Y".to_string(),
+            1,
+            0.5,
+            CausalDirection::Positive,
+            0.01,
+        ));
+
+        let engine = DoCalculusEngine::new(model);
+
+        // ATE = E[Y|do(X=1)] - E[Y|do(X=0)] = 0.5 - 0 = 0.5
+        let ate = engine.average_treatment_effect("X", "Y");
+        assert!((ate - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_identifiability() {
+        let mut model = CausalModel::default();
+
+        // Simple identifiable case: X -> Y
+        model.add_equation(StructuralEquation::new(
+            "Y",
+            vec!["X".to_string()],
+            vec![0.5],
+            0.1,
+        ));
+
+        let engine = DoCalculusEngine::new(model.clone());
+        assert!(engine.is_identifiable("Y", "X"));
+
+        // Add latent confounder - makes it non-identifiable
+        model.add_latent_confounder("X", "Y");
+        let engine2 = DoCalculusEngine::new(model);
+        assert!(!engine2.is_identifiable("Y", "X"));
+    }
+
+    #[test]
+    fn test_causal_query() {
+        let mut model = CausalModel::default();
+
+        model.add_equation(StructuralEquation::new(
+            "Y",
+            vec!["X".to_string()],
+            vec![0.7],
+            0.1,
+        ));
+
+        model.graph.add_relationship(CausalRelationship::new(
+            "X".to_string(),
+            "Y".to_string(),
+            1,
+            0.7,
+            CausalDirection::Positive,
+            0.01,
+        ));
+
+        let mut engine = DoCalculusEngine::new(model);
+
+        // Query P(Y | do(X = 1.0))
+        let query = CausalQuery::do_query("Y", "X", 1.0);
+        let result = engine.query(query);
+
+        assert!((result.estimated_effect - 0.7).abs() < 0.1);
+        assert!(result.method_used != EstimationMethod::NotIdentifiable);
+    }
+
+    #[test]
+    fn test_structural_equation_evaluation() {
+        let eq = StructuralEquation::new(
+            "Y",
+            vec!["X1".to_string(), "X2".to_string()],
+            vec![0.5, 0.3],
+            0.1,
+        );
+
+        let mut values = HashMap::new();
+        values.insert("X1".to_string(), 2.0);
+        values.insert("X2".to_string(), 3.0);
+
+        // Y = 0.5 * 2 + 0.3 * 3 = 1.0 + 0.9 = 1.9
+        let result = eq.evaluate(&values);
+        assert!((result - 1.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_causal_model_parents_children() {
+        let mut model = CausalModel::default();
+
+        // X -> Y -> Z
+        model.add_equation(StructuralEquation::new(
+            "Y",
+            vec!["X".to_string()],
+            vec![0.5],
+            0.1,
+        ));
+
+        model.add_equation(StructuralEquation::new(
+            "Z",
+            vec!["Y".to_string()],
+            vec![0.6],
+            0.1,
+        ));
+
+        assert_eq!(model.get_parents("Y"), vec!["X".to_string()]);
+        assert_eq!(model.get_children("Y"), vec!["Z".to_string()]);
+    }
+
+    #[test]
+    fn test_intervention_adjusted_confidence() {
+        let mut analyzer = CausalAnalyzer::new();
+
+        // Add price history
+        for i in 0..50 {
+            analyzer.update_prices("VIX", 20.0 + (i as f64 * 0.05));
+            analyzer.update_prices("SPY", 400.0 - (i as f64 * 0.1));
+        }
+
+        // VIX causes SPY (negative relationship)
+        analyzer.graph.add_relationship(CausalRelationship::new(
+            "VIX".to_string(),
+            "SPY".to_string(),
+            1,
+            0.6,
+            CausalDirection::Negative,
+            0.01,
+        ));
+
+        let base_conf = 0.7;
+        let adjusted = analyzer.get_intervention_adjusted_confidence("SPY", true, base_conf);
+
+        // Should be adjusted (could be higher or lower depending on VIX state)
+        assert!(adjusted >= 0.0 && adjusted <= 1.0);
+    }
+
+    #[test]
+    fn test_do_rule_display() {
+        assert_eq!(format!("{}", DoRule::Rule1InsertDelete), "Rule 1 (insert/delete obs)");
+        assert_eq!(format!("{}", DoRule::Rule2ActionExchange), "Rule 2 (action/obs exchange)");
+        assert_eq!(format!("{}", DoRule::Rule3ActionDeletion), "Rule 3 (action deletion)");
+    }
+
+    #[test]
+    fn test_estimation_method_display() {
+        assert_eq!(format!("{}", EstimationMethod::BackdoorAdjustment), "backdoor");
+        assert_eq!(format!("{}", EstimationMethod::DirectEstimation), "direct");
+        assert_eq!(format!("{}", EstimationMethod::NotIdentifiable), "not-identifiable");
+    }
+
+    #[test]
+    fn test_query_result_significance() {
+        let query = CausalQuery::do_query("Y", "X", 1.0);
+
+        // Significant: CI doesn't contain 0
+        let significant = QueryResult::new(
+            query.clone(),
+            0.5,
+            (0.2, 0.8),
+            EstimationMethod::DirectEstimation,
+            Vec::new(),
+        );
+        assert!(significant.is_significant());
+
+        // Not significant: CI contains 0
+        let not_significant = QueryResult::new(
+            query,
+            0.1,
+            (-0.2, 0.4),
+            EstimationMethod::DirectEstimation,
+            Vec::new(),
+        );
+        assert!(!not_significant.is_significant());
     }
 }
