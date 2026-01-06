@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -44,6 +44,7 @@ const TRANSFER_PATH: &str = "sovereign_transfer.json";
 const MOE_PATH: &str = "sovereign_moe.json";
 const META_PATH: &str = "sovereign_meta.json";
 const WEAKNESS_PATH: &str = "sovereign_weakness.json";
+const CAUSALITY_PATH: &str = "sovereign_causality.json";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -109,6 +110,16 @@ fn save_weakness(weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>) {
         warn!("Failed to save WeaknessAnalyzer: {}", e);
     } else {
         info!("Weakness: Saved - {} weaknesses identified", wa.weakness_count());
+    }
+}
+
+/// Save CausalAnalyzer state
+fn save_causality(causal_analyzer: &Arc<Mutex<CausalAnalyzer>>) {
+    let ca = causal_analyzer.lock().unwrap();
+    if let Err(e) = ca.save(CAUSALITY_PATH) {
+        warn!("Failed to save CausalAnalyzer: {}", e);
+    } else {
+        info!("Causal: Saved - {}", ca.format_summary());
     }
 }
 
@@ -386,6 +397,18 @@ async fn main() -> Result<()> {
         agent.attach_weakness_analyzer(Arc::clone(&weakness_analyzer));
     }
 
+    // Load CausalAnalyzer for understanding market relationships
+    let causal_analyzer = Arc::new(Mutex::new(CausalAnalyzer::load_or_new(CAUSALITY_PATH)));
+    {
+        let ca = causal_analyzer.lock().unwrap();
+        info!("Causal: Loaded - {}", ca.format_summary());
+    }
+
+    // Attach CausalAnalyzer to all agents
+    for agent in agents.values_mut() {
+        agent.attach_causal_analyzer(Arc::clone(&causal_analyzer));
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -437,6 +460,7 @@ async fn main() -> Result<()> {
                 &transfer_manager,
                 &meta_learner,
                 &weakness_analyzer,
+                &causal_analyzer,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -452,6 +476,7 @@ async fn main() -> Result<()> {
                 &transfer_manager,
                 &meta_learner,
                 &weakness_analyzer,
+                &causal_analyzer,
             ).await
         }
     }
@@ -569,6 +594,7 @@ async fn run_alpaca_loop(
     transfer_manager: &Arc<Mutex<TransferManager>>,
     meta_learner: &Arc<Mutex<MetaLearner>>,
     weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
+    causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -671,12 +697,13 @@ async fn run_alpaca_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, MoE, MetaLearner, and WeaknessAnalyzer
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, and CausalAnalyzer
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
                 save_meta(meta_learner);
                 save_weakness(weakness_analyzer);
+                save_causality(causal_analyzer);
 
                 // Run periodic weakness analysis on trade history
                 {
@@ -690,6 +717,20 @@ async fn run_alpaca_loop(
                             info!("  - {:?}: {:.1}% severity - {}", w.weakness_type, w.severity * 100.0, w.suggested_action);
                         }
                     }
+                }
+
+                // Run weekly causal discovery on Sundays
+                if now.weekday() == Weekday::Sun {
+                    let mut ca = causal_analyzer.lock().unwrap();
+                    let new_relationships = ca.discover_relationships();
+                    if !new_relationships.is_empty() {
+                        info!("[CAUSAL] Discovered {} new relationships:", new_relationships.len());
+                        for rel in new_relationships.iter().take(5) {
+                            info!("  - {}", rel.description());
+                        }
+                    }
+                    // Prune old relationships (older than 90 days)
+                    ca.graph_mut().prune_old(90);
                 }
 
                 if telegram_enabled {
@@ -723,6 +764,7 @@ async fn run_ibkr_loop(
     transfer_manager: &Arc<Mutex<TransferManager>>,
     meta_learner: &Arc<Mutex<MetaLearner>>,
     weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
+    causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -802,12 +844,13 @@ async fn run_ibkr_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights, transfer state, MoE, MetaLearner, and WeaknessAnalyzer
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, and CausalAnalyzer
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
                 save_meta(meta_learner);
                 save_weakness(weakness_analyzer);
+                save_causality(causal_analyzer);
 
                 // Run periodic weakness analysis on trade history
                 {
@@ -819,6 +862,20 @@ async fn run_ibkr_loop(
                             info!("  - {:?}: {:.1}% severity - {}", w.weakness_type, w.severity * 100.0, w.suggested_action);
                         }
                     }
+                }
+
+                // Run weekly causal discovery on Sundays
+                if now.weekday() == Weekday::Sun {
+                    let mut ca = causal_analyzer.lock().unwrap();
+                    let new_relationships = ca.discover_relationships();
+                    if !new_relationships.is_empty() {
+                        info!("[CAUSAL] Discovered {} new relationships:", new_relationships.len());
+                        for rel in new_relationships.iter().take(5) {
+                            info!("  - {}", rel.description());
+                        }
+                    }
+                    // Prune old relationships (older than 90 days)
+                    ca.graph_mut().prune_old(90);
                 }
 
                 if telegram_enabled {

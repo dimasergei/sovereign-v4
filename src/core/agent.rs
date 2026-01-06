@@ -31,6 +31,7 @@ use super::transfer::TransferManager;
 use super::moe::MixtureOfExperts;
 use super::metalearner::{MetaLearner, calculate_accuracy};
 use super::weakness::WeaknessAnalyzer;
+use super::causality::CausalAnalyzer;
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -189,6 +190,10 @@ pub struct SymbolAgent {
     // Weakness identification and improvement
     /// Shared weakness analyzer for self-improvement
     weakness_analyzer: Option<Arc<Mutex<WeaknessAnalyzer>>>,
+
+    // Causal reasoning
+    /// Shared causal analyzer for understanding market relationships
+    causal_analyzer: Option<Arc<Mutex<CausalAnalyzer>>>,
 }
 
 impl SymbolAgent {
@@ -227,6 +232,7 @@ impl SymbolAgent {
             trades_in_current_regime: Vec::new(),
             meta_adaptation_threshold: 10,
             weakness_analyzer: None,
+            causal_analyzer: None,
         }
     }
 
@@ -259,6 +265,7 @@ impl SymbolAgent {
             trades_in_current_regime: Vec::new(),
             meta_adaptation_threshold: 10,
             weakness_analyzer: None,
+            causal_analyzer: None,
         }
     }
 
@@ -296,6 +303,7 @@ impl SymbolAgent {
             trades_in_current_regime: Vec::new(),
             meta_adaptation_threshold: 10,
             weakness_analyzer: None,
+            causal_analyzer: None,
         }
     }
 
@@ -325,6 +333,7 @@ impl SymbolAgent {
             trades_in_current_regime: Vec::new(),
             meta_adaptation_threshold: 10,
             weakness_analyzer: None,
+            causal_analyzer: None,
         }
     }
 
@@ -1481,6 +1490,66 @@ impl SymbolAgent {
         let regime = self.regime_detector.current_regime();
 
         wa_lock.get_position_size_multiplier(&regime, &self.symbol)
+    }
+
+    // ==================== Causal Analyzer Methods ====================
+
+    /// Attach causal analyzer for understanding market relationships
+    pub fn attach_causal_analyzer(&mut self, ca: Arc<Mutex<CausalAnalyzer>>) {
+        self.causal_analyzer = Some(ca);
+    }
+
+    /// Check if causal analyzer is attached
+    pub fn has_causal_analyzer(&self) -> bool {
+        self.causal_analyzer.is_some()
+    }
+
+    /// Get reference to causal analyzer
+    pub fn causal_analyzer(&self) -> Option<&Arc<Mutex<CausalAnalyzer>>> {
+        self.causal_analyzer.as_ref()
+    }
+
+    /// Update causal analyzer with current price
+    pub fn update_causal_prices(&self, price: f64) {
+        if let Some(ref ca) = self.causal_analyzer {
+            let mut ca_lock = ca.lock().unwrap();
+            ca_lock.update_prices(&self.symbol, price);
+        }
+    }
+
+    /// Get causal context for logging/debugging
+    pub fn get_causal_context(&self) -> String {
+        let Some(ref ca) = self.causal_analyzer else {
+            return format!("{}: no causal analyzer", self.symbol);
+        };
+
+        let ca_lock = ca.lock().unwrap();
+        ca_lock.get_causal_context(&self.symbol)
+    }
+
+    /// Get confidence adjustment based on causal alignment
+    ///
+    /// Returns a value in [-0.15, +0.15] to adjust confidence:
+    /// - Positive if leading indicators agree with trade direction
+    /// - Negative if leading indicators disagree
+    /// - Zero if no causal information available
+    pub fn get_causal_confidence_adjustment(&self, is_long: bool) -> f64 {
+        let Some(ref ca) = self.causal_analyzer else {
+            return 0.0;
+        };
+
+        let ca_lock = ca.lock().unwrap();
+        ca_lock.get_causal_confidence_adjustment(&self.symbol, is_long)
+    }
+
+    /// Get predicted regime from causal factors
+    pub fn predict_regime_from_causes(&self) -> Option<Regime> {
+        let Some(ref ca) = self.causal_analyzer else {
+            return None;
+        };
+
+        let ca_lock = ca.lock().unwrap();
+        ca_lock.predict_regime_from_causes(&self.symbol)
     }
 }
 
