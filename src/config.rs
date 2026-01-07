@@ -82,10 +82,19 @@ pub struct AlpacaConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct IbkrConfig {
+    /// Connection mode: "gateway" (REST API) or "tws" (Socket API)
+    #[serde(default = "default_connection_mode")]
+    pub connection_mode: String,
+    /// Gateway URL for REST API mode (e.g., "https://localhost:5000")
     #[serde(default)]
     pub gateway_url: String,
+    /// Account ID (e.g., "DU1234567")
     #[serde(default)]
     pub account_id: String,
+}
+
+fn default_connection_mode() -> String {
+    "gateway".to_string()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -342,6 +351,47 @@ impl Config {
 
     pub fn get_ibkr_client_id(&self) -> i32 {
         self.broker.client_id.unwrap_or(1)
+    }
+
+    /// Check if IBKR is in TWS socket mode
+    pub fn is_ibkr_tws_mode(&self) -> bool {
+        if let Some(ibkr) = &self.ibkr {
+            ibkr.connection_mode == "tws"
+        } else {
+            false
+        }
+    }
+
+    /// Check if IBKR is in Gateway REST mode
+    pub fn is_ibkr_gateway_mode(&self) -> bool {
+        if let Some(ibkr) = &self.ibkr {
+            ibkr.connection_mode == "gateway" || ibkr.connection_mode.is_empty()
+        } else {
+            // Default to gateway mode if no ibkr config
+            true
+        }
+    }
+
+    /// Get IBKR account ID
+    pub fn get_ibkr_account_id(&self) -> String {
+        if let Some(ibkr) = &self.ibkr {
+            ibkr.account_id.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Get IBKR gateway URL
+    pub fn get_ibkr_gateway_url(&self) -> String {
+        if let Some(ibkr) = &self.ibkr {
+            if ibkr.gateway_url.is_empty() {
+                "https://localhost:5000".to_string()
+            } else {
+                ibkr.gateway_url.clone()
+            }
+        } else {
+            "https://localhost:5000".to_string()
+        }
     }
 }
 

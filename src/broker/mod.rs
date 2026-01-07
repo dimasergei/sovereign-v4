@@ -1,10 +1,11 @@
 //! Broker Module
 //!
-//! Broker integrations: IBKR, Alpaca, and Prime Broker (FIX).
+//! Broker integrations: IBKR (REST & TWS), Alpaca, and Prime Broker (FIX).
 
 pub mod alpaca;
 pub mod ibkr;
 pub mod prime_broker;
+pub mod tws;
 
 use rust_decimal::Decimal;
 use async_trait::async_trait;
