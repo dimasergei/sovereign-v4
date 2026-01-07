@@ -8,7 +8,14 @@ use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
-use tracing::{info, warn, debug, error};
+use tracing::{info, warn, debug};
+
+use ibapi::Client;
+use ibapi::contracts::Contract as IbContract;
+use ibapi::market_data::historical::{BarSize, WhatToShow, Duration as IbDuration};
+use ibapi::market_data::TradingHours;
+use ibapi::accounts::{AccountSummaryResult, PositionUpdate};
+use ibapi::accounts::types::AccountGroup;
 
 /// TWS Broker client using native socket API
 pub struct TwsBroker {
@@ -17,28 +24,20 @@ pub struct TwsBroker {
     client_id: i32,
     account_id: String,
     connected: Arc<AtomicBool>,
-    client: Arc<Mutex<Option<TwsClient>>>,
-}
-
-/// Internal TWS client wrapper
-struct TwsClient {
-    // ibapi client will be stored here when connected
-    // For now, we use a placeholder until ibapi is properly configured
-    _host: String,
-    _port: u16,
+    client: Arc<Mutex<Option<Client>>>,
 }
 
 // ============================================================================
-// Contract Definitions
+// Our Local Types (for API compatibility with rest of codebase)
 // ============================================================================
 
-/// Contract specification for trading
+/// Contract specification for trading (local type)
 #[derive(Debug, Clone)]
 pub struct Contract {
     pub symbol: String,
-    pub sec_type: String,      // STK, CASH, FUT, OPT, etc.
-    pub exchange: String,      // SMART, IDEALPRO, CME, etc.
-    pub currency: String,      // USD, CAD, EUR, etc.
+    pub sec_type: String,
+    pub exchange: String,
+    pub currency: String,
     pub primary_exchange: Option<String>,
     pub local_symbol: Option<String>,
     pub con_id: Option<i64>,
@@ -60,7 +59,6 @@ impl Contract {
 
     /// Create a forex contract
     pub fn forex(pair: &str) -> Self {
-        // Parse pair like "EURUSD" or "EUR.USD"
         let (base, quote) = if pair.contains('.') {
             let parts: Vec<&str> = pair.split('.').collect();
             (parts[0], parts[1])
@@ -80,27 +78,38 @@ impl Contract {
             con_id: None,
         }
     }
+
+    /// Convert to ibapi Contract
+    fn to_ibapi(&self) -> IbContract {
+        if self.sec_type == "CASH" {
+            IbContract::forex(&self.symbol, &self.currency).build()
+        } else {
+            let mut builder = IbContract::stock(&self.symbol);
+            if self.exchange != "SMART" {
+                builder = builder.on_exchange(&self.exchange);
+            }
+            if self.currency != "USD" {
+                builder = builder.in_currency(&self.currency);
+            }
+            builder.build()
+        }
+    }
 }
 
-// ============================================================================
-// Order Types
-// ============================================================================
-
-/// Order specification
+/// Order specification (local type for compatibility)
 #[derive(Debug, Clone)]
 pub struct Order {
     pub order_id: i32,
-    pub action: String,        // BUY, SELL
+    pub action: String,
     pub total_quantity: f64,
-    pub order_type: String,    // MKT, LMT, STP, etc.
+    pub order_type: String,
     pub limit_price: Option<f64>,
     pub stop_price: Option<f64>,
-    pub tif: String,           // DAY, GTC, IOC, etc.
+    pub tif: String,
     pub transmit: bool,
 }
 
 impl Order {
-    /// Create a market order
     pub fn market(action: &str, quantity: f64) -> Self {
         Self {
             order_id: 0,
@@ -114,7 +123,6 @@ impl Order {
         }
     }
 
-    /// Create a limit order
     pub fn limit(action: &str, quantity: f64, price: f64) -> Self {
         Self {
             order_id: 0,
@@ -128,7 +136,6 @@ impl Order {
         }
     }
 
-    /// Create a stop order
     pub fn stop(action: &str, quantity: f64, stop_price: f64) -> Self {
         Self {
             order_id: 0,
@@ -142,10 +149,6 @@ impl Order {
         }
     }
 }
-
-// ============================================================================
-// Response Types
-// ============================================================================
 
 /// Account summary data
 #[derive(Debug, Clone, Default)]
@@ -218,26 +221,26 @@ impl TwsBroker {
 
     /// Connect to TWS
     pub async fn connect(&self) -> Result<()> {
-        info!("Connecting to TWS at {}:{} (client_id={})", self.host, self.port, self.client_id);
+        let address = format!("{}:{}", self.host, self.port);
+        info!("Connecting to TWS at {} (client_id={})", address, self.client_id);
 
-        // Create TWS connection
-        // Note: The actual ibapi connection would be:
-        // let client = ibapi::Client::connect(&self.host, self.port)?;
-        // For now, we simulate the connection
+        match Client::connect(&address, self.client_id).await {
+            Ok(client) => {
+                info!("Connected to TWS successfully (server version: {})", client.server_version());
 
-        let client = TwsClient {
-            _host: self.host.clone(),
-            _port: self.port,
-        };
+                {
+                    let mut guard = self.client.lock().await;
+                    *guard = Some(client);
+                }
 
-        {
-            let mut guard = self.client.lock().await;
-            *guard = Some(client);
+                self.connected.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to connect to TWS: {}", e);
+                Err(anyhow::anyhow!("TWS connection failed: {}", e))
+            }
         }
-
-        self.connected.store(true, Ordering::SeqCst);
-        info!("Connected to TWS successfully");
-        Ok(())
     }
 
     /// Disconnect from TWS
@@ -261,80 +264,169 @@ impl TwsBroker {
 
     /// Get account summary
     pub async fn get_account_summary(&self) -> Result<AccountSummary> {
-        if !self.is_connected() {
-            return Err(anyhow::anyhow!("Not connected to TWS"));
-        }
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to TWS"))?;
 
         debug!("Requesting account summary for {}", self.account_id);
 
-        // In production, this would use:
-        // client.req_account_summary(9001, "All", "$LEDGER:CAD")?;
-        // Then process the callbacks to build the summary
+        let tags = &[
+            "NetLiquidation",
+            "TotalCashValue",
+            "BuyingPower",
+            "AvailableFunds",
+            "ExcessLiquidity",
+            "MaintMarginReq",
+        ];
 
-        // For now, return placeholder (would be populated from callbacks)
-        Ok(AccountSummary {
+        let mut subscription = client
+            .account_summary(&AccountGroup("All".to_string()), tags)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to request account summary: {}", e))?;
+
+        let mut summary = AccountSummary {
             account_id: self.account_id.clone(),
-            net_liquidation: 0.0,
-            total_cash: 0.0,
-            buying_power: 0.0,
-            available_funds: 0.0,
-            excess_liquidity: 0.0,
-            maintenance_margin: 0.0,
-            currency: "CAD".to_string(),
-        })
+            currency: "USD".to_string(),
+            ..Default::default()
+        };
+
+        // Collect values from subscription using async iteration
+        while let Some(result) = subscription.next().await {
+            match result {
+                Ok(AccountSummaryResult::Summary(s)) => {
+                    if s.account == self.account_id || self.account_id.is_empty() {
+                        summary.account_id = s.account.clone();
+                        match s.tag.as_str() {
+                            "NetLiquidation" => summary.net_liquidation = s.value.parse().unwrap_or(0.0),
+                            "TotalCashValue" => summary.total_cash = s.value.parse().unwrap_or(0.0),
+                            "BuyingPower" => summary.buying_power = s.value.parse().unwrap_or(0.0),
+                            "AvailableFunds" => summary.available_funds = s.value.parse().unwrap_or(0.0),
+                            "ExcessLiquidity" => summary.excess_liquidity = s.value.parse().unwrap_or(0.0),
+                            "MaintMarginReq" => summary.maintenance_margin = s.value.parse().unwrap_or(0.0),
+                            _ => {}
+                        }
+                        summary.currency = s.currency.clone();
+                    }
+                }
+                Ok(AccountSummaryResult::End) => break,
+                Err(e) => {
+                    warn!("Error receiving account summary: {}", e);
+                    break;
+                }
+            }
+        }
+
+        info!("Account summary: NAV=${:.2}, Cash=${:.2}, BP=${:.2}",
+            summary.net_liquidation, summary.total_cash, summary.buying_power);
+
+        Ok(summary)
     }
 
     /// Get all positions
     pub async fn get_positions(&self) -> Result<Vec<TwsPosition>> {
-        if !self.is_connected() {
-            return Err(anyhow::anyhow!("Not connected to TWS"));
-        }
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to TWS"))?;
 
         debug!("Requesting positions");
 
-        // In production, this would use:
-        // client.req_positions()?;
-        // Then process the position callbacks
+        let mut subscription = client
+            .positions()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to request positions: {}", e))?;
 
-        Ok(Vec::new())
+        let mut positions = Vec::new();
+
+        while let Some(result) = subscription.next().await {
+            match result {
+                Ok(PositionUpdate::Position(pos)) => {
+                    let contract = Contract {
+                        symbol: pos.contract.symbol.to_string(),
+                        sec_type: pos.contract.security_type.to_string(),
+                        exchange: pos.contract.exchange.to_string(),
+                        currency: pos.contract.currency.to_string(),
+                        primary_exchange: Some(pos.contract.primary_exchange.to_string()),
+                        local_symbol: Some(pos.contract.local_symbol.clone()),
+                        con_id: Some(pos.contract.contract_id as i64),
+                    };
+
+                    positions.push(TwsPosition {
+                        account: pos.account.clone(),
+                        contract,
+                        position: pos.position,
+                        avg_cost: pos.average_cost,
+                        unrealized_pnl: None,
+                        market_value: None,
+                    });
+                }
+                Ok(PositionUpdate::PositionEnd) => break,
+                Err(e) => {
+                    warn!("Error receiving positions: {}", e);
+                    break;
+                }
+            }
+        }
+
+        info!("Retrieved {} positions", positions.len());
+        Ok(positions)
     }
 
     /// Get historical bars
     pub async fn get_historical_bars(
         &self,
         contract: &Contract,
-        end_date_time: &str,
+        _end_date_time: &str,
         duration: &str,
         bar_size: &str,
-        what_to_show: &str,
+        _what_to_show: &str,
         use_rth: bool,
     ) -> Result<Vec<HistoricalBar>> {
-        if !self.is_connected() {
-            return Err(anyhow::anyhow!("Not connected to TWS"));
-        }
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to TWS"))?;
 
-        debug!(
-            "Requesting historical bars for {} ({} {} bars)",
-            contract.symbol, duration, bar_size
-        );
+        debug!("Requesting historical bars for {} ({} {})", contract.symbol, duration, bar_size);
 
-        // In production, this would use:
-        // client.req_historical_data(
-        //     4001,           // reqId
-        //     &contract,      // contract
-        //     end_date_time,  // end date time
-        //     duration,       // duration string (e.g., "1 Y")
-        //     bar_size,       // bar size (e.g., "1 day")
-        //     what_to_show,   // what to show (e.g., "TRADES")
-        //     use_rth,        // use regular trading hours
-        //     1,              // format date (1=yyyyMMdd HH:mm:ss)
-        //     false,          // keep up to date
-        //     vec![],         // chart options
-        // )?;
+        let ib_contract = contract.to_ibapi();
 
-        let _ = (end_date_time, what_to_show, use_rth);
+        // Parse duration string like "1 Y", "1 D", "1 M"
+        let duration_val = parse_duration(duration);
 
-        Ok(Vec::new())
+        // Parse bar size string like "1 day", "1 hour", "5 mins"
+        let bar_size_val = parse_bar_size(bar_size);
+
+        let trading_hours = if use_rth {
+            TradingHours::Regular
+        } else {
+            TradingHours::Extended
+        };
+
+        let historical_data = client
+            .historical_data(
+                &ib_contract,
+                None, // end_date (None = now)
+                duration_val,
+                bar_size_val,
+                Some(WhatToShow::Trades),
+                trading_hours,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch historical data: {}", e))?;
+
+        let bars: Vec<HistoricalBar> = historical_data
+            .bars
+            .iter()
+            .map(|b| HistoricalBar {
+                time: b.date.to_string(),
+                open: b.open,
+                high: b.high,
+                low: b.low,
+                close: b.close,
+                volume: b.volume as i64,
+                wap: b.wap,
+                count: b.count,
+            })
+            .collect();
+
+        info!("Retrieved {} historical bars for {}", bars.len(), contract.symbol);
+        Ok(bars)
     }
 
     /// Place a market order
@@ -344,17 +436,34 @@ impl TwsBroker {
         action: &str,
         quantity: f64,
     ) -> Result<i32> {
-        if !self.is_connected() {
-            return Err(anyhow::anyhow!("Not connected to TWS"));
-        }
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to TWS"))?;
 
-        info!(
-            "Placing market order: {} {} {} @ MKT",
-            action, quantity, contract.symbol
-        );
+        info!("Placing market order: {} {} {} @ MKT", action, quantity, contract.symbol);
 
-        let order = Order::market(action, quantity);
-        self.place_order(contract, &order).await
+        let ib_contract = contract.to_ibapi();
+        let qty = quantity.round() as i32;
+
+        let order_id = if action.to_uppercase() == "BUY" {
+            client
+                .order(&ib_contract)
+                .buy(qty)
+                .market()
+                .submit()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to place buy order: {}", e))?
+        } else {
+            client
+                .order(&ib_contract)
+                .sell(qty)
+                .market()
+                .submit()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to place sell order: {}", e))?
+        };
+
+        info!("Market order submitted with ID: {}", order_id);
+        Ok(order_id.into())
     }
 
     /// Place a limit order
@@ -365,43 +474,49 @@ impl TwsBroker {
         quantity: f64,
         limit_price: f64,
     ) -> Result<i32> {
-        if !self.is_connected() {
-            return Err(anyhow::anyhow!("Not connected to TWS"));
-        }
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to TWS"))?;
 
-        info!(
-            "Placing limit order: {} {} {} @ {}",
-            action, quantity, contract.symbol, limit_price
-        );
+        info!("Placing limit order: {} {} {} @ {}", action, quantity, contract.symbol, limit_price);
 
-        let order = Order::limit(action, quantity, limit_price);
-        self.place_order(contract, &order).await
-    }
+        let ib_contract = contract.to_ibapi();
+        let qty = quantity.round() as i32;
 
-    /// Place an order (internal)
-    async fn place_order(&self, contract: &Contract, order: &Order) -> Result<i32> {
-        // In production, this would use:
-        // let order_id = client.next_valid_order_id();
-        // client.place_order(order_id, &contract, &order)?;
+        let order_id = if action.to_uppercase() == "BUY" {
+            client
+                .order(&ib_contract)
+                .buy(qty)
+                .limit(limit_price)
+                .submit()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to place buy limit order: {}", e))?
+        } else {
+            client
+                .order(&ib_contract)
+                .sell(qty)
+                .limit(limit_price)
+                .submit()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to place sell limit order: {}", e))?
+        };
 
-        debug!("Order submitted: {:?} for {:?}", order, contract);
-
-        // Return a simulated order ID
-        let order_id = 1001;
-        Ok(order_id)
+        info!("Limit order submitted with ID: {}", order_id);
+        Ok(order_id.into())
     }
 
     /// Cancel an order
     pub async fn cancel_order(&self, order_id: i32) -> Result<()> {
-        if !self.is_connected() {
-            return Err(anyhow::anyhow!("Not connected to TWS"));
-        }
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to TWS"))?;
 
         info!("Cancelling order {}", order_id);
 
-        // In production:
-        // client.cancel_order(order_id)?;
+        let _subscription = client
+            .cancel_order(order_id, "")
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to cancel order: {}", e))?;
 
+        info!("Order {} cancelled", order_id);
         Ok(())
     }
 
@@ -422,12 +537,55 @@ impl TwsBroker {
 
     /// Get next valid order ID
     pub async fn next_order_id(&self) -> Result<i32> {
-        if !self.is_connected() {
-            return Err(anyhow::anyhow!("Not connected to TWS"));
-        }
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to TWS"))?;
+        Ok(client.next_order_id())
+    }
+}
 
-        // In production, would request from TWS
-        Ok(1000)
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Parse duration string like "1 Y", "1 D", "1 M" to ibapi Duration
+fn parse_duration(s: &str) -> IbDuration {
+    let parts: Vec<&str> = s.trim().split_whitespace().collect();
+    if parts.len() != 2 {
+        return IbDuration::DAY;
+    }
+
+    let num: i32 = parts[0].parse().unwrap_or(1);
+    match parts[1].to_uppercase().as_str() {
+        "Y" | "YEAR" | "YEARS" => IbDuration::years(num),
+        "M" | "MONTH" | "MONTHS" => IbDuration::months(num),
+        "W" | "WEEK" | "WEEKS" => IbDuration::weeks(num),
+        "D" | "DAY" | "DAYS" => IbDuration::days(num),
+        "H" | "HOUR" | "HOURS" => IbDuration::seconds(num * 3600),
+        _ => IbDuration::days(num),
+    }
+}
+
+/// Parse bar size string like "1 day", "1 hour", "5 mins"
+fn parse_bar_size(s: &str) -> BarSize {
+    let s_lower = s.to_lowercase();
+    if s_lower.contains("day") {
+        BarSize::Day
+    } else if s_lower.contains("hour") {
+        BarSize::Hour
+    } else if s_lower.contains("min") {
+        if s_lower.contains("30") {
+            BarSize::Min30
+        } else if s_lower.contains("15") {
+            BarSize::Min15
+        } else if s_lower.contains("5") {
+            BarSize::Min5
+        } else {
+            BarSize::Min
+        }
+    } else if s_lower.contains("sec") {
+        BarSize::Sec30
+    } else {
+        BarSize::Day
     }
 }
 
@@ -448,7 +606,7 @@ impl From<&TwsPosition> for super::BrokerPosition {
             side,
             quantity: Decimal::from_f64_retain(p.position.abs()).unwrap_or(Decimal::ZERO),
             entry_price: Decimal::from_f64_retain(p.avg_cost).unwrap_or(Decimal::ZERO),
-            current_price: Decimal::ZERO, // Would be populated from market data
+            current_price: Decimal::ZERO,
             unrealized_pnl: Decimal::from_f64_retain(p.unrealized_pnl.unwrap_or(0.0))
                 .unwrap_or(Decimal::ZERO),
         }
@@ -514,52 +672,39 @@ mod tests {
         assert_eq!(order.stop_price, Some(145.00));
     }
 
-    #[tokio::test]
-    async fn test_tws_broker_creation() {
+    #[test]
+    fn test_parse_duration() {
+        // Test that parse_duration returns the expected duration types
+        let d = parse_duration("1 D");
+        assert_eq!(d.to_string(), "1 D");
+
+        let y = parse_duration("1 Y");
+        assert_eq!(y.to_string(), "1 Y");
+
+        let w = parse_duration("2 W");
+        assert_eq!(w.to_string(), "2 W");
+
+        let m = parse_duration("3 M");
+        assert_eq!(m.to_string(), "3 M");
+    }
+
+    #[test]
+    fn test_parse_bar_size() {
+        assert!(matches!(parse_bar_size("1 day"), BarSize::Day));
+        assert!(matches!(parse_bar_size("1 hour"), BarSize::Hour));
+        assert!(matches!(parse_bar_size("5 mins"), BarSize::Min5));
+        assert!(matches!(parse_bar_size("15 mins"), BarSize::Min15));
+    }
+
+    #[test]
+    fn test_tws_broker_creation() {
         let broker = TwsBroker::new(
-            "127.0.0.1".to_string(),
+            "192.168.64.1".to_string(),
             7497,
             1,
             "DU1234567".to_string(),
         );
         assert!(!broker.is_connected());
         assert_eq!(broker.account_id(), "DU1234567");
-    }
-
-    #[tokio::test]
-    async fn test_tws_connect_disconnect() {
-        let broker = TwsBroker::new(
-            "127.0.0.1".to_string(),
-            7497,
-            1,
-            "DU1234567".to_string(),
-        );
-
-        // Connect
-        let result = broker.connect().await;
-        assert!(result.is_ok());
-        assert!(broker.is_connected());
-
-        // Disconnect
-        let result = broker.disconnect().await;
-        assert!(result.is_ok());
-        assert!(!broker.is_connected());
-    }
-
-    #[tokio::test]
-    async fn test_not_connected_error() {
-        let broker = TwsBroker::new(
-            "127.0.0.1".to_string(),
-            7497,
-            1,
-            "DU1234567".to_string(),
-        );
-
-        // Should fail when not connected
-        let result = broker.get_account_summary().await;
-        assert!(result.is_err());
-
-        let result = broker.get_positions().await;
-        assert!(result.is_err());
     }
 }

@@ -50,9 +50,9 @@ toml = "0.9.10"
 axum = "0.8.8"
 futures-util = "0.3.31"
 
-# IBKR TWS API (optional - for direct TWS socket connection)
-# Note: ibapi requires TWS/Gateway to be running
-# ibapi = "0.1"  # Uncomment when ready to use native TWS socket API
+# IBKR TWS API (native socket connection)
+ibapi = "2.5.0"
+time = "0.3"
 
 [dev-dependencies]
 tokio-test = "0.4"
