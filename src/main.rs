@@ -747,9 +747,42 @@ enum BrokerType {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let mut config_path = "config.toml".to_string();
+    let mut live_mode = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" | "-c" => {
+                if i + 1 < args.len() {
+                    config_path = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            "--live" => {
+                live_mode = true;
+            }
+            "--help" | "-h" => {
+                eprintln!("Sovereign v4 - Lossless Autonomous Trading System");
+                eprintln!();
+                eprintln!("Usage: sovereign [OPTIONS]");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  --config, -c <path>  Path to config file (default: config.toml)");
+                eprintln!("  --live               Enable live trading mode");
+                eprintln!("  --help, -h           Show this help message");
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
     // Load configuration
-    let cfg = Config::load("config.toml").unwrap_or_else(|e| {
-        eprintln!("Failed to load config.toml: {}. Exiting.", e);
+    let cfg = Config::load(&config_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load {}: {}. Exiting.", config_path, e);
         std::process::exit(1);
     });
 
@@ -761,8 +794,17 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
+    // Verify live mode requirements
+    if live_mode {
+        info!("{}", SEP);
+        info!("  === LIVE TRADING MODE ===");
+        info!("  Config: {}", config_path);
+        info!("  Capital: ${:.0} {}", cfg.get_initial_capital(), cfg.get_currency());
+        info!("{}", SEP);
+    }
+
     info!("{}", SEP);
-    info!("  {} - Lossless Autonomous Trading System", cfg.system.name);
+    info!("  {} - Lossless Autonomous Trading System", cfg.get_system_name());
     info!("  Philosophy: No parameters. No thresholds. Pure counting.");
     info!("{}", SEP);
 
