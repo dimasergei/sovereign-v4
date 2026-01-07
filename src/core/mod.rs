@@ -29,6 +29,7 @@ pub mod consolidation;
 pub mod transferability;
 pub mod selfmod;
 pub mod codegen;
+pub mod foundation;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
@@ -62,4 +63,9 @@ pub use codegen::{
     CodeDeployer, CodeGenerator, GeneratedCode, CodeType, Expression, EvalContext,
     Sandbox, SafetyViolation, CompareOp, evaluate, evaluate_bool,
     TestResults, BacktestResults, CodePerformance, DeploymentStatus, DeploymentRecord,
+};
+pub use foundation::{
+    TimeSeriesFoundation, FoundationModelType, TimeSeriesTokenizer,
+    FoundationWeights, TransformerLayer, MultiHeadAttention, FeedForward, LayerNorm,
+    ForecastDistribution, FoundationTransfer,
 };

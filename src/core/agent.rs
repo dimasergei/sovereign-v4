@@ -39,6 +39,7 @@ use super::embeddings::{VectorIndex, TradeContext as EmbeddingTradeContext, EMBE
 use super::consolidation::{MemoryConsolidator, EpisodeContext};
 use super::selfmod::{SelfModificationEngine, RuleContext, RuleAction};
 use super::codegen::{CodeDeployer, EvalContext as CodegenEvalContext};
+use super::foundation::{TimeSeriesFoundation, FoundationTransfer, ForecastDistribution};
 use crate::data::memory::{TradeMemory, MarketRegime};
 use std::sync::Mutex;
 
@@ -229,6 +230,16 @@ pub struct SymbolAgent {
     // Code self-modification
     /// Shared code deployer for generated code execution
     code_deployer: Option<Arc<Mutex<CodeDeployer>>>,
+
+    // Foundation model integration
+    /// Shared foundation model for time-series understanding
+    foundation: Option<Arc<Mutex<TimeSeriesFoundation>>>,
+    /// Shared foundation transfer for zero-shot transfer learning
+    foundation_transfer: Option<Arc<Mutex<FoundationTransfer>>>,
+    /// Cached price history for foundation model encoding
+    price_history: Vec<f64>,
+    /// Maximum price history length for foundation encoding
+    max_price_history: usize,
 }
 
 impl SymbolAgent {
@@ -275,6 +286,10 @@ impl SymbolAgent {
             memory_consolidator: None,
             self_mod: None,
             code_deployer: None,
+            foundation: None,
+            foundation_transfer: None,
+            price_history: Vec::with_capacity(512),
+            max_price_history: 512,
         }
     }
 
@@ -315,6 +330,10 @@ impl SymbolAgent {
             memory_consolidator: None,
             self_mod: None,
             code_deployer: None,
+            foundation: None,
+            foundation_transfer: None,
+            price_history: Vec::with_capacity(512),
+            max_price_history: 512,
         }
     }
 
@@ -360,6 +379,10 @@ impl SymbolAgent {
             memory_consolidator: None,
             self_mod: None,
             code_deployer: None,
+            foundation: None,
+            foundation_transfer: None,
+            price_history: Vec::with_capacity(512),
+            max_price_history: 512,
         }
     }
 
@@ -397,6 +420,10 @@ impl SymbolAgent {
             memory_consolidator: None,
             self_mod: None,
             code_deployer: None,
+            foundation: None,
+            foundation_transfer: None,
+            price_history: Vec::with_capacity(512),
+            max_price_history: 512,
         }
     }
 
@@ -583,6 +610,11 @@ impl SymbolAgent {
         self.last_price = close;
         self.last_volume = volume;
         self.bar_count += 1;
+
+        // 6a. Update price history for foundation model
+        if let Some(close_f) = close.to_f64() {
+            self.update_price_history(close_f);
+        }
 
         // 7. Not ready yet - need more data
         if !self.is_ready() {
@@ -1503,6 +1535,11 @@ impl SymbolAgent {
                     combined = intervention_adjusted;
                 }
             }
+        }
+
+        // Apply foundation model adjustment (direction and regime)
+        if self.has_foundation() {
+            combined = self.get_foundation_confidence_adjustment(combined);
         }
 
         info!(
@@ -2612,6 +2649,197 @@ impl SymbolAgent {
         }
 
         (modified_conviction, size_factor)
+    }
+
+    // ==================== Foundation Model Integration ====================
+
+    /// Attach foundation model for time-series understanding
+    pub fn attach_foundation(&mut self, foundation: Arc<Mutex<TimeSeriesFoundation>>) {
+        self.foundation = Some(foundation);
+    }
+
+    /// Check if foundation model is attached
+    pub fn has_foundation(&self) -> bool {
+        self.foundation.is_some()
+    }
+
+    /// Attach foundation transfer for zero-shot transfer learning
+    pub fn attach_foundation_transfer(&mut self, transfer: Arc<Mutex<FoundationTransfer>>) {
+        self.foundation_transfer = Some(transfer);
+    }
+
+    /// Check if foundation transfer is attached
+    pub fn has_foundation_transfer(&self) -> bool {
+        self.foundation_transfer.is_some()
+    }
+
+    /// Update price history for foundation model encoding
+    fn update_price_history(&mut self, close: f64) {
+        if self.price_history.len() >= self.max_price_history {
+            self.price_history.remove(0);
+        }
+        self.price_history.push(close);
+    }
+
+    /// Get foundation model embedding for current price history
+    pub fn get_foundation_embedding(&self) -> Option<Vec<f64>> {
+        if !self.has_foundation() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref foundation_lock) = self.foundation {
+            if let Ok(mut foundation) = foundation_lock.lock() {
+                return Some(foundation.encode(&self.price_history));
+            }
+        }
+        None
+    }
+
+    /// Get foundation model forecast for current price history
+    pub fn get_foundation_forecast(&self, horizon: usize) -> Option<Vec<f64>> {
+        if !self.has_foundation() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref foundation_lock) = self.foundation {
+            if let Ok(mut foundation) = foundation_lock.lock() {
+                return Some(foundation.forecast(&self.price_history, horizon));
+            }
+        }
+        None
+    }
+
+    /// Get foundation model forecast distribution for uncertainty quantification
+    pub fn get_foundation_forecast_distribution(
+        &self,
+        horizon: usize,
+        num_samples: usize,
+    ) -> Option<ForecastDistribution> {
+        if !self.has_foundation() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref foundation_lock) = self.foundation {
+            if let Ok(mut foundation) = foundation_lock.lock() {
+                return Some(foundation.forecast_distribution(&self.price_history, horizon, num_samples));
+            }
+        }
+        None
+    }
+
+    /// Get foundation model regime prediction (zero-shot)
+    pub fn get_foundation_regime(&self) -> Option<(Regime, f64)> {
+        if !self.has_foundation() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref foundation_lock) = self.foundation {
+            if let Ok(mut foundation) = foundation_lock.lock() {
+                return Some(foundation.zero_shot_regime(&self.price_history));
+            }
+        }
+        None
+    }
+
+    /// Get foundation model direction prediction (zero-shot)
+    pub fn get_foundation_direction(&self) -> Option<(bool, f64)> {
+        if !self.has_foundation() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref foundation_lock) = self.foundation {
+            if let Ok(mut foundation) = foundation_lock.lock() {
+                return Some(foundation.zero_shot_direction(&self.price_history));
+            }
+        }
+        None
+    }
+
+    /// Get zero-shot transfer score from foundation model
+    pub fn get_foundation_transfer_score(&self, target_symbol: &str) -> Option<f64> {
+        if !self.has_foundation_transfer() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref transfer_lock) = self.foundation_transfer {
+            if let Ok(mut transfer) = transfer_lock.lock() {
+                // First ensure we have an embedding for our symbol
+                transfer.compute_symbol_embedding(&self.symbol, &self.price_history);
+                // Then get transfer score
+                return Some(transfer.zero_shot_transfer(&self.symbol, target_symbol));
+            }
+        }
+        None
+    }
+
+    /// Get foundation-based combined regime (blends HMM and foundation)
+    pub fn get_blended_regime(&self) -> (Regime, f64) {
+        let hmm_regime = self.regime_detector.current_regime();
+        let hmm_confidence = self.regime_detector.confidence();
+
+        // If no foundation or not enough data, return HMM only
+        if let Some((foundation_regime, foundation_confidence)) = self.get_foundation_regime() {
+            // Blend: 60% HMM + 40% foundation (HMM has more temporal context)
+            let blended_confidence = hmm_confidence * 0.6 + foundation_confidence * 0.4;
+
+            // Use regime with higher confidence
+            if foundation_confidence > hmm_confidence && foundation_confidence > 0.6 {
+                info!(
+                    "[FOUNDATION] {} Regime override: {} ({:.1}%) -> {} ({:.1}%)",
+                    self.symbol, hmm_regime, hmm_confidence * 100.0,
+                    foundation_regime, foundation_confidence * 100.0
+                );
+                (foundation_regime, blended_confidence)
+            } else {
+                (hmm_regime, blended_confidence)
+            }
+        } else {
+            (hmm_regime, hmm_confidence)
+        }
+    }
+
+    /// Get foundation-adjusted confidence for trading decisions
+    pub fn get_foundation_confidence_adjustment(&self, base_confidence: f64) -> f64 {
+        // Check direction prediction
+        if let Some((is_bullish, direction_confidence)) = self.get_foundation_direction() {
+            let sr_price_f = self.sr.get_support(self.last_price)
+                .unwrap_or(self.last_price)
+                .to_f64()
+                .unwrap_or(0.0);
+            let last_price_f = self.last_price.to_f64().unwrap_or(1.0);
+            let is_long = sr_price_f < last_price_f;
+
+            // If foundation agrees with our direction, boost confidence
+            let direction_agrees = (is_long && is_bullish) || (!is_long && !is_bullish);
+
+            if direction_agrees && direction_confidence > 0.6 {
+                // Boost confidence proportionally to foundation conviction
+                let boost = (direction_confidence - 0.5) * 0.2; // Max +10% boost
+                let adjusted = (base_confidence + boost).min(1.0);
+                info!(
+                    "[FOUNDATION] {} Direction agrees ({}): {:.1}% -> {:.1}%",
+                    self.symbol,
+                    if is_bullish { "bullish" } else { "bearish" },
+                    base_confidence * 100.0,
+                    adjusted * 100.0
+                );
+                return adjusted;
+            } else if !direction_agrees && direction_confidence > 0.7 {
+                // Reduce confidence if foundation strongly disagrees
+                let penalty = (direction_confidence - 0.5) * 0.15; // Max -7.5% penalty
+                let adjusted = (base_confidence - penalty).max(0.0);
+                info!(
+                    "[FOUNDATION] {} Direction disagrees ({}): {:.1}% -> {:.1}%",
+                    self.symbol,
+                    if is_bullish { "bullish" } else { "bearish" },
+                    base_confidence * 100.0,
+                    adjusted * 100.0
+                );
+                return adjusted;
+            }
+        }
+
+        base_confidence
     }
 }
 

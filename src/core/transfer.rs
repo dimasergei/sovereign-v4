@@ -18,6 +18,7 @@ use tracing::info;
 
 use super::regime::Regime;
 use super::transferability::{TransferabilityPredictor, TransferOutcome};
+use super::foundation::FoundationTransfer;
 
 /// Number of features in the calibrator model
 const NUM_FEATURES: usize = 6;
@@ -175,6 +176,9 @@ pub struct TransferManager {
     /// ML prediction threshold
     #[serde(default = "default_ml_threshold")]
     ml_threshold: f64,
+    /// Foundation-based transfer for zero-shot learning
+    #[serde(skip)]
+    foundation_transfer: Option<Arc<Mutex<FoundationTransfer>>>,
 }
 
 fn default_ml_threshold() -> f64 {
@@ -196,6 +200,7 @@ impl TransferManager {
             transferability_predictor: None,
             use_ml_predictions: false,
             ml_threshold: 0.6,
+            foundation_transfer: None,
         }
     }
 
@@ -207,6 +212,7 @@ impl TransferManager {
             transferability_predictor: Some(predictor),
             use_ml_predictions: true,
             ml_threshold: 0.6,
+            foundation_transfer: None,
         }
     }
 
@@ -224,6 +230,53 @@ impl TransferManager {
     /// Set ML threshold
     pub fn set_ml_threshold(&mut self, threshold: f64) {
         self.ml_threshold = threshold;
+    }
+
+    /// Attach foundation transfer for zero-shot learning
+    pub fn attach_foundation_transfer(&mut self, transfer: Arc<Mutex<FoundationTransfer>>) {
+        self.foundation_transfer = Some(transfer);
+    }
+
+    /// Check if foundation transfer is attached
+    pub fn has_foundation_transfer(&self) -> bool {
+        self.foundation_transfer.is_some()
+    }
+
+    /// Get zero-shot transfer score from foundation model
+    ///
+    /// Uses foundation model embeddings to compute similarity-based transfer scores
+    /// between symbols. Higher scores indicate better knowledge transfer potential.
+    pub fn get_zero_shot_transfer_score(
+        &self,
+        source: &str,
+        target: &str,
+        source_prices: &[f64],
+    ) -> Option<f64> {
+        if let Some(ref transfer_lock) = self.foundation_transfer {
+            if let Ok(mut transfer) = transfer_lock.lock() {
+                // First ensure we have an embedding for the source symbol
+                transfer.compute_symbol_embedding(source, source_prices);
+                return Some(transfer.zero_shot_transfer(source, target));
+            }
+        }
+        None
+    }
+
+    /// Get foundation-based similar symbols for a given symbol
+    pub fn get_foundation_similar_symbols(
+        &self,
+        symbol: &str,
+        prices: &[f64],
+        top_k: usize,
+    ) -> Vec<(String, f64)> {
+        if let Some(ref transfer_lock) = self.foundation_transfer {
+            if let Ok(mut transfer) = transfer_lock.lock() {
+                // First ensure we have an embedding for this symbol
+                transfer.compute_symbol_embedding(symbol, prices);
+                return transfer.get_most_similar_symbols(symbol, top_k);
+            }
+        }
+        Vec::new()
     }
 
     /// Update symbol profile in ML predictor

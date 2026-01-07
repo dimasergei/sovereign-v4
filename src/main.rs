@@ -25,7 +25,7 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType, MemoryConsolidator, TransferabilityPredictor, SelfModificationEngine, Constitution, CodeDeployer};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType, MemoryConsolidator, TransferabilityPredictor, SelfModificationEngine, Constitution, CodeDeployer, TimeSeriesFoundation, FoundationModelType, FoundationTransfer};
 use crate::core::health::HealthStatus;
 use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
@@ -54,6 +54,7 @@ const CONSOLIDATION_PATH: &str = "sovereign_consolidation.json";
 const TRANSFERABILITY_PATH: &str = "sovereign_transferability.json";
 const SELFMOD_PATH: &str = "sovereign_selfmod.json";
 const CODEGEN_PATH: &str = "sovereign_codegen.json";
+const FOUNDATION_PATH: &str = "sovereign_foundation.bin";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -267,6 +268,17 @@ fn save_codegen(code_deployer: &Arc<Mutex<CodeDeployer>>) {
         warn!("Failed to save CodeDeployer: {}", e);
     } else {
         info!("Codegen: Saved - {}", deployer.format_summary());
+    }
+}
+
+/// Save TimeSeriesFoundation model state
+fn save_foundation(foundation: &Arc<Mutex<TimeSeriesFoundation>>) {
+    let model = foundation.lock().unwrap();
+    if let Err(e) = model.save(FOUNDATION_PATH) {
+        warn!("Failed to save Foundation model: {}", e);
+    } else {
+        info!("Foundation: Saved - {} layers, {} dim, {} inferences",
+            model.num_layers(), model.embedding_dim(), model.inference_count());
     }
 }
 
@@ -1035,6 +1047,38 @@ async fn main() -> Result<()> {
         agent.attach_code_deployer(Arc::clone(&code_deployer));
     }
 
+    // Load or create TimeSeriesFoundation model (small model: 4 layers, 128 dim for efficiency)
+    let foundation = Arc::new(Mutex::new(
+        TimeSeriesFoundation::load(FOUNDATION_PATH)
+            .unwrap_or_else(|_| {
+                info!("Foundation: Creating new model (4 layers, 128 dim)");
+                // Use with_config for custom dimensions: model_type, embedding_dim, context_length, num_layers, num_heads, vocab_size, patch_size
+                TimeSeriesFoundation::with_config(FoundationModelType::Custom, 128, 512, 4, 8, 1024, 16)
+            })
+    ));
+    {
+        let model = foundation.lock().unwrap();
+        info!("Foundation: Loaded - {} layers, {} dim, context {} bars",
+            model.num_layers(), model.embedding_dim(), model.context_length());
+    }
+
+    // Create FoundationTransfer for zero-shot transfer learning
+    let foundation_transfer = Arc::new(Mutex::new(
+        FoundationTransfer::new(Arc::clone(&foundation))
+    ));
+
+    // Attach Foundation and FoundationTransfer to all agents
+    for agent in agents.values_mut() {
+        agent.attach_foundation(Arc::clone(&foundation));
+        agent.attach_foundation_transfer(Arc::clone(&foundation_transfer));
+    }
+
+    // Attach FoundationTransfer to TransferManager
+    {
+        let mut tm = transfer_manager.lock().unwrap();
+        tm.attach_foundation_transfer(Arc::clone(&foundation_transfer));
+    }
+
     // Initialize portfolio
     let mut portfolio = Portfolio::new(initial_balance);
 
@@ -1096,6 +1140,7 @@ async fn main() -> Result<()> {
                 &transferability_predictor,
                 &selfmod,
                 &code_deployer,
+                &foundation,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -1121,6 +1166,7 @@ async fn main() -> Result<()> {
                 &transferability_predictor,
                 &selfmod,
                 &code_deployer,
+                &foundation,
             ).await
         }
     }
@@ -1248,6 +1294,7 @@ async fn run_alpaca_loop(
     transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
     selfmod: &Arc<Mutex<SelfModificationEngine>>,
     code_deployer: &Arc<Mutex<CodeDeployer>>,
+    foundation: &Arc<Mutex<TimeSeriesFoundation>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -1369,7 +1416,7 @@ async fn run_alpaca_loop(
                     mon.snapshot_daily();
                 }
 
-                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, Counterfactual, and Monitor
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, Counterfactual, Monitor, Foundation
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
@@ -1385,6 +1432,7 @@ async fn run_alpaca_loop(
                 save_transferability(&transferability_predictor);
                 save_selfmod(selfmod);
                 save_codegen(code_deployer);
+                save_foundation(foundation);
 
                 // Run pattern consolidation
                 run_consolidation(memory_consolidator);
@@ -1489,6 +1537,7 @@ async fn run_ibkr_loop(
     transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
     selfmod: &Arc<Mutex<SelfModificationEngine>>,
     code_deployer: &Arc<Mutex<CodeDeployer>>,
+    foundation: &Arc<Mutex<TimeSeriesFoundation>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
@@ -1587,7 +1636,7 @@ async fn run_ibkr_loop(
                     mon.snapshot_daily();
                 }
 
-                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, Counterfactual, and Monitor
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, Counterfactual, Monitor, Foundation
                 save_calibrator(agents);
                 save_transfer(transfer_manager);
                 save_moe(agents);
@@ -1603,6 +1652,7 @@ async fn run_ibkr_loop(
                 save_transferability(&transferability_predictor);
                 save_selfmod(selfmod);
                 save_codegen(code_deployer);
+                save_foundation(foundation);
 
                 // Run pattern consolidation
                 run_consolidation(memory_consolidator);
