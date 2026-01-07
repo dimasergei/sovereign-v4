@@ -634,3 +634,115 @@ pub async fn send_negative_transfer_alert(
     );
     let _ = send(&msg).await;
 }
+
+// ==================== Sharded Memory Commands ====================
+
+/// Send memory command help
+pub async fn send_memory_help() {
+    let msg = "💾 <b>Memory Commands</b>\n\n\
+        /memory stats - Show sharded memory statistics\n\
+        /memory shards - Show per-shard information\n\
+        /memory compact - Trigger shard compaction\n\
+        /memory rebalance - Trigger shard rebalancing";
+    let _ = send(msg).await;
+}
+
+/// Send sharded memory statistics
+pub async fn send_memory_stats(
+    total_entries: u64,
+    num_shards: usize,
+    total_size_mb: f64,
+    avg_query_ms: f64,
+    cache_hit_rate: f64,
+    symbol_count: usize,
+    buffer_size: usize,
+) {
+    let msg = format!(
+        "💾 <b>Sharded Memory Stats</b>\n\n\
+        📊 Total Entries: {}\n\
+        🗂️ Shards: {}\n\
+        📦 Total Size: {:.1} MB\n\
+        ⚡ Avg Query: {:.2} ms\n\
+        🎯 Cache Hit Rate: {:.1}%\n\
+        🏷️ Symbols: {}\n\
+        ✏️ Write Buffer: {}",
+        format_number(total_entries),
+        num_shards,
+        total_size_mb,
+        avg_query_ms,
+        cache_hit_rate * 100.0,
+        symbol_count,
+        buffer_size
+    );
+    let _ = send(&msg).await;
+}
+
+/// Format large numbers with K/M/B suffixes
+fn format_number(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Send per-shard information
+pub async fn send_shard_info(shards: &[(usize, usize, f64)]) {
+    // (shard_id, entry_count, load_pct)
+    let mut msg = String::from("🗂️ <b>Shard Information</b>\n\n");
+
+    for (id, count, load_pct) in shards {
+        let bar = render_load_bar(*load_pct);
+        msg.push_str(&format!(
+            "Shard {}: {} {} ({:.1}%)\n",
+            id, bar, format_number(*count as u64), load_pct * 100.0
+        ));
+    }
+
+    let _ = send(&msg).await;
+}
+
+/// Render a load bar for shard visualization
+fn render_load_bar(load_pct: f64) -> String {
+    let width = 10;
+    let filled = ((load_pct * width as f64).round() as usize).min(width);
+    let empty = width - filled;
+
+    let fill_char = if load_pct > 0.9 {
+        "🔴"
+    } else if load_pct > 0.7 {
+        "🟡"
+    } else {
+        "🟢"
+    };
+
+    format!("[{}{}]", fill_char.repeat(filled), "░".repeat(empty))
+}
+
+/// Send compaction result
+pub async fn send_memory_compact(success: bool, message: &str) {
+    let emoji = if success { "✅" } else { "❌" };
+    let status = if success { "Compaction Complete" } else { "Compaction Failed" };
+    let msg = format!(
+        "{} <b>{}</b>\n\n{}",
+        emoji, status, message
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send rebalance result
+pub async fn send_memory_rebalance(success: bool, entries_moved: u32, message: &str) {
+    let emoji = if success { "⚖️" } else { "❌" };
+    let status = if success { "Rebalance Complete" } else { "Rebalance Failed" };
+    let msg = format!(
+        "{} <b>{}</b>\n\n\
+        Entries Moved: {}\n\
+        {}",
+        emoji, status, entries_moved, message
+    );
+    let _ = send(&msg).await;
+}

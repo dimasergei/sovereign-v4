@@ -30,6 +30,7 @@ pub mod transferability;
 pub mod selfmod;
 pub mod codegen;
 pub mod foundation;
+pub mod sharded_memory;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
@@ -73,4 +74,10 @@ pub use foundation::{
     TimeSeriesFoundation, FoundationModelType, TimeSeriesTokenizer,
     FoundationWeights, TransformerLayer, MultiHeadAttention, FeedForward, LayerNorm,
     ForecastDistribution, FoundationTransfer,
+};
+pub use sharded_memory::{
+    ShardConfig, ShardKey, ShardingStrategy, ShardRouter,
+    MemoryShard, MemoryEntry, EntryType, MemoryQuery, QueryOrder,
+    ShardedMemory, GlobalIndex, WriteBuffer, QueryCache,
+    ImportanceUpdater, ShardedMemoryStats,
 };
