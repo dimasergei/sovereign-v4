@@ -415,20 +415,6 @@ async fn process_telegram_commands(
 
     for cmd in commands {
         match cmd.command.as_str() {
-            "/pending" => {
-                let engine = selfmod.lock().unwrap();
-                let pending: Vec<(String, String, String)> = engine
-                    .get_pending()
-                    .iter()
-                    .map(|p| (
-                        p.id.to_string(),
-                        format!("{:?}", p.modification),
-                        p.reason.clone(),
-                    ))
-                    .collect();
-                drop(engine);
-                telegram::send_pending_mods(&pending).await;
-            }
             "/rules" => {
                 let engine = selfmod.lock().unwrap();
                 let rules: Vec<(String, String, String, u32)> = engine
@@ -456,47 +442,20 @@ async fn process_telegram_commands(
                     c.forbidden_modifications.len(),
                 ).await;
             }
-            "/approve" => {
-                if let Some(id_str) = cmd.args.first() {
-                    if let Ok(id) = id_str.parse::<u64>() {
-                        let mut engine = selfmod.lock().unwrap();
-                        match engine.approve_pending(id, "telegram") {
-                            Ok(()) => {
-                                drop(engine);
-                                telegram::send_approval(id_str, true, "Modification approved and applied.").await;
-                            }
-                            Err(e) => {
-                                drop(engine);
-                                telegram::send_approval(id_str, false, &format!("Error: {}", e)).await;
-                            }
-                        }
-                    } else {
-                        telegram::send_approval(id_str, false, "Invalid ID format").await;
-                    }
-                } else {
-                    telegram::send_approval("", false, "Usage: /approve <id>").await;
-                }
-            }
-            "/reject" => {
-                if let Some(id_str) = cmd.args.first() {
-                    if let Ok(id) = id_str.parse::<u64>() {
-                        let mut engine = selfmod.lock().unwrap();
-                        match engine.reject_pending(id, "rejected via telegram") {
-                            Ok(()) => {
-                                drop(engine);
-                                telegram::send_rejection(id_str, true, "Modification rejected.").await;
-                            }
-                            Err(e) => {
-                                drop(engine);
-                                telegram::send_rejection(id_str, false, &format!("Error: {}", e)).await;
-                            }
-                        }
-                    } else {
-                        telegram::send_rejection(id_str, false, "Invalid ID format").await;
-                    }
-                } else {
-                    telegram::send_rejection("", false, "Usage: /reject <id>").await;
-                }
+            "/history" => {
+                let engine = selfmod.lock().unwrap();
+                let history: Vec<(u64, String, String, bool)> = engine
+                    .get_modification_history()
+                    .iter()
+                    .map(|m| (
+                        m.id,
+                        m.modification.description(),
+                        m.applied_at.format("%Y-%m-%d %H:%M").to_string(),
+                        m.rolled_back,
+                    ))
+                    .collect();
+                drop(engine);
+                telegram::send_modification_history(&history).await;
             }
             "/rollback" => {
                 if let Some(id_str) = cmd.args.first() {

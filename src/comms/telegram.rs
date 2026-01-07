@@ -215,6 +215,30 @@ fn render_progress_bar(progress: f64, width: usize) -> String {
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
+/// Send autonomous self-modification notification
+/// Used when modifications are auto-deployed or auto-rejected (no human approval)
+pub async fn send_selfmod_notification(deployed: bool, description: &str, reason: Option<&str>) {
+    let (prefix, emoji) = if deployed {
+        ("[SELFMOD] Auto-deployed", "🚀")
+    } else {
+        ("[SELFMOD] Auto-rejected", "🚫")
+    };
+
+    let msg = if let Some(r) = reason {
+        format!(
+            "{} <b>{}</b>\n\n{}\n\nReason: {}",
+            emoji, prefix, description, r
+        )
+    } else {
+        format!(
+            "{} <b>{}</b>\n\n{}",
+            emoji, prefix, description
+        )
+    };
+
+    let _ = send(&msg).await;
+}
+
 /// Last processed update ID for command polling
 static LAST_UPDATE_ID: AtomicI64 = AtomicI64::new(0);
 
@@ -384,16 +408,40 @@ pub async fn send_rollback(id: &str, success: bool, message: &str) {
     let _ = send(&msg).await;
 }
 
-/// Send command help
+/// Send command help (autonomous mode - no approval commands)
 pub async fn send_selfmod_help() {
     let msg = "🤖 <b>Self-Modification Commands</b>\n\n\
-        /pending - List pending modifications\n\
+        <b>Autonomous Mode Active</b>\n\
+        All modifications are auto-deployed/rejected based on constitution.\n\n\
         /rules - List active trading rules\n\
         /constitution - Show safety constraints\n\
-        /approve &lt;id&gt; - Approve a modification\n\
-        /reject &lt;id&gt; - Reject a modification\n\
-        /rollback &lt;id&gt; - Rollback an applied modification";
+        /history - Show modification history\n\
+        /rollback &lt;id&gt; - Rollback a deployed modification";
     let _ = send(msg).await;
+}
+
+/// Send modification history
+pub async fn send_modification_history(history: &[(u64, String, String, bool)]) {
+    // (id, description, timestamp, rolled_back)
+    if history.is_empty() {
+        let _ = send("📜 <b>Modification History</b>\n\nNo modifications yet.").await;
+        return;
+    }
+
+    let mut msg = String::from("📜 <b>Modification History</b>\n\n");
+    for (id, description, timestamp, rolled_back) in history.iter().take(15) {
+        let status = if *rolled_back { "⏪" } else { "✅" };
+        msg.push_str(&format!(
+            "{} <code>{}</code> {}\n   {}\n\n",
+            status, id, description, timestamp
+        ));
+    }
+
+    if history.len() > 15 {
+        msg.push_str(&format!("... and {} more", history.len() - 15));
+    }
+
+    let _ = send(&msg).await;
 }
 
 // ==================== Codegen Commands ====================
