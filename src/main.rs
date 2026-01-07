@@ -2348,7 +2348,7 @@ async fn run_tws_loop(
             // Get latest bar for each symbol using TWS historical data
             for sym in &symbols {
                 let contract = broker.make_stock_contract(sym, "SMART", "USD");
-                match broker.get_historical_bars(&contract, "", "1 D", "1 day", "TRADES", true).await {
+                match broker.get_historical_bars(&contract, "", "1 D", "1 day", "MIDPOINT", true).await {
                     Ok(bars) => {
                         if let Some(bar) = bars.last() {
                             bar_count += 1;
