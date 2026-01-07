@@ -656,15 +656,13 @@ pub struct ConstitutionViolation {
     pub reason: ViolationReason,
 }
 
-/// Result of proposing a modification
+/// Result of proposing a modification (fully autonomous - no human approval)
 #[derive(Debug, Clone)]
 pub enum ProposalResult {
-    /// Modification was auto-approved and applied
-    AutoApproved { id: u64 },
-    /// Modification requires human approval
-    PendingApproval { id: u64 },
-    /// Modification was rejected
-    Rejected { reason: ViolationReason },
+    /// Modification was auto-deployed (constitutional check passed)
+    AutoDeployed { id: u64, description: String },
+    /// Modification was auto-rejected (constitutional check failed)
+    AutoRejected { reason: ViolationReason, description: String },
 }
 
 /// Guard that enforces constitutional constraints
@@ -789,62 +787,59 @@ impl ConstitutionalGuard {
         true
     }
 
-    /// Propose a modification
+    /// Propose a modification (fully autonomous - no human approval workflow)
+    ///
+    /// Modifications are automatically deployed if they pass constitutional checks,
+    /// or automatically rejected if they violate the constitution.
     pub fn propose_modification(
         &mut self,
         mod_type: ModificationType,
         reason: String,
-        evidence: Vec<String>,
-        estimated_impact: f64,
+        _evidence: Vec<String>,
+        _estimated_impact: f64,
     ) -> ProposalResult {
         self.maybe_reset_daily();
 
-        // Check constitution
+        let description = mod_type.description();
+
+        // Check constitution - auto-reject if violation
         if let Err(violation) = self.check_modification(&mod_type) {
             self.violations.push(ConstitutionViolation {
                 timestamp: Utc::now(),
                 attempted_modification: mod_type.clone(),
                 reason: violation.clone(),
             });
-            return ProposalResult::Rejected { reason: violation };
+            return ProposalResult::AutoRejected {
+                reason: violation,
+                description,
+            };
         }
 
-        // Check daily limits
+        // Check daily limits - auto-reject if exceeded
         if let Err(violation) = self.check_daily_limit() {
-            return ProposalResult::Rejected { reason: violation };
+            return ProposalResult::AutoRejected {
+                reason: violation,
+                description,
+            };
         }
 
         let id = self.next_id;
         self.next_id += 1;
 
-        // Check if can auto-approve
-        if self.can_auto_approve(&mod_type, estimated_impact, evidence.len() as u32) {
-            // Auto-approve
-            self.changes_today += 1;
-            self.modification_history.push(AppliedModification {
-                id,
-                modification: mod_type,
-                reason,
-                applied_at: Utc::now(),
-                approval: ApprovalStatus::AutoApproved {
-                    reason: "Within limits and sufficient evidence".to_string(),
-                },
-                rolled_back: false,
-            });
-            ProposalResult::AutoApproved { id }
-        } else {
-            // Queue for human approval
-            self.pending_approvals.push(PendingModification {
-                id,
-                modification: mod_type,
-                reason,
-                evidence,
-                estimated_impact,
-                proposed_at: Utc::now(),
-                status: ApprovalStatus::Pending,
-            });
-            ProposalResult::PendingApproval { id }
-        }
+        // Auto-deploy: constitutional check passed
+        self.changes_today += 1;
+        self.modification_history.push(AppliedModification {
+            id,
+            modification: mod_type,
+            reason,
+            applied_at: Utc::now(),
+            approval: ApprovalStatus::AutoApproved {
+                reason: "Autonomous deployment - constitutional check passed".to_string(),
+            },
+            rolled_back: false,
+        });
+
+        ProposalResult::AutoDeployed { id, description }
     }
 
     /// Get pending modifications
@@ -1339,19 +1334,22 @@ impl SelfModificationEngine {
         }
     }
 
-    /// Propose a rule addition with backtest
+    /// Propose a rule addition with backtest (fully autonomous)
     pub fn propose_rule(
         &mut self,
         rule: TradingRule,
         history: &[TradeContext],
     ) -> ProposalResult {
+        let rule_name = rule.name.clone();
+
         // Check rule limit
         if self.rule_engine.active_count() as u32 >= self.guard.constitution().max_active_rules {
-            return ProposalResult::Rejected {
+            return ProposalResult::AutoRejected {
                 reason: ViolationReason::TooManyRules {
                     current: self.rule_engine.active_count() as u32,
                     max: self.guard.constitution().max_active_rules,
                 },
+                description: format!("Add rule: {}", rule_name),
             };
         }
 
@@ -1359,8 +1357,9 @@ impl SelfModificationEngine {
         let backtest_result = if self.guard.constitution().require_backtest_for_rules {
             let result = self.backtest_rule(&rule, history);
             if !result.passes {
-                return ProposalResult::Rejected {
+                return ProposalResult::AutoRejected {
                     reason: ViolationReason::BacktestRequired,
+                    description: format!("Add rule: {}", rule_name),
                 };
             }
             Some(result)
@@ -1545,10 +1544,9 @@ impl SelfModificationEngine {
     /// Format summary for logging
     pub fn format_summary(&self) -> String {
         format!(
-            "{} active rules, {} changes today, {} pending",
+            "{} active rules, {} changes today (autonomous)",
             self.rule_engine.active_count(),
-            self.guard.changes_today(),
-            self.guard.get_pending().len()
+            self.guard.changes_today()
         )
     }
 }
@@ -1611,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_approval() {
+    fn test_auto_deploy() {
         let mut guard = ConstitutionalGuard::default();
 
         let mod_type = ModificationType::ThresholdChange {
@@ -1620,20 +1618,20 @@ mod tests {
             new: 0.55,
         };
 
-        // Small impact with evidence should auto-approve
+        // Valid modification should be auto-deployed
         let evidence: Vec<String> = (0..25).map(|i| format!("Trade {}", i)).collect();
         let result = guard.propose_modification(
             mod_type,
             "Test change".to_string(),
             evidence,
-            0.05, // 5% impact, below 10% threshold
+            0.05,
         );
 
-        assert!(matches!(result, ProposalResult::AutoApproved { .. }));
+        assert!(matches!(result, ProposalResult::AutoDeployed { .. }));
     }
 
     #[test]
-    fn test_human_approval_required() {
+    fn test_autonomous_deploy_any_valid() {
         let mut guard = ConstitutionalGuard::default();
 
         let mod_type = ModificationType::ThresholdChange {
@@ -1642,16 +1640,17 @@ mod tests {
             new: 0.8,
         };
 
-        // Large impact should require human approval
+        // Any valid (non-forbidden) modification should be auto-deployed
+        // No more human approval required
         let evidence: Vec<String> = (0..25).map(|i| format!("Trade {}", i)).collect();
         let result = guard.propose_modification(
             mod_type,
             "Big change".to_string(),
             evidence,
-            0.25, // 25% impact, above 10% threshold
+            0.25, // Impact no longer matters for approval
         );
 
-        assert!(matches!(result, ProposalResult::PendingApproval { .. }));
+        assert!(matches!(result, ProposalResult::AutoDeployed { .. }));
     }
 
     #[test]
@@ -1749,7 +1748,7 @@ mod tests {
 
         let mut guard = ConstitutionalGuard::new(constitution);
 
-        // First two should succeed
+        // First two should auto-deploy
         for i in 0..2 {
             let mod_type = ModificationType::ThresholdChange {
                 name: format!("threshold_{}", i),
@@ -1765,10 +1764,10 @@ mod tests {
                 0.01,
             );
 
-            assert!(matches!(result, ProposalResult::AutoApproved { .. }));
+            assert!(matches!(result, ProposalResult::AutoDeployed { .. }));
         }
 
-        // Third should fail
+        // Third should auto-reject due to daily limit
         let mod_type = ModificationType::ThresholdChange {
             name: "threshold_2".to_string(),
             old: 0.5,
@@ -1783,7 +1782,7 @@ mod tests {
             0.01,
         );
 
-        assert!(matches!(result, ProposalResult::Rejected { reason: ViolationReason::DailyLimitReached { .. } }));
+        assert!(matches!(result, ProposalResult::AutoRejected { reason: ViolationReason::DailyLimitReached { .. }, .. }));
     }
 
     #[test]
