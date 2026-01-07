@@ -746,3 +746,91 @@ pub async fn send_memory_rebalance(success: bool, entries_moved: u32, message: &
     );
     let _ = send(&msg).await;
 }
+
+// ==================== Streaming Commands ====================
+
+/// Send streaming command help
+pub async fn send_streaming_help() {
+    let msg = "📡 <b>Streaming Commands</b>\n\n\
+        /streaming stats - Show streaming statistics\n\
+        /streaming flush - Force flush all pending updates\n\
+        /streaming pause - Pause learning (buffer still accepts)\n\
+        /streaming resume - Resume learning";
+    let _ = send(msg).await;
+}
+
+/// Send streaming statistics
+pub async fn send_streaming_stats(
+    updates_processed: u64,
+    updates_pending: usize,
+    learning_updates: u64,
+    avg_latency_us: f64,
+    buffer_utilization: f64,
+    cache_size: usize,
+    is_paused: bool,
+) {
+    let status_emoji = if is_paused { "⏸️" } else { "▶️" };
+    let status_text = if is_paused { "PAUSED" } else { "RUNNING" };
+
+    let msg = format!(
+        "📡 <b>Streaming Stats</b> {} {}\n\n\
+        📥 Updates Processed: {}\n\
+        ⏳ Updates Pending: {}\n\
+        🧠 Learning Updates: {}\n\
+        ⚡ Avg Latency: {:.1} µs\n\
+        📊 Buffer: {:.1}%\n\
+        🗂️ Cache Size: {}",
+        status_emoji, status_text,
+        format_number(updates_processed),
+        updates_pending,
+        format_number(learning_updates),
+        avg_latency_us,
+        buffer_utilization * 100.0,
+        cache_size
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send streaming flush result
+pub async fn send_streaming_flush(success: bool, message: &str) {
+    let emoji = if success { "✅" } else { "❌" };
+    let status = if success { "Flush Complete" } else { "Flush Failed" };
+    let msg = format!(
+        "{} <b>{}</b>\n\n{}",
+        emoji, status, message
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send streaming pause/resume confirmation
+pub async fn send_streaming_state(paused: bool) {
+    let (emoji, status, desc) = if paused {
+        ("⏸️", "Learning Paused", "Buffer continues accepting updates")
+    } else {
+        ("▶️", "Learning Resumed", "Processing updates in background")
+    };
+
+    let msg = format!(
+        "{} <b>{}</b>\n\n{}",
+        emoji, status, desc
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send online learning update notification
+pub async fn send_learning_update(
+    symbol: &str,
+    update_type: &str,
+    learning_count: u64,
+    accuracy: f64,
+) {
+    let msg = format!(
+        "🧠 <b>Online Learning</b>\n\n\
+        Symbol: {}\n\
+        Update: {}\n\
+        Total Learning Updates: {}\n\
+        Model Accuracy: {:.1}%",
+        symbol, update_type, learning_count, accuracy * 100.0
+    );
+    let _ = send(&msg).await;
+}
