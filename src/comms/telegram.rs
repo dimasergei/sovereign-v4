@@ -477,3 +477,44 @@ pub async fn send_code_rollback(id: &str, success: bool, message: &str) {
     );
     let _ = send(&msg).await;
 }
+
+// ==================== Causal Commands ====================
+
+/// Send latent confounders list
+pub async fn send_causal_latents(latents: &[(String, String)], summary: &str) {
+    if latents.is_empty() {
+        let msg = format!("🔍 <b>Latent Confounders</b>\n\n{}", summary);
+        let _ = send(&msg).await;
+        return;
+    }
+
+    let mut msg = String::from("🔍 <b>Latent Confounders (Hidden Variables)</b>\n\n");
+    msg.push_str(&format!("{}\n\n", summary));
+
+    for (i, (a, b)) in latents.iter().take(10).enumerate() {
+        msg.push_str(&format!(
+            "{}. <b>{}</b> ↔ <b>{}</b>\n   Both influenced by unknown hidden factor\n\n",
+            i + 1, a, b
+        ));
+    }
+
+    if latents.len() > 10 {
+        msg.push_str(&format!("... and {} more", latents.len() - 10));
+    }
+
+    let _ = send(&msg).await;
+}
+
+/// Send PAG structure summary
+pub async fn send_causal_pag(summary: &str) {
+    let msg = format!(
+        "🕸️ <b>Partial Ancestral Graph (PAG)</b>\n\n\
+        <pre>{}</pre>\n\n\
+        Legend:\n\
+        → Definite direction\n\
+        ↔ Latent confounder\n\
+        ○ Uncertain endpoint",
+        summary
+    );
+    let _ = send(&msg).await;
+}

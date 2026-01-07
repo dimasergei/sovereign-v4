@@ -408,6 +408,7 @@ fn discover_ml_clusters(transfer_manager: &Arc<Mutex<TransferManager>>) {
 async fn process_telegram_commands(
     selfmod: &Arc<Mutex<SelfModificationEngine>>,
     code_deployer: &Arc<Mutex<CodeDeployer>>,
+    causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
 ) {
     let commands = telegram::poll_commands().await;
 
@@ -625,6 +626,59 @@ async fn process_telegram_commands(
             }
             "/codegenhelp" => {
                 telegram::send_codegen_help().await;
+            }
+            // ==================== Causal Commands ====================
+            "/causal" => {
+                let subcommand = cmd.args.first().map(|s| s.as_str()).unwrap_or("help");
+                match subcommand {
+                    "latents" => {
+                        let ca = causal_analyzer.lock().unwrap();
+                        let latents = ca.get_latent_confounders();
+                        drop(ca);
+                        if latents.is_empty() {
+                            telegram::send_causal_latents(&[], "No latent confounders discovered yet. Run /causal discover to analyze.").await;
+                        } else {
+                            let latent_strs: Vec<(String, String)> = latents.iter()
+                                .map(|(a, b)| (a.clone(), b.clone()))
+                                .collect();
+                            telegram::send_causal_latents(&latent_strs, &format!("{} latent confounders discovered", latents.len())).await;
+                        }
+                    }
+                    "pag" => {
+                        let ca = causal_analyzer.lock().unwrap();
+                        let summary = ca.format_pag_summary();
+                        drop(ca);
+                        telegram::send_causal_pag(&summary).await;
+                    }
+                    "discover" => {
+                        // Trigger FCI discovery (expensive operation)
+                        let mut ca = causal_analyzer.lock().unwrap();
+                        match ca.discover_with_latents() {
+                            Some(result) => {
+                                let msg = format!(
+                                    "FCI Discovery complete:\n- {} nodes in PAG\n- {} definite edges\n- {} uncertain edges\n- {} latent confounders",
+                                    result.pag.nodes.len(),
+                                    result.definite_edges.len(),
+                                    result.uncertain_edges.len(),
+                                    result.latent_confounders.len()
+                                );
+                                drop(ca);
+                                telegram::send(&msg).await.ok();
+                            }
+                            None => {
+                                drop(ca);
+                                telegram::send("FCI Discovery: Insufficient data (need 30+ observations per symbol)").await.ok();
+                            }
+                        }
+                    }
+                    "status" | _ => {
+                        let ca = causal_analyzer.lock().unwrap();
+                        let summary = ca.format_summary();
+                        let latent_count = ca.get_latent_confounders().len();
+                        drop(ca);
+                        telegram::send(&format!("Causal Analyzer:\n{}\nLatent confounders: {}\n\nCommands:\n/causal latents - Show discovered latent confounders\n/causal pag - Show PAG structure summary\n/causal discover - Run FCI discovery (expensive)", summary, latent_count)).await.ok();
+                    }
+                }
             }
             _ => {}
         }
@@ -1331,7 +1385,7 @@ async fn run_alpaca_loop(
 
             // Poll for Telegram commands
             if telegram_enabled {
-                process_telegram_commands(selfmod, code_deployer).await;
+                process_telegram_commands(selfmod, code_deployer, causal_analyzer).await;
             }
 
             match health.check() {
@@ -1496,6 +1550,27 @@ async fn run_alpaca_loop(
                     ca.graph_mut().prune_old(90);
                 }
 
+                // Run monthly FCI discovery on first of month (expensive operation)
+                if now.day() == 1 {
+                    info!("[FCI] Running monthly latent confounder discovery...");
+                    let mut ca = causal_analyzer.lock().unwrap();
+                    match ca.discover_with_latents() {
+                        Some(result) => {
+                            info!("[FCI] Discovery complete:");
+                            info!("  - {} nodes in PAG", result.pag.nodes.len());
+                            info!("  - {} definite edges", result.definite_edges.len());
+                            info!("  - {} uncertain edges", result.uncertain_edges.len());
+                            info!("  - {} latent confounders discovered", result.latent_confounders.len());
+                            for (a, b) in result.latent_confounders.iter().take(5) {
+                                info!("    Latent confounder between {} and {}", a, b);
+                            }
+                        }
+                        None => {
+                            info!("[FCI] Insufficient data for discovery (need 30+ observations)");
+                        }
+                    }
+                }
+
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();
                     telegram::send_daily_summary(
@@ -1565,7 +1640,7 @@ async fn run_ibkr_loop(
 
             // Poll for Telegram commands
             if telegram_enabled {
-                process_telegram_commands(selfmod, code_deployer).await;
+                process_telegram_commands(selfmod, code_deployer, causal_analyzer).await;
             }
 
             match health.check() {
@@ -1712,6 +1787,27 @@ async fn run_ibkr_loop(
                     }
                     // Prune old relationships (older than 90 days)
                     ca.graph_mut().prune_old(90);
+                }
+
+                // Run monthly FCI discovery on first of month (expensive operation)
+                if now.day() == 1 {
+                    info!("[FCI] Running monthly latent confounder discovery...");
+                    let mut ca = causal_analyzer.lock().unwrap();
+                    match ca.discover_with_latents() {
+                        Some(result) => {
+                            info!("[FCI] Discovery complete:");
+                            info!("  - {} nodes in PAG", result.pag.nodes.len());
+                            info!("  - {} definite edges", result.definite_edges.len());
+                            info!("  - {} uncertain edges", result.uncertain_edges.len());
+                            info!("  - {} latent confounders discovered", result.latent_confounders.len());
+                            for (a, b) in result.latent_confounders.iter().take(5) {
+                                info!("    Latent confounder between {} and {}", a, b);
+                            }
+                        }
+                        None => {
+                            info!("[FCI] Insufficient data for discovery (need 30+ observations)");
+                        }
+                    }
                 }
 
                 if telegram_enabled {

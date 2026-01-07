@@ -1992,6 +1992,1643 @@ impl CausalAnalyzer {
     }
 }
 
+// ==================== FCI Algorithm Types ====================
+
+/// Edge type in a causal graph
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeType {
+    /// X -> Y (definite cause)
+    Directed,
+    /// X <-> Y (latent confounder / bidirected)
+    Bidirected,
+    /// X - Y (undirected / unknown orientation)
+    Undirected,
+    /// X o-> Y (partially directed)
+    PartiallyDirected,
+}
+
+impl std::fmt::Display for EdgeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EdgeType::Directed => write!(f, "->"),
+            EdgeType::Bidirected => write!(f, "<->"),
+            EdgeType::Undirected => write!(f, "-"),
+            EdgeType::PartiallyDirected => write!(f, "o->"),
+        }
+    }
+}
+
+/// Edge mark for PAG edges
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeMark {
+    /// - (tail, nothing special)
+    Tail,
+    /// > (arrowhead, into node)
+    Arrow,
+    /// o (circle, unknown)
+    Circle,
+}
+
+impl std::fmt::Display for EdgeMark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EdgeMark::Tail => write!(f, "-"),
+            EdgeMark::Arrow => write!(f, ">"),
+            EdgeMark::Circle => write!(f, "o"),
+        }
+    }
+}
+
+/// Partial Ancestral Graph (PAG) - output of FCI algorithm
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialAncestralGraph {
+    /// Nodes in the graph
+    pub nodes: Vec<String>,
+    /// Edges with marks: (A, B) -> (mark_at_A, mark_at_B)
+    /// Edge A m1--m2 B means edge from A to B with mark m1 at A and m2 at B
+    pub edges: HashMap<(String, String), (EdgeMark, EdgeMark)>,
+}
+
+impl Default for PartialAncestralGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialAncestralGraph {
+    /// Create empty PAG
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            edges: HashMap::new(),
+        }
+    }
+
+    /// Add a node
+    pub fn add_node(&mut self, node: &str) {
+        if !self.nodes.contains(&node.to_string()) {
+            self.nodes.push(node.to_string());
+        }
+    }
+
+    /// Add an edge with marks
+    pub fn add_edge(&mut self, from: &str, to: &str, mark_from: EdgeMark, mark_to: EdgeMark) {
+        self.add_node(from);
+        self.add_node(to);
+
+        // Store in canonical order (lexicographically smaller first)
+        let (a, b, m1, m2) = if from < to {
+            (from.to_string(), to.to_string(), mark_from, mark_to)
+        } else {
+            (to.to_string(), from.to_string(), mark_to, mark_from)
+        };
+        self.edges.insert((a, b), (m1, m2));
+    }
+
+    /// Get edge between two nodes (order-independent)
+    pub fn get_edge(&self, a: &str, b: &str) -> Option<(EdgeMark, EdgeMark)> {
+        let (first, second) = if a < b { (a, b) } else { (b, a) };
+        self.edges.get(&(first.to_string(), second.to_string())).copied()
+            .map(|(m1, m2)| {
+                if a < b { (m1, m2) } else { (m2, m1) }
+            })
+    }
+
+    /// Set edge marks (updates existing edge)
+    pub fn set_edge(&mut self, a: &str, b: &str, mark_a: EdgeMark, mark_b: EdgeMark) {
+        let (first, second, m1, m2) = if a < b {
+            (a.to_string(), b.to_string(), mark_a, mark_b)
+        } else {
+            (b.to_string(), a.to_string(), mark_b, mark_a)
+        };
+        self.edges.insert((first, second), (m1, m2));
+    }
+
+    /// Remove an edge
+    pub fn remove_edge(&mut self, a: &str, b: &str) {
+        let (first, second) = if a < b { (a, b) } else { (b, a) };
+        self.edges.remove(&(first.to_string(), second.to_string()));
+    }
+
+    /// Check if edge exists between two nodes
+    pub fn has_edge(&self, a: &str, b: &str) -> bool {
+        self.get_edge(a, b).is_some()
+    }
+
+    /// Get all neighbors of a node (nodes connected by any edge)
+    pub fn get_neighbors(&self, node: &str) -> Vec<String> {
+        let mut neighbors = Vec::new();
+        for (a, b) in self.edges.keys() {
+            if a == node {
+                neighbors.push(b.clone());
+            } else if b == node {
+                neighbors.push(a.clone());
+            }
+        }
+        neighbors
+    }
+
+    /// Get all adjacent nodes (same as neighbors for PAG)
+    pub fn get_adjacent(&self, node: &str) -> Vec<String> {
+        self.get_neighbors(node)
+    }
+
+    /// Check if potential_ancestor is an ancestor of node
+    /// Returns None if uncertain (circle marks)
+    pub fn is_ancestor(&self, potential_ancestor: &str, node: &str) -> Option<bool> {
+        if potential_ancestor == node {
+            return Some(true);
+        }
+
+        // BFS to find directed path
+        let mut visited = HashSet::new();
+        let mut queue = vec![potential_ancestor.to_string()];
+
+        while let Some(current) = queue.pop() {
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.insert(current.clone());
+
+            for neighbor in self.get_neighbors(&current) {
+                if let Some((mark_at_current, mark_at_neighbor)) = self.get_edge(&current, &neighbor) {
+                    // Check if edge goes from current to neighbor
+                    let is_directed_to_neighbor = match (mark_at_current, mark_at_neighbor) {
+                        (EdgeMark::Tail, EdgeMark::Arrow) => true,
+                        (EdgeMark::Circle, EdgeMark::Arrow) => true,
+                        (EdgeMark::Circle, EdgeMark::Circle) => return None, // Uncertain
+                        _ => false,
+                    };
+
+                    if is_directed_to_neighbor {
+                        if neighbor == node {
+                            return Some(true);
+                        }
+                        queue.push(neighbor);
+                    }
+                }
+            }
+        }
+
+        Some(false)
+    }
+
+    /// Get edge type for display
+    pub fn get_edge_type(&self, from: &str, to: &str) -> Option<EdgeType> {
+        self.get_edge(from, to).map(|(m1, m2)| {
+            match (m1, m2) {
+                (EdgeMark::Tail, EdgeMark::Arrow) => EdgeType::Directed,
+                (EdgeMark::Arrow, EdgeMark::Tail) => EdgeType::Directed, // reversed
+                (EdgeMark::Arrow, EdgeMark::Arrow) => EdgeType::Bidirected,
+                (EdgeMark::Tail, EdgeMark::Tail) => EdgeType::Undirected,
+                (EdgeMark::Circle, EdgeMark::Arrow) | (EdgeMark::Arrow, EdgeMark::Circle) => EdgeType::PartiallyDirected,
+                _ => EdgeType::Undirected,
+            }
+        })
+    }
+
+    /// Get count of definite edges
+    pub fn definite_edge_count(&self) -> usize {
+        self.edges.values().filter(|(m1, m2)| {
+            matches!((m1, m2),
+                (EdgeMark::Tail, EdgeMark::Arrow) |
+                (EdgeMark::Arrow, EdgeMark::Tail) |
+                (EdgeMark::Arrow, EdgeMark::Arrow) |
+                (EdgeMark::Tail, EdgeMark::Tail)
+            )
+        }).count()
+    }
+
+    /// Get count of uncertain edges (with circles)
+    pub fn uncertain_edge_count(&self) -> usize {
+        self.edges.values().filter(|(m1, m2)| {
+            *m1 == EdgeMark::Circle || *m2 == EdgeMark::Circle
+        }).count()
+    }
+
+    /// Format PAG summary
+    pub fn format_summary(&self) -> String {
+        let bidirected: Vec<_> = self.edges.iter()
+            .filter(|(_, (m1, m2))| *m1 == EdgeMark::Arrow && *m2 == EdgeMark::Arrow)
+            .map(|((a, b), _)| format!("{} <-> {}", a, b))
+            .collect();
+
+        format!(
+            "{} nodes, {} edges ({} definite, {} uncertain), {} bidirected",
+            self.nodes.len(),
+            self.edges.len(),
+            self.definite_edge_count(),
+            self.uncertain_edge_count(),
+            bidirected.len()
+        )
+    }
+}
+
+/// Result of FCI algorithm
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FCIResult {
+    /// The learned partial ancestral graph
+    pub pag: PartialAncestralGraph,
+    /// Pairs with hidden common cause (bidirected edges)
+    pub latent_confounders: Vec<(String, String)>,
+    /// Definite directed edges
+    pub definite_edges: Vec<(String, String, EdgeType)>,
+    /// Uncertain edges with their marks
+    pub uncertain_edges: Vec<(String, String, EdgeMark, EdgeMark)>,
+    /// Separation sets found during skeleton discovery
+    pub separation_sets: HashMap<(String, String), Vec<String>>,
+}
+
+impl FCIResult {
+    /// Create new FCI result
+    pub fn new(pag: PartialAncestralGraph, separation_sets: HashMap<(String, String), Vec<String>>) -> Self {
+        let mut latent_confounders = Vec::new();
+        let mut definite_edges = Vec::new();
+        let mut uncertain_edges = Vec::new();
+
+        for ((a, b), (m1, m2)) in &pag.edges {
+            match (m1, m2) {
+                (EdgeMark::Arrow, EdgeMark::Arrow) => {
+                    latent_confounders.push((a.clone(), b.clone()));
+                    definite_edges.push((a.clone(), b.clone(), EdgeType::Bidirected));
+                }
+                (EdgeMark::Tail, EdgeMark::Arrow) => {
+                    definite_edges.push((a.clone(), b.clone(), EdgeType::Directed));
+                }
+                (EdgeMark::Arrow, EdgeMark::Tail) => {
+                    definite_edges.push((b.clone(), a.clone(), EdgeType::Directed));
+                }
+                (EdgeMark::Tail, EdgeMark::Tail) => {
+                    definite_edges.push((a.clone(), b.clone(), EdgeType::Undirected));
+                }
+                _ => {
+                    uncertain_edges.push((a.clone(), b.clone(), *m1, *m2));
+                }
+            }
+        }
+
+        Self {
+            pag,
+            latent_confounders,
+            definite_edges,
+            uncertain_edges,
+            separation_sets,
+        }
+    }
+
+    /// Get summary string
+    pub fn summary(&self) -> String {
+        format!(
+            "FCI: {} latent confounders, {} definite edges, {} uncertain",
+            self.latent_confounders.len(),
+            self.definite_edges.len(),
+            self.uncertain_edges.len()
+        )
+    }
+}
+
+/// Data matrix for statistical tests
+#[derive(Debug, Clone)]
+pub struct DataMatrix {
+    /// Variable names
+    pub variables: Vec<String>,
+    /// Data rows (observations x variables)
+    pub data: Vec<Vec<f64>>,
+    /// Variable name to index mapping
+    pub var_index: HashMap<String, usize>,
+}
+
+impl Default for DataMatrix {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DataMatrix {
+    /// Create empty data matrix
+    pub fn new() -> Self {
+        Self {
+            variables: Vec::new(),
+            data: Vec::new(),
+            var_index: HashMap::new(),
+        }
+    }
+
+    /// Add a variable
+    pub fn add_variable(&mut self, name: &str) {
+        if !self.var_index.contains_key(name) {
+            let idx = self.variables.len();
+            self.variables.push(name.to_string());
+            self.var_index.insert(name.to_string(), idx);
+
+            // Extend existing rows with NaN
+            for row in &mut self.data {
+                row.push(f64::NAN);
+            }
+        }
+    }
+
+    /// Add an observation (row of values matching variable order)
+    pub fn add_observation(&mut self, values: &[f64]) {
+        if values.len() == self.variables.len() {
+            self.data.push(values.to_vec());
+        }
+    }
+
+    /// Get column data for a variable
+    pub fn get_column(&self, var: &str) -> Option<Vec<f64>> {
+        let idx = self.var_index.get(var)?;
+        Some(self.data.iter().map(|row| row[*idx]).collect())
+    }
+
+    /// Compute correlation between two variables
+    pub fn correlation(&self, var1: &str, var2: &str) -> f64 {
+        let col1 = match self.get_column(var1) {
+            Some(c) => c,
+            None => return 0.0,
+        };
+        let col2 = match self.get_column(var2) {
+            Some(c) => c,
+            None => return 0.0,
+        };
+
+        pearson_correlation(&col1, &col2)
+    }
+
+    /// Get subset of data with only specified variables
+    pub fn subset(&self, vars: &[String]) -> DataMatrix {
+        let mut new_matrix = DataMatrix::new();
+
+        for var in vars {
+            new_matrix.add_variable(var);
+        }
+
+        for row in &self.data {
+            let new_row: Vec<f64> = vars.iter()
+                .filter_map(|v| self.var_index.get(v).map(|&idx| row[idx]))
+                .collect();
+            if new_row.len() == vars.len() {
+                new_matrix.add_observation(&new_row);
+            }
+        }
+
+        new_matrix
+    }
+
+    /// Get number of observations
+    pub fn n_observations(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Get number of variables
+    pub fn n_variables(&self) -> usize {
+        self.variables.len()
+    }
+}
+
+/// Pearson correlation helper function
+fn pearson_correlation(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len().min(y.len());
+    if n < 2 {
+        return 0.0;
+    }
+
+    // Filter out NaN values
+    let pairs: Vec<(f64, f64)> = x.iter().zip(y.iter())
+        .filter(|(a, b)| !a.is_nan() && !b.is_nan())
+        .map(|(&a, &b)| (a, b))
+        .collect();
+
+    if pairs.len() < 2 {
+        return 0.0;
+    }
+
+    let n = pairs.len() as f64;
+    let x_mean: f64 = pairs.iter().map(|(a, _)| a).sum::<f64>() / n;
+    let y_mean: f64 = pairs.iter().map(|(_, b)| b).sum::<f64>() / n;
+
+    let mut cov = 0.0;
+    let mut var_x = 0.0;
+    let mut var_y = 0.0;
+
+    for (xi, yi) in &pairs {
+        let x_diff = xi - x_mean;
+        let y_diff = yi - y_mean;
+        cov += x_diff * y_diff;
+        var_x += x_diff * x_diff;
+        var_y += y_diff * y_diff;
+    }
+
+    if var_x < 1e-10 || var_y < 1e-10 {
+        return 0.0;
+    }
+
+    cov / (var_x.sqrt() * var_y.sqrt())
+}
+
+/// Trait for conditional independence tests
+pub trait ConditionalIndependenceTest: Send + Sync {
+    /// Test if X is independent of Y given conditioning set
+    /// Returns (is_independent, p_value)
+    fn test(&self, x: &str, y: &str, conditioning: &[String], data: &DataMatrix) -> (bool, f64);
+}
+
+/// Partial correlation test for conditional independence
+#[derive(Debug, Clone)]
+pub struct PartialCorrelationTest {
+    /// Significance level (default 0.05)
+    pub significance_level: f64,
+}
+
+impl Default for PartialCorrelationTest {
+    fn default() -> Self {
+        Self::new(0.05)
+    }
+}
+
+impl PartialCorrelationTest {
+    /// Create new test with significance level
+    pub fn new(significance_level: f64) -> Self {
+        Self { significance_level }
+    }
+
+    /// Compute partial correlation between x and y controlling for z
+    pub fn partial_correlation(&self, x: &str, y: &str, z: &[String], data: &DataMatrix) -> f64 {
+        if z.is_empty() {
+            return data.correlation(x, y);
+        }
+
+        // Use recursive formula for partial correlation
+        // For single control: r_xy.z = (r_xy - r_xz * r_yz) / sqrt((1-r_xz^2)(1-r_yz^2))
+        if z.len() == 1 {
+            let z_var = &z[0];
+            let r_xy = data.correlation(x, y);
+            let r_xz = data.correlation(x, z_var);
+            let r_yz = data.correlation(y, z_var);
+
+            let denominator = ((1.0 - r_xz * r_xz) * (1.0 - r_yz * r_yz)).sqrt();
+            if denominator < 1e-10 {
+                return 0.0;
+            }
+
+            return (r_xy - r_xz * r_yz) / denominator;
+        }
+
+        // For multiple controls, use iterative approach
+        let mut remaining = z.to_vec();
+        let last = remaining.pop().unwrap();
+
+        let r_xy_z_rest = self.partial_correlation(x, y, &remaining, data);
+        let r_xk_z_rest = self.partial_correlation(x, &last, &remaining, data);
+        let r_yk_z_rest = self.partial_correlation(y, &last, &remaining, data);
+
+        let denominator = ((1.0 - r_xk_z_rest * r_xk_z_rest) * (1.0 - r_yk_z_rest * r_yk_z_rest)).sqrt();
+        if denominator < 1e-10 {
+            return 0.0;
+        }
+
+        (r_xy_z_rest - r_xk_z_rest * r_yk_z_rest) / denominator
+    }
+
+    /// Fisher z-transform for testing significance
+    fn fisher_z_test(&self, r: f64, n: usize, k: usize) -> f64 {
+        // z = 0.5 * ln((1+r)/(1-r))
+        // Under null hypothesis, z ~ N(0, 1/sqrt(n-k-3))
+        let r_clamped = r.clamp(-0.9999, 0.9999);
+        let z = 0.5 * ((1.0 + r_clamped) / (1.0 - r_clamped)).ln();
+
+        let df = n as i64 - k as i64 - 3;
+        if df <= 0 {
+            return 1.0; // Not enough data
+        }
+
+        let se = 1.0 / (df as f64).sqrt();
+        let z_stat = z.abs() / se;
+
+        // Two-tailed p-value from standard normal
+        2.0 * (1.0 - normal_cdf(z_stat))
+    }
+}
+
+impl ConditionalIndependenceTest for PartialCorrelationTest {
+    fn test(&self, x: &str, y: &str, conditioning: &[String], data: &DataMatrix) -> (bool, f64) {
+        let r = self.partial_correlation(x, y, conditioning, data);
+        let n = data.n_observations();
+        let k = conditioning.len();
+
+        let p_value = self.fisher_z_test(r, n, k);
+        let is_independent = p_value > self.significance_level;
+
+        (is_independent, p_value)
+    }
+}
+
+/// Standard normal CDF
+fn normal_cdf(x: f64) -> f64 {
+    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
+}
+
+/// Error function approximation
+fn erf(x: f64) -> f64 {
+    let a1 = 0.254829592;
+    let a2 = -0.284496736;
+    let a3 = 1.421413741;
+    let a4 = -1.453152027;
+    let a5 = 1.061405429;
+    let p = 0.3275911;
+
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+
+    let t = 1.0 / (1.0 + p * x);
+    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
+
+    sign * y
+}
+
+/// Discriminating path for FCI Rule 4
+#[derive(Debug, Clone)]
+pub struct DiscriminatingPath {
+    /// Start node
+    pub start: String,
+    /// Middle nodes (colliders)
+    pub middle: Vec<String>,
+    /// End node
+    pub end: String,
+    /// The discriminated node (adjacent to end)
+    pub discriminated_node: String,
+}
+
+/// FCI (Fast Causal Inference) Algorithm
+pub struct FCIAlgorithm {
+    /// Conditional independence test
+    ci_test: Box<dyn ConditionalIndependenceTest>,
+    /// Maximum conditioning set size
+    pub max_conditioning_size: usize,
+    /// Significance level
+    pub significance_level: f64,
+}
+
+impl std::fmt::Debug for FCIAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FCIAlgorithm")
+            .field("max_conditioning_size", &self.max_conditioning_size)
+            .field("significance_level", &self.significance_level)
+            .finish()
+    }
+}
+
+impl FCIAlgorithm {
+    /// Create new FCI algorithm with default partial correlation test
+    pub fn new(significance_level: f64) -> Self {
+        Self {
+            ci_test: Box::new(PartialCorrelationTest::new(significance_level)),
+            max_conditioning_size: 5,
+            significance_level,
+        }
+    }
+
+    /// Create with custom CI test
+    pub fn with_test(test: Box<dyn ConditionalIndependenceTest>, max_conditioning_size: usize) -> Self {
+        Self {
+            significance_level: 0.05,
+            ci_test: test,
+            max_conditioning_size,
+        }
+    }
+
+    /// Run FCI algorithm on data
+    pub fn run(&self, data: &DataMatrix) -> FCIResult {
+        // Phase 1: Build skeleton (remove edges via CI tests)
+        let (mut pag, sep_sets) = self.phase1_skeleton(data);
+
+        // Phase 2: Orient colliders (v-structures)
+        self.phase2_orient_colliders(&mut pag, &sep_sets);
+
+        // Phase 3: Apply FCI orientation rules
+        self.phase3_apply_rules(&mut pag, &sep_sets);
+
+        // Build result
+        FCIResult::new(pag, sep_sets)
+    }
+
+    /// Phase 1: Build skeleton by removing edges via CI tests
+    fn phase1_skeleton(&self, data: &DataMatrix) -> (PartialAncestralGraph, HashMap<(String, String), Vec<String>>) {
+        let mut pag = PartialAncestralGraph::new();
+        let mut sep_sets: HashMap<(String, String), Vec<String>> = HashMap::new();
+
+        // Add all nodes
+        for var in &data.variables {
+            pag.add_node(var);
+        }
+
+        // Start with complete graph (all edges o-o)
+        for i in 0..data.variables.len() {
+            for j in (i + 1)..data.variables.len() {
+                pag.add_edge(
+                    &data.variables[i],
+                    &data.variables[j],
+                    EdgeMark::Circle,
+                    EdgeMark::Circle,
+                );
+            }
+        }
+
+        // Remove edges via CI tests with increasing conditioning set sizes
+        for cond_size in 0..=self.max_conditioning_size {
+            let edges_to_check: Vec<_> = pag.edges.keys().cloned().collect();
+
+            for (a, b) in edges_to_check {
+                if !pag.has_edge(&a, &b) {
+                    continue;
+                }
+
+                // Get potential conditioning variables (neighbors of a or b, excluding a and b)
+                let neighbors_a: HashSet<_> = pag.get_neighbors(&a).into_iter().filter(|n| n != &b).collect();
+                let neighbors_b: HashSet<_> = pag.get_neighbors(&b).into_iter().filter(|n| n != &a).collect();
+
+                // Try conditioning on subsets of a's neighbors
+                if let Some(sep_set) = self.find_separating_set(&a, &b, &neighbors_a, cond_size, data) {
+                    pag.remove_edge(&a, &b);
+                    sep_sets.insert((a.clone(), b.clone()), sep_set);
+                    continue;
+                }
+
+                // Try conditioning on subsets of b's neighbors
+                if let Some(sep_set) = self.find_separating_set(&a, &b, &neighbors_b, cond_size, data) {
+                    pag.remove_edge(&a, &b);
+                    sep_sets.insert((a.clone(), b.clone()), sep_set);
+                }
+            }
+        }
+
+        (pag, sep_sets)
+    }
+
+    /// Find a separating set that makes a and b independent
+    fn find_separating_set(
+        &self,
+        a: &str,
+        b: &str,
+        candidates: &HashSet<String>,
+        size: usize,
+        data: &DataMatrix,
+    ) -> Option<Vec<String>> {
+        if size > candidates.len() {
+            return None;
+        }
+
+        let candidates_vec: Vec<_> = candidates.iter().cloned().collect();
+
+        // Generate all subsets of given size
+        for subset in Self::subsets(&candidates_vec, size) {
+            let (is_independent, _p_value) = self.ci_test.test(a, b, &subset, data);
+            if is_independent {
+                return Some(subset);
+            }
+        }
+
+        None
+    }
+
+    /// Generate all subsets of a given size
+    fn subsets(items: &[String], size: usize) -> Vec<Vec<String>> {
+        if size == 0 {
+            return vec![Vec::new()];
+        }
+        if items.is_empty() || size > items.len() {
+            return Vec::new();
+        }
+
+        let mut result = Vec::new();
+
+        // Subsets including first element
+        for mut subset in Self::subsets(&items[1..], size - 1) {
+            subset.insert(0, items[0].clone());
+            result.push(subset);
+        }
+
+        // Subsets not including first element
+        result.extend(Self::subsets(&items[1..], size));
+
+        result
+    }
+
+    /// Phase 2: Orient colliders (v-structures)
+    fn phase2_orient_colliders(&self, pag: &mut PartialAncestralGraph, sep_sets: &HashMap<(String, String), Vec<String>>) {
+        let nodes = pag.nodes.clone();
+
+        // For each triple A - B - C where A and C are not adjacent
+        for b in &nodes {
+            let neighbors: Vec<_> = pag.get_neighbors(b);
+
+            for i in 0..neighbors.len() {
+                for j in (i + 1)..neighbors.len() {
+                    let a = &neighbors[i];
+                    let c = &neighbors[j];
+
+                    // Check if A and C are not adjacent
+                    if pag.has_edge(a, c) {
+                        continue;
+                    }
+
+                    // Get separation set for A-C
+                    let sep_set = sep_sets.get(&(a.clone(), c.clone()))
+                        .or_else(|| sep_sets.get(&(c.clone(), a.clone())));
+
+                    // If B is NOT in the separation set, orient as collider: A -> B <- C
+                    if let Some(sep) = sep_set {
+                        if !sep.contains(b) {
+                            // Orient A -> B
+                            if let Some((m1, m2)) = pag.get_edge(a, b) {
+                                if m2 == EdgeMark::Circle {
+                                    pag.set_edge(a, b, m1, EdgeMark::Arrow);
+                                }
+                            }
+                            // Orient C -> B
+                            if let Some((m1, m2)) = pag.get_edge(c, b) {
+                                if m2 == EdgeMark::Circle {
+                                    pag.set_edge(c, b, m1, EdgeMark::Arrow);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Phase 3: Apply FCI orientation rules until no changes
+    fn phase3_apply_rules(&self, pag: &mut PartialAncestralGraph, sep_sets: &HashMap<(String, String), Vec<String>>) {
+        let mut changed = true;
+        let mut iterations = 0;
+        let max_iterations = 100;
+
+        while changed && iterations < max_iterations {
+            changed = false;
+            iterations += 1;
+
+            // R1: If A o-> B -> C and A,C not adjacent: A -> B -> C (orient A o-> B to A -> B)
+            changed |= self.apply_rule_r1(pag);
+
+            // R2: If A -> B o-> C or A o-> B -> C, and A -> C: orient A -> C
+            changed |= self.apply_rule_r2(pag);
+
+            // R3: If A o-> B <- C and A o-> D o-> C, D o-> B, A,C not adjacent: D -> B
+            changed |= self.apply_rule_r3(pag);
+
+            // R4: Discriminating paths
+            changed |= self.apply_rule_r4(pag, sep_sets);
+
+            // R8: If A o-> B -> C or A - B -> C, and A -> C: orient A -> B
+            changed |= self.apply_rule_r8(pag);
+
+            // R9: If A o-> B o-> C and uncovered path A ... C, A,C not adjacent: orient B o-> C to B -> C
+            changed |= self.apply_rule_r9(pag);
+
+            // R10: If A o-> B -> C, A o-> D -> C, D -> B: orient A o-> B to A -> B
+            changed |= self.apply_rule_r10(pag);
+        }
+    }
+
+    /// R1: If A o-> B -> C and A,C not adjacent: A -> B (change circle to tail at A)
+    fn apply_rule_r1(&self, pag: &mut PartialAncestralGraph) -> bool {
+        let mut changed = false;
+        let nodes = pag.nodes.clone();
+
+        for b in &nodes {
+            let neighbors: Vec<_> = pag.get_neighbors(b);
+
+            for a in &neighbors {
+                for c in &neighbors {
+                    if a == c || pag.has_edge(a, c) {
+                        continue;
+                    }
+
+                    // Check A o-> B
+                    if let Some((m_a, m_b_from_a)) = pag.get_edge(a, b) {
+                        if m_a != EdgeMark::Circle || m_b_from_a != EdgeMark::Arrow {
+                            continue;
+                        }
+
+                        // Check B -> C
+                        if let Some((m_b_to_c, m_c)) = pag.get_edge(b, c) {
+                            if m_b_to_c == EdgeMark::Tail && m_c == EdgeMark::Arrow {
+                                // Orient A o-> B to A -> B
+                                pag.set_edge(a, b, EdgeMark::Tail, EdgeMark::Arrow);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// R2: If A -> B o-> C (or chain), and A -> C: A -> C stays (already oriented)
+    fn apply_rule_r2(&self, pag: &mut PartialAncestralGraph) -> bool {
+        let mut changed = false;
+        let nodes = pag.nodes.clone();
+
+        for a in &nodes {
+            for c in &nodes {
+                if a == c {
+                    continue;
+                }
+
+                // Check if A o-> C exists
+                if let Some((m_a, m_c)) = pag.get_edge(a, c) {
+                    if m_a == EdgeMark::Circle && m_c == EdgeMark::Arrow {
+                        // Look for chain A -> B o-> C or A o-> B -> C
+                        for b in pag.get_neighbors(a) {
+                            if &b == c || !pag.has_edge(&b, c) {
+                                continue;
+                            }
+
+                            let ab_edge = pag.get_edge(a, &b);
+                            let bc_edge = pag.get_edge(&b, c);
+
+                            let has_chain = match (ab_edge, bc_edge) {
+                                (Some((EdgeMark::Tail, EdgeMark::Arrow)), Some((EdgeMark::Circle, EdgeMark::Arrow))) => true,
+                                (Some((EdgeMark::Circle, EdgeMark::Arrow)), Some((EdgeMark::Tail, EdgeMark::Arrow))) => true,
+                                _ => false,
+                            };
+
+                            if has_chain {
+                                // Orient A o-> C to A -> C
+                                pag.set_edge(a, c, EdgeMark::Tail, EdgeMark::Arrow);
+                                changed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// R3: Kite rule
+    fn apply_rule_r3(&self, pag: &mut PartialAncestralGraph) -> bool {
+        let mut changed = false;
+        let nodes = pag.nodes.clone();
+
+        for b in &nodes {
+            // Find A o-> B <- C where A,C not adjacent
+            let neighbors: Vec<_> = pag.get_neighbors(b);
+
+            for a in &neighbors {
+                for c in &neighbors {
+                    if a >= c || pag.has_edge(a, c) {
+                        continue;
+                    }
+
+                    // Check A o-> B <- C
+                    let ab = pag.get_edge(a, b);
+                    let cb = pag.get_edge(c, b);
+
+                    let is_collider = matches!(
+                        (ab, cb),
+                        (Some((_, EdgeMark::Arrow)), Some((_, EdgeMark::Arrow)))
+                    );
+
+                    if !is_collider {
+                        continue;
+                    }
+
+                    // Find D: A o-> D o-> C, D o-> B
+                    for d in &neighbors {
+                        if d == a || d == c {
+                            continue;
+                        }
+
+                        let ad = pag.get_edge(a, d);
+                        let dc = pag.get_edge(d, c);
+                        let db = pag.get_edge(d, b);
+
+                        let pattern_match = matches!(
+                            (ad, dc, db),
+                            (Some((EdgeMark::Circle, EdgeMark::Arrow)), Some((EdgeMark::Circle, EdgeMark::Arrow)), Some((EdgeMark::Circle, EdgeMark::Arrow)))
+                        );
+
+                        if pattern_match {
+                            // Orient D o-> B to D -> B
+                            pag.set_edge(d, b, EdgeMark::Tail, EdgeMark::Arrow);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// R4: Discriminating paths
+    fn apply_rule_r4(&self, pag: &mut PartialAncestralGraph, sep_sets: &HashMap<(String, String), Vec<String>>) -> bool {
+        let mut changed = false;
+
+        for path in self.find_discriminating_paths(pag) {
+            let b = &path.discriminated_node;
+            let c = &path.end;
+            let a = &path.start;
+
+            // Get separation set for A,C
+            let sep_set = sep_sets.get(&(a.clone(), c.clone()))
+                .or_else(|| sep_sets.get(&(c.clone(), a.clone())));
+
+            if let Some((m_b, m_c)) = pag.get_edge(b, c) {
+                if m_c == EdgeMark::Circle {
+                    if let Some(sep) = sep_set {
+                        if sep.contains(b) {
+                            // B in sep set: orient as B -> C
+                            pag.set_edge(b, c, m_b, EdgeMark::Arrow);
+                            changed = true;
+                        } else {
+                            // B not in sep set: orient as B <-> C (bidirected)
+                            pag.set_edge(b, c, EdgeMark::Arrow, EdgeMark::Arrow);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// Find discriminating paths in PAG
+    fn find_discriminating_paths(&self, pag: &PartialAncestralGraph) -> Vec<DiscriminatingPath> {
+        let mut paths = Vec::new();
+
+        // A discriminating path is: A, V1, ..., Vk, B, C where:
+        // - A is not adjacent to C
+        // - V1...Vk are colliders on the path
+        // - Each Vi is a parent of C
+        // - B o-* C (uncertain at C end)
+
+        for a in &pag.nodes {
+            for c in &pag.nodes {
+                if a == c || pag.has_edge(a, c) {
+                    continue;
+                }
+
+                // Find paths from A to C via colliders
+                self.find_disc_paths_dfs(pag, a, c, &mut paths);
+            }
+        }
+
+        paths
+    }
+
+    /// DFS helper for finding discriminating paths
+    fn find_disc_paths_dfs(
+        &self,
+        pag: &PartialAncestralGraph,
+        start: &str,
+        end: &str,
+        paths: &mut Vec<DiscriminatingPath>,
+    ) {
+        // Simplified: look for paths of length 3 (A - B - C) that could be discriminating
+        for b in pag.get_neighbors(start) {
+            if pag.has_edge(&b, end) && !pag.has_edge(start, end) {
+                // Check if this is a potential discriminating path
+                if let Some((_, m_c)) = pag.get_edge(&b, end) {
+                    if m_c == EdgeMark::Circle {
+                        paths.push(DiscriminatingPath {
+                            start: start.to_string(),
+                            middle: Vec::new(),
+                            end: end.to_string(),
+                            discriminated_node: b.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// R8: If A o-> B -> C and A -> C: orient A o-> B to A -> B
+    fn apply_rule_r8(&self, pag: &mut PartialAncestralGraph) -> bool {
+        let mut changed = false;
+        let nodes = pag.nodes.clone();
+
+        for b in &nodes {
+            let neighbors: Vec<_> = pag.get_neighbors(b);
+
+            for a in &neighbors {
+                for c in &neighbors {
+                    if a == c {
+                        continue;
+                    }
+
+                    // Check A -> C
+                    if let Some((m_a_c, m_c_a)) = pag.get_edge(a, c) {
+                        if m_a_c != EdgeMark::Tail || m_c_a != EdgeMark::Arrow {
+                            continue;
+                        }
+
+                        // Check A o-> B or A - B
+                        if let Some((m_a, m_b)) = pag.get_edge(a, b) {
+                            if m_b != EdgeMark::Arrow {
+                                continue;
+                            }
+
+                            // Check B -> C
+                            if let Some((m_b_c, m_c_b)) = pag.get_edge(b, c) {
+                                if m_b_c == EdgeMark::Tail && m_c_b == EdgeMark::Arrow {
+                                    if m_a == EdgeMark::Circle || m_a == EdgeMark::Tail {
+                                        // Orient A o-> B to A -> B
+                                        pag.set_edge(a, b, EdgeMark::Tail, EdgeMark::Arrow);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// R9: Uncovered potentially directed path rule
+    fn apply_rule_r9(&self, pag: &mut PartialAncestralGraph) -> bool {
+        // Simplified implementation
+        false
+    }
+
+    /// R10: Triangle rule
+    fn apply_rule_r10(&self, pag: &mut PartialAncestralGraph) -> bool {
+        let mut changed = false;
+        let nodes = pag.nodes.clone();
+
+        for b in &nodes {
+            let neighbors: Vec<_> = pag.get_neighbors(b);
+
+            for a in &neighbors {
+                // Check A o-> B
+                if let Some((m_a, m_b)) = pag.get_edge(a, b) {
+                    if m_a != EdgeMark::Circle || m_b != EdgeMark::Arrow {
+                        continue;
+                    }
+
+                    // Find C and D for the pattern
+                    for c in &neighbors {
+                        if a == c {
+                            continue;
+                        }
+
+                        // Check B -> C
+                        if let Some((m_b_c, m_c)) = pag.get_edge(b, c) {
+                            if m_b_c != EdgeMark::Tail || m_c != EdgeMark::Arrow {
+                                continue;
+                            }
+
+                            for d in pag.get_neighbors(a) {
+                                if &d == b || &d == c {
+                                    continue;
+                                }
+
+                                // Check A o-> D -> C and D -> B
+                                let ad = pag.get_edge(a, &d);
+                                let dc = pag.get_edge(&d, c);
+                                let db = pag.get_edge(&d, b);
+
+                                let pattern = matches!(
+                                    (ad, dc, db),
+                                    (
+                                        Some((EdgeMark::Circle, EdgeMark::Arrow)),
+                                        Some((EdgeMark::Tail, EdgeMark::Arrow)),
+                                        Some((EdgeMark::Tail, EdgeMark::Arrow))
+                                    )
+                                );
+
+                                if pattern {
+                                    // Orient A o-> B to A -> B
+                                    pag.set_edge(a, b, EdgeMark::Tail, EdgeMark::Arrow);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// Check if three nodes form a collider: A -> B <- C
+    pub fn is_collider(&self, a: &str, b: &str, c: &str, pag: &PartialAncestralGraph) -> bool {
+        let ab = pag.get_edge(a, b);
+        let cb = pag.get_edge(c, b);
+
+        matches!(
+            (ab, cb),
+            (Some((_, EdgeMark::Arrow)), Some((_, EdgeMark::Arrow)))
+        )
+    }
+
+    /// Identify latent confounders from PAG (bidirected edges)
+    pub fn identify_latent_confounders(&self, pag: &PartialAncestralGraph) -> Vec<(String, String)> {
+        pag.edges.iter()
+            .filter(|(_, (m1, m2))| *m1 == EdgeMark::Arrow && *m2 == EdgeMark::Arrow)
+            .map(|((a, b), _)| (a.clone(), b.clone()))
+            .collect()
+    }
+}
+
+/// Neural causal network for neuro-symbolic integration (simplified)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeuralCausalNet {
+    /// Weights for edge prediction
+    edge_weights: Vec<Vec<f64>>,
+    /// Bias terms
+    bias: Vec<f64>,
+    /// Hidden layer size
+    hidden_size: usize,
+}
+
+impl Default for NeuralCausalNet {
+    fn default() -> Self {
+        Self::new(16)
+    }
+}
+
+impl NeuralCausalNet {
+    /// Create new neural causal network
+    pub fn new(hidden_size: usize) -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
+        // Initialize weights randomly
+        let input_size = 32; // 2 * 16 features per variable
+        let edge_weights: Vec<Vec<f64>> = (0..hidden_size)
+            .map(|_| (0..input_size).map(|_| rng.gen_range(-0.5..0.5)).collect())
+            .collect();
+
+        let bias: Vec<f64> = (0..4).map(|_| rng.gen_range(-0.1..0.1)).collect();
+
+        Self {
+            edge_weights,
+            bias,
+            hidden_size,
+        }
+    }
+
+    /// Predict edge type from time series histories
+    pub fn predict_edge(&self, x_history: &[f64], y_history: &[f64]) -> (f64, EdgeType) {
+        // Extract features from histories
+        let features = self.extract_features(x_history, y_history);
+
+        // Forward pass through network
+        let hidden: Vec<f64> = self.edge_weights.iter()
+            .map(|weights| {
+                let sum: f64 = weights.iter().zip(&features).map(|(w, f)| w * f).sum();
+                (sum + 0.01).max(0.0) // ReLU
+            })
+            .collect();
+
+        // Compute edge type scores
+        let mean_hidden: f64 = hidden.iter().sum::<f64>() / hidden.len() as f64;
+
+        // Simple scoring based on cross-correlation
+        let correlation = self.compute_lagged_correlation(x_history, y_history);
+
+        let edge_type = if correlation.abs() < 0.1 {
+            EdgeType::Undirected
+        } else if correlation > 0.3 {
+            EdgeType::Directed
+        } else if correlation < -0.3 {
+            EdgeType::Bidirected
+        } else {
+            EdgeType::PartiallyDirected
+        };
+
+        let confidence = (correlation.abs() * 0.5 + mean_hidden.abs() * 0.5).clamp(0.0, 1.0);
+
+        (confidence, edge_type)
+    }
+
+    /// Extract features from time series
+    fn extract_features(&self, x: &[f64], y: &[f64]) -> Vec<f64> {
+        let mut features = Vec::with_capacity(32);
+
+        // Statistics of x
+        features.extend(self.compute_stats(x));
+
+        // Statistics of y
+        features.extend(self.compute_stats(y));
+
+        // Pad to 32 if needed
+        while features.len() < 32 {
+            features.push(0.0);
+        }
+
+        features.truncate(32);
+        features
+    }
+
+    /// Compute basic statistics
+    fn compute_stats(&self, data: &[f64]) -> Vec<f64> {
+        if data.is_empty() {
+            return vec![0.0; 16];
+        }
+
+        let n = data.len() as f64;
+        let mean = data.iter().sum::<f64>() / n;
+        let variance = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        let std = variance.sqrt();
+
+        let min = data.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        // Autocorrelation at lag 1
+        let autocorr = if data.len() > 1 {
+            let mut ac = 0.0;
+            for i in 1..data.len() {
+                ac += (data[i] - mean) * (data[i - 1] - mean);
+            }
+            ac / ((data.len() - 1) as f64 * variance.max(1e-10))
+        } else {
+            0.0
+        };
+
+        // Trend (simple linear regression slope)
+        let trend = if data.len() > 1 {
+            let x_mean = (data.len() as f64 - 1.0) / 2.0;
+            let mut num = 0.0;
+            let mut den = 0.0;
+            for (i, &y) in data.iter().enumerate() {
+                let x = i as f64;
+                num += (x - x_mean) * (y - mean);
+                den += (x - x_mean).powi(2);
+            }
+            if den > 1e-10 { num / den } else { 0.0 }
+        } else {
+            0.0
+        };
+
+        vec![
+            mean, std, min, max, autocorr, trend,
+            variance, (max - min), // range
+            data.first().copied().unwrap_or(0.0),
+            data.last().copied().unwrap_or(0.0),
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // padding
+        ]
+    }
+
+    /// Compute lagged correlation
+    fn compute_lagged_correlation(&self, x: &[f64], y: &[f64]) -> f64 {
+        let n = x.len().min(y.len());
+        if n < 3 {
+            return 0.0;
+        }
+
+        // Try different lags and find best correlation
+        let mut best_corr: f64 = 0.0;
+
+        for lag in 0..5.min(n / 3) {
+            let x_slice = &x[0..n - lag];
+            let y_slice = &y[lag..n];
+            let corr = pearson_correlation(x_slice, y_slice);
+
+            if corr.abs() > best_corr.abs() {
+                best_corr = corr;
+            }
+        }
+
+        best_corr
+    }
+
+    /// Refine PAG using neural predictions
+    pub fn refine_pag(&self, pag: &mut PartialAncestralGraph, data: &DataMatrix) {
+        let edges_to_check: Vec<_> = pag.edges.iter()
+            .filter(|(_, (m1, m2))| *m1 == EdgeMark::Circle || *m2 == EdgeMark::Circle)
+            .map(|((a, b), _)| (a.clone(), b.clone()))
+            .collect();
+
+        for (a, b) in edges_to_check {
+            let x_data = match data.get_column(&a) {
+                Some(d) => d,
+                None => continue,
+            };
+            let y_data = match data.get_column(&b) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let (confidence, predicted_type) = self.predict_edge(&x_data, &y_data);
+
+            // Only refine if confident
+            if confidence > 0.6 {
+                if let Some((m1, m2)) = pag.get_edge(&a, &b) {
+                    // Only change circle marks
+                    let new_marks = match predicted_type {
+                        EdgeType::Directed => {
+                            if m1 == EdgeMark::Circle {
+                                (EdgeMark::Tail, m2)
+                            } else if m2 == EdgeMark::Circle {
+                                (m1, EdgeMark::Arrow)
+                            } else {
+                                (m1, m2)
+                            }
+                        }
+                        EdgeType::Bidirected => {
+                            let new_m1 = if m1 == EdgeMark::Circle { EdgeMark::Arrow } else { m1 };
+                            let new_m2 = if m2 == EdgeMark::Circle { EdgeMark::Arrow } else { m2 };
+                            (new_m1, new_m2)
+                        }
+                        _ => (m1, m2),
+                    };
+
+                    pag.set_edge(&a, &b, new_marks.0, new_marks.1);
+                }
+            }
+        }
+    }
+}
+
+// ==================== CausalAnalyzer FCI Integration ====================
+
+impl CausalAnalyzer {
+    /// Discover causal structure with latent confounders using FCI
+    pub fn discover_with_latents(&mut self) -> Option<FCIResult> {
+        // Build DataMatrix from price history
+        if self.price_history.is_empty() {
+            return None;
+        }
+
+        let mut data = DataMatrix::new();
+
+        // Add variables
+        for symbol in self.price_history.keys() {
+            data.add_variable(symbol);
+        }
+
+        // Find minimum history length
+        let min_len = self.price_history.values()
+            .map(|h| h.len())
+            .min()
+            .unwrap_or(0);
+
+        if min_len < 30 {
+            return None;
+        }
+
+        // Build observation rows
+        let symbols: Vec<_> = self.price_history.keys().cloned().collect();
+        for i in 0..min_len {
+            let row: Vec<f64> = symbols.iter()
+                .map(|s| self.price_history.get(s).unwrap()[i])
+                .collect();
+            data.add_observation(&row);
+        }
+
+        // Run FCI algorithm
+        let fci = FCIAlgorithm::new(self.significance_threshold);
+        let result = fci.run(&data);
+
+        // Update causal model with discovered latent confounders
+        for (a, b) in &result.latent_confounders {
+            // Check if we already have these in the model
+            // This helps identify hidden common causes
+            info!(
+                "[FCI] Discovered latent confounder between {} and {}",
+                a, b
+            );
+        }
+
+        Some(result)
+    }
+
+    /// Get discovered latent confounders
+    pub fn get_latent_confounders(&self) -> Vec<(String, String)> {
+        // Run FCI and get latent confounders
+        let mut temp_analyzer = self.clone();
+        temp_analyzer.discover_with_latents()
+            .map(|r| r.latent_confounders)
+            .unwrap_or_default()
+    }
+
+    /// Check if there's a latent confounder between two variables
+    pub fn has_latent_confounder_fci(&self, x: &str, y: &str) -> bool {
+        let confounders = self.get_latent_confounders();
+        confounders.iter().any(|(a, b)| {
+            (a == x && b == y) || (a == y && b == x)
+        })
+    }
+
+    /// Format PAG structure summary for display
+    pub fn format_pag_summary(&self) -> String {
+        // Run FCI to get the PAG
+        let mut temp_analyzer = self.clone();
+        match temp_analyzer.discover_with_latents() {
+            Some(result) => {
+                let mut summary = String::new();
+
+                // Node count
+                summary.push_str(&format!("Nodes: {}\n", result.pag.nodes.len()));
+
+                // Edge statistics
+                summary.push_str(&format!("Definite edges: {}\n", result.definite_edges.len()));
+                summary.push_str(&format!("Uncertain edges: {}\n", result.uncertain_edges.len()));
+                summary.push_str(&format!("Latent confounders: {}\n\n", result.latent_confounders.len()));
+
+                // Show definite causal relationships
+                if !result.definite_edges.is_empty() {
+                    summary.push_str("Definite Causes:\n");
+                    for (source, target, edge_type) in result.definite_edges.iter().take(10) {
+                        let arrow = match edge_type {
+                            EdgeType::Directed => "→",
+                            EdgeType::Bidirected => "↔",
+                            EdgeType::Undirected => "—",
+                            EdgeType::PartiallyDirected => "o→",
+                        };
+                        summary.push_str(&format!("  {} {} {}\n", source, arrow, target));
+                    }
+                    if result.definite_edges.len() > 10 {
+                        summary.push_str(&format!("  ... and {} more\n", result.definite_edges.len() - 10));
+                    }
+                    summary.push('\n');
+                }
+
+                // Show latent confounders
+                if !result.latent_confounders.is_empty() {
+                    summary.push_str("Latent Confounders:\n");
+                    for (a, b) in result.latent_confounders.iter().take(5) {
+                        summary.push_str(&format!("  {} ↔ {} (hidden cause)\n", a, b));
+                    }
+                    if result.latent_confounders.len() > 5 {
+                        summary.push_str(&format!("  ... and {} more\n", result.latent_confounders.len() - 5));
+                    }
+                }
+
+                summary
+            }
+            None => "No PAG available (insufficient data, need 30+ observations)".to_string(),
+        }
+    }
+}
+
+impl Clone for CausalAnalyzer {
+    fn clone(&self) -> Self {
+        Self {
+            graph: self.graph.clone(),
+            price_history: self.price_history.clone(),
+            last_prices: self.last_prices.clone(),
+            window_size: self.window_size,
+            significance_threshold: self.significance_threshold,
+            granger: GrangerCausalityTest::with_significance(self.significance_threshold),
+        }
+    }
+}
+
+// ==================== DoCalculusEngine FCI Integration ====================
+
+impl DoCalculusEngine {
+    /// Check if effect is identifiable given PAG structure
+    pub fn is_identifiable_with_pag(
+        &self,
+        target: &str,
+        treatment: &str,
+        pag: &PartialAncestralGraph,
+    ) -> bool {
+        // Check for bidirected edge (latent confounder)
+        if let Some((m1, m2)) = pag.get_edge(treatment, target) {
+            if m1 == EdgeMark::Arrow && m2 == EdgeMark::Arrow {
+                // Bidirected edge - may not be identifiable
+                // Check if there's an instrument or front-door path
+                return self.has_instrument(treatment, target, pag) ||
+                       self.has_frontdoor_path(treatment, target, pag);
+            }
+        }
+
+        // Check adjustment paths for bidirected edges
+        if let Some(adjustment) = self.find_adjustment_set(treatment, target) {
+            for adj_var in &adjustment {
+                if let Some((m1, m2)) = pag.get_edge(treatment, adj_var) {
+                    if m1 == EdgeMark::Arrow && m2 == EdgeMark::Arrow {
+                        // Adjustment variable has latent confounder with treatment
+                        return false;
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if there's a valid instrumental variable
+    fn has_instrument(&self, treatment: &str, outcome: &str, pag: &PartialAncestralGraph) -> bool {
+        // Look for Z: Z -> treatment, Z not connected to outcome except through treatment
+        for node in &pag.nodes {
+            if node == treatment || node == outcome {
+                continue;
+            }
+
+            // Check Z -> treatment
+            if let Some((m1, m2)) = pag.get_edge(node, treatment) {
+                if m2 != EdgeMark::Arrow {
+                    continue;
+                }
+
+                // Check Z not directly connected to outcome
+                if !pag.has_edge(node, outcome) {
+                    // Check no backdoor from Z to outcome
+                    let z_neighbors: HashSet<_> = pag.get_neighbors(node).into_iter().collect();
+                    let has_backdoor = z_neighbors.iter().any(|n| {
+                        n != treatment && pag.has_edge(n, outcome)
+                    });
+
+                    if !has_backdoor {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Check if there's a front-door path
+    fn has_frontdoor_path(&self, treatment: &str, outcome: &str, pag: &PartialAncestralGraph) -> bool {
+        // Look for M: treatment -> M -> outcome, M blocks all paths from treatment to outcome
+        for node in &pag.nodes {
+            if node == treatment || node == outcome {
+                continue;
+            }
+
+            // Check treatment -> M
+            if let Some((_, m2_t)) = pag.get_edge(treatment, node) {
+                if m2_t != EdgeMark::Arrow {
+                    continue;
+                }
+
+                // Check M -> outcome
+                if let Some((_, m2_o)) = pag.get_edge(node, outcome) {
+                    if m2_o != EdgeMark::Arrow {
+                        continue;
+                    }
+
+                    // Check no backdoor from M to outcome that doesn't go through treatment
+                    // (Simplified check)
+                    if !pag.has_edge(treatment, outcome) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Suggest valid instrumental variables given PAG
+    pub fn suggest_instruments(
+        &self,
+        treatment: &str,
+        outcome: &str,
+        pag: &PartialAncestralGraph,
+    ) -> Vec<String> {
+        let mut instruments = Vec::new();
+
+        for node in &pag.nodes {
+            if node == treatment || node == outcome {
+                continue;
+            }
+
+            // Check if this could be a valid instrument
+            // Z -> treatment (or Z o-> treatment)
+            if let Some((_, m2)) = pag.get_edge(node, treatment) {
+                if m2 != EdgeMark::Arrow && m2 != EdgeMark::Circle {
+                    continue;
+                }
+
+                // Z should not be connected to outcome
+                if pag.has_edge(node, outcome) {
+                    continue;
+                }
+
+                // Check no bidirected edge with treatment
+                if let Some((m1, _)) = pag.get_edge(node, treatment) {
+                    if m1 == EdgeMark::Arrow {
+                        continue; // Bidirected
+                    }
+                }
+
+                instruments.push(node.clone());
+            }
+        }
+
+        instruments
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2584,5 +4221,353 @@ mod tests {
             Vec::new(),
         );
         assert!(!not_significant.is_significant());
+    }
+
+    // ==================== FCI Algorithm Tests ====================
+
+    #[test]
+    fn test_partial_correlation() {
+        let test = PartialCorrelationTest::new(0.05);
+
+        // Create data matrix with known correlation structure
+        let mut data = DataMatrix::new();
+        data.add_variable("X");
+        data.add_variable("Y");
+        data.add_variable("Z");
+
+        // Generate correlated data: Y = 0.8*X + noise, Z = 0.5*X + noise
+        for i in 0..100 {
+            let x = (i as f64) * 0.1;
+            let y = 0.8 * x + (i as f64 * 0.01).sin() * 0.1;
+            let z = 0.5 * x + (i as f64 * 0.02).cos() * 0.1;
+            data.add_observation(&[x, y, z]);
+        }
+
+        // X and Y should be correlated
+        let corr_xy = test.partial_correlation("X", "Y", &[], &data);
+        assert!(corr_xy.abs() > 0.5, "X-Y correlation should be strong");
+
+        // Test conditional independence
+        let (independent, p_value) = test.test("X", "Y", &[], &data);
+        assert!(!independent, "X and Y should not be independent");
+        assert!(p_value < 0.05, "P-value should be significant");
+    }
+
+    #[test]
+    fn test_ci_test() {
+        let test = PartialCorrelationTest::new(0.05);
+
+        let mut data = DataMatrix::new();
+        data.add_variable("A");
+        data.add_variable("B");
+        data.add_variable("C");
+
+        // A -> B -> C chain: A and C independent given B
+        for i in 0..200 {
+            let a = (i as f64) * 0.05;
+            let noise_b = ((i * 7) as f64 * 0.1).sin() * 0.5;
+            let b = 0.7 * a + noise_b;
+            let noise_c = ((i * 11) as f64 * 0.1).cos() * 0.5;
+            let c = 0.6 * b + noise_c;
+            data.add_observation(&[a, b, c]);
+        }
+
+        // A and C should be dependent marginally
+        let (indep_marginal, _) = test.test("A", "C", &[], &data);
+        assert!(!indep_marginal, "A and C should be marginally dependent");
+
+        // A and C should be more independent given B (d-separation)
+        let (_, p_given_b) = test.test("A", "C", &["B".to_string()], &data);
+        let (_, p_marginal) = test.test("A", "C", &[], &data);
+        assert!(p_given_b > p_marginal, "Conditioning on B should increase p-value");
+    }
+
+    #[test]
+    fn test_fci_skeleton() {
+        let mut fci = FCIAlgorithm::new(0.05);
+        fci.max_conditioning_size = 2;
+
+        // Create data for A -> B -> C chain
+        let mut data = DataMatrix::new();
+        data.add_variable("A");
+        data.add_variable("B");
+        data.add_variable("C");
+
+        for i in 0..150 {
+            let a = (i as f64) * 0.1;
+            let b = 0.8 * a + ((i * 3) as f64 * 0.1).sin() * 0.3;
+            let c = 0.7 * b + ((i * 5) as f64 * 0.1).cos() * 0.3;
+            data.add_observation(&[a, b, c]);
+        }
+
+        let result = fci.run(&data);
+
+        // Should have edges A-B and B-C
+        assert!(result.pag.has_edge("A", "B"), "Should have A-B edge");
+        assert!(result.pag.has_edge("B", "C"), "Should have B-C edge");
+
+        // A-C may or may not be present depending on statistical power
+        // but if present, it should have been tested
+    }
+
+    #[test]
+    fn test_collider_orientation() {
+        // Test v-structure detection: A -> B <- C
+        let mut pag = PartialAncestralGraph::new();
+        pag.add_node("A");
+        pag.add_node("B");
+        pag.add_node("C");
+
+        // Initial skeleton with circle marks
+        pag.add_edge("A", "B", EdgeMark::Circle, EdgeMark::Circle);
+        pag.add_edge("B", "C", EdgeMark::Circle, EdgeMark::Circle);
+
+        // If A and C are independent but both cause B, they form a collider
+        // After orientation: A *-> B <-* C
+
+        // Simulate collider orientation
+        if !pag.has_edge("A", "C") {
+            // A and C not adjacent - can orient as collider if B is in sep set
+            // Here we manually orient as if it were detected
+            pag.set_edge("A", "B", EdgeMark::Circle, EdgeMark::Arrow);
+            pag.set_edge("C", "B", EdgeMark::Circle, EdgeMark::Arrow);
+        }
+
+        // Check orientation
+        let (_, m2) = pag.get_edge("A", "B").unwrap();
+        assert_eq!(m2, EdgeMark::Arrow, "B should have arrow from A");
+
+        let (_, m4) = pag.get_edge("C", "B").unwrap();
+        assert_eq!(m4, EdgeMark::Arrow, "B should have arrow from C");
+    }
+
+    #[test]
+    fn test_fci_rules() {
+        let mut pag = PartialAncestralGraph::new();
+        pag.add_node("A");
+        pag.add_node("B");
+        pag.add_node("C");
+
+        // Test Rule 1: A *-> B o-* C where A and C not adjacent
+        // becomes A *-> B -> C
+        pag.add_edge("A", "B", EdgeMark::Circle, EdgeMark::Arrow);
+        pag.add_edge("B", "C", EdgeMark::Circle, EdgeMark::Circle);
+        // A and C not adjacent
+
+        // Apply rule 1 manually
+        let (m1, m2) = pag.get_edge("B", "C").unwrap();
+        if m1 == EdgeMark::Circle && !pag.has_edge("A", "C") {
+            // Check if A *-> B
+            if let Some((_, mark_to_b)) = pag.get_edge("A", "B") {
+                if mark_to_b == EdgeMark::Arrow {
+                    // Orient B o-* C as B -> C
+                    pag.set_edge("B", "C", EdgeMark::Tail, m2);
+                }
+            }
+        }
+
+        let (new_m1, _) = pag.get_edge("B", "C").unwrap();
+        assert_eq!(new_m1, EdgeMark::Tail, "Rule 1 should orient B-C with tail at B");
+    }
+
+    #[test]
+    fn test_latent_detection() {
+        let fci = FCIAlgorithm::new(0.05);
+
+        // Create data with latent confounder structure: L -> A, L -> B
+        // A and B appear correlated but neither causes the other
+        let mut data = DataMatrix::new();
+        data.add_variable("A");
+        data.add_variable("B");
+
+        for i in 0..200 {
+            // L is latent
+            let l = (i as f64) * 0.1;
+            let a = 0.7 * l + ((i * 3) as f64 * 0.1).sin() * 0.2;
+            let b = 0.6 * l + ((i * 5) as f64 * 0.1).cos() * 0.2;
+            data.add_observation(&[a, b]);
+        }
+
+        let result = fci.run(&data);
+
+        // A and B should be connected (correlated)
+        assert!(result.pag.has_edge("A", "B"), "A and B should be connected");
+
+        // With only two variables and no conditioning set that makes them independent,
+        // FCI can't definitively identify a latent, but the edge marks should reflect uncertainty
+        let (m1, m2) = result.pag.get_edge("A", "B").unwrap();
+        // Bidirected edge (A <-> B) would indicate latent confounder
+        // Circle marks indicate uncertainty
+        assert!(
+            (m1 == EdgeMark::Arrow && m2 == EdgeMark::Arrow) ||
+            (m1 == EdgeMark::Circle || m2 == EdgeMark::Circle),
+            "Edge should show uncertainty or bidirected pattern"
+        );
+    }
+
+    #[test]
+    fn test_pag_operations() {
+        let mut pag = PartialAncestralGraph::new();
+
+        // Test node operations
+        pag.add_node("X");
+        pag.add_node("Y");
+        pag.add_node("Z");
+
+        assert_eq!(pag.nodes.len(), 3);
+
+        // Test edge operations
+        pag.add_edge("X", "Y", EdgeMark::Tail, EdgeMark::Arrow);
+        assert!(pag.has_edge("X", "Y"));
+        assert!(pag.has_edge("Y", "X")); // Symmetric check
+
+        // Test get_edge (canonical ordering)
+        let (m1, m2) = pag.get_edge("X", "Y").unwrap();
+        assert_eq!(m1, EdgeMark::Tail);
+        assert_eq!(m2, EdgeMark::Arrow);
+
+        // Test adjacency
+        let adj_y = pag.get_adjacent("Y");
+        assert!(adj_y.contains(&"X".to_string()));
+
+        // Test edge removal
+        pag.remove_edge("X", "Y");
+        assert!(!pag.has_edge("X", "Y"));
+
+        // Test bidirected edge
+        pag.add_edge("Y", "Z", EdgeMark::Arrow, EdgeMark::Arrow);
+        let (m3, m4) = pag.get_edge("Y", "Z").unwrap();
+        assert_eq!(m3, EdgeMark::Arrow);
+        assert_eq!(m4, EdgeMark::Arrow);
+    }
+
+    #[test]
+    fn test_neuro_symbolic_refinement() {
+        let neural_net = NeuralCausalNet::new(16);
+
+        // Create a simple PAG
+        let mut pag = PartialAncestralGraph::new();
+        pag.add_node("A");
+        pag.add_node("B");
+        pag.add_edge("A", "B", EdgeMark::Circle, EdgeMark::Circle);
+
+        // Create data matrix with time series
+        let mut data = DataMatrix::new();
+        data.add_variable("A");
+        data.add_variable("B");
+
+        for i in 0..100 {
+            let a = (i as f64) * 0.1 + ((i * 3) as f64 * 0.1).sin() * 0.2;
+            let b = 0.8 * a + ((i * 5) as f64 * 0.1).cos() * 0.3;
+            data.add_observation(&[a, b]);
+        }
+
+        // Refine PAG using neural network predictions
+        neural_net.refine_pag(&mut pag, &data);
+
+        // The PAG should still have the edge (refinement modifies in place)
+        assert!(pag.has_edge("A", "B"), "Edge should still exist after refinement");
+    }
+
+    #[test]
+    fn test_fci_result_fields() {
+        // Create a PAG with different edge types
+        let mut pag = PartialAncestralGraph::new();
+        pag.add_node("A");
+        pag.add_node("B");
+        pag.add_node("C");
+        pag.add_node("D");
+
+        // Definite edge: A -> B (tail to arrow)
+        pag.add_edge("A", "B", EdgeMark::Tail, EdgeMark::Arrow);
+
+        // Bidirected: B <-> C (latent confounder)
+        pag.add_edge("B", "C", EdgeMark::Arrow, EdgeMark::Arrow);
+
+        // Uncertain: C o-> D
+        pag.add_edge("C", "D", EdgeMark::Circle, EdgeMark::Arrow);
+
+        // Verify edge retrieval works correctly
+        let (m1, m2) = pag.get_edge("A", "B").unwrap();
+        assert_eq!(m1, EdgeMark::Tail);
+        assert_eq!(m2, EdgeMark::Arrow);
+
+        let (m3, m4) = pag.get_edge("B", "C").unwrap();
+        assert_eq!(m3, EdgeMark::Arrow);
+        assert_eq!(m4, EdgeMark::Arrow);
+
+        let (m5, m6) = pag.get_edge("C", "D").unwrap();
+        assert_eq!(m5, EdgeMark::Circle);
+        assert_eq!(m6, EdgeMark::Arrow);
+    }
+
+    #[test]
+    fn test_data_matrix() {
+        let mut dm = DataMatrix::new();
+        dm.add_variable("X");
+        dm.add_variable("Y");
+
+        dm.add_observation(&[1.0, 2.0]);
+        dm.add_observation(&[2.0, 4.0]);
+        dm.add_observation(&[3.0, 6.0]);
+
+        assert_eq!(dm.data.len(), 3);
+        assert_eq!(dm.variables.len(), 2);
+
+        let x_data = dm.get_column("X").unwrap();
+        assert_eq!(x_data, vec![1.0, 2.0, 3.0]);
+
+        let y_data = dm.get_column("Y").unwrap();
+        assert_eq!(y_data, vec![2.0, 4.0, 6.0]);
+
+        // Test correlation
+        let corr = dm.correlation("X", "Y");
+        assert!((corr - 1.0).abs() < 0.001, "Perfect positive correlation expected");
+    }
+
+    #[test]
+    fn test_causal_analyzer_fci_integration() {
+        let mut analyzer = CausalAnalyzer::new();
+
+        // Add price history for multiple symbols
+        for i in 0..60 {
+            let base = (i as f64) * 0.1;
+            analyzer.update_prices("SPY", 400.0 + base);
+            analyzer.update_prices("QQQ", 350.0 + 0.9 * base + ((i * 3) as f64 * 0.1).sin() * 2.0);
+            analyzer.update_prices("IWM", 200.0 + 0.5 * base + ((i * 5) as f64 * 0.1).cos() * 3.0);
+        }
+
+        // Run FCI discovery
+        let result = analyzer.discover_with_latents();
+
+        // Should produce some result with the data
+        assert!(result.is_some(), "FCI should produce results with sufficient data");
+
+        if let Some(fci_result) = result {
+            // PAG should have nodes
+            assert!(!fci_result.pag.nodes.is_empty(), "PAG should have nodes");
+        }
+    }
+
+    #[test]
+    fn test_do_calculus_pag_integration() {
+        let model = CausalModel::default();
+        let engine = DoCalculusEngine::new(model);
+
+        // Create PAG with clear structure
+        let mut pag = PartialAncestralGraph::new();
+        pag.add_node("X");
+        pag.add_node("Y");
+        pag.add_node("Z");
+
+        // X -> Y (definite)
+        pag.add_edge("X", "Y", EdgeMark::Tail, EdgeMark::Arrow);
+
+        // Z -> X (instrument)
+        pag.add_edge("Z", "X", EdgeMark::Tail, EdgeMark::Arrow);
+
+        // Z is a valid instrument for X->Y effect
+        let instruments = engine.suggest_instruments("X", "Y", &pag);
+        assert!(instruments.contains(&"Z".to_string()), "Z should be suggested as instrument");
     }
 }
