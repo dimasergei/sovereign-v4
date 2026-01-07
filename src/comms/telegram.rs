@@ -518,3 +518,119 @@ pub async fn send_causal_pag(summary: &str) {
     );
     let _ = send(&msg).await;
 }
+
+// ==================== Transfer Blocking Commands ====================
+
+/// Send transfer command help
+pub async fn send_transfer_help() {
+    let msg = "🔄 <b>Transfer Commands</b>\n\n\
+        /transfer blocked - List blacklisted & graylisted pairs\n\
+        /transfer history - Show transfer impact history\n\
+        /transfer unblock &lt;source&gt; &lt;target&gt; - Remove from blacklist";
+    let _ = send(msg).await;
+}
+
+/// Send blocked transfer pairs (blacklist and graylist)
+pub async fn send_blocked_transfers(
+    blacklist: &[(String, String, String)],  // (source, target, reason)
+    graylist: &[(String, String, f64, String)],  // (source, target, impact, expires)
+) {
+    let mut msg = String::from("🚫 <b>Blocked Transfer Pairs</b>\n\n");
+
+    // Blacklist section
+    if blacklist.is_empty() {
+        msg.push_str("⛔ <b>Blacklist:</b> Empty\n\n");
+    } else {
+        msg.push_str(&format!("⛔ <b>Blacklist</b> ({} pairs):\n", blacklist.len()));
+        for (i, (source, target, reason)) in blacklist.iter().take(10).enumerate() {
+            msg.push_str(&format!(
+                "{}. {} → {}\n   {}\n",
+                i + 1, source, target, reason
+            ));
+        }
+        if blacklist.len() > 10 {
+            msg.push_str(&format!("... and {} more\n", blacklist.len() - 10));
+        }
+        msg.push('\n');
+    }
+
+    // Graylist section
+    if graylist.is_empty() {
+        msg.push_str("⏸️ <b>Graylist:</b> Empty");
+    } else {
+        msg.push_str(&format!("⏸️ <b>Graylist</b> ({} pairs):\n", graylist.len()));
+        for (i, (source, target, impact, expires)) in graylist.iter().take(10).enumerate() {
+            msg.push_str(&format!(
+                "{}. {} → {} ({:.1}%)\n   Expires: {}\n",
+                i + 1, source, target, impact * 100.0, expires
+            ));
+        }
+        if graylist.len() > 10 {
+            msg.push_str(&format!("... and {} more", graylist.len() - 10));
+        }
+    }
+
+    let _ = send(&msg).await;
+}
+
+/// Send transfer impact history
+pub async fn send_transfer_history(history: &[(String, String, f64, String, String)]) {
+    // (source, target, impact, verdict, date)
+    if history.is_empty() {
+        let _ = send("📜 <b>Transfer History</b>\n\nNo transfer evaluations yet.").await;
+        return;
+    }
+
+    let mut msg = String::from("📜 <b>Transfer History</b>\n\n");
+    for (i, (source, target, impact, verdict, date)) in history.iter().take(15).enumerate() {
+        let emoji = match verdict.as_str() {
+            "Positive" => "✅",
+            "Neutral" => "➖",
+            "Negative" => "⚠️",
+            "HighlyNegative" => "🚫",
+            _ => "❓",
+        };
+        msg.push_str(&format!(
+            "{}. {} {} → {}\n   Impact: {:.1}% | {}\n",
+            i + 1, emoji, source, target,
+            impact * 100.0, date
+        ));
+    }
+
+    if history.len() > 15 {
+        msg.push_str(&format!("\n... and {} more", history.len() - 15));
+    }
+
+    let _ = send(&msg).await;
+}
+
+/// Send transfer unblock confirmation
+pub async fn send_transfer_unblock(source: &str, target: &str, success: bool, message: &str) {
+    let emoji = if success { "✅" } else { "❌" };
+    let status = if success { "Unblocked" } else { "Unblock Failed" };
+    let msg = format!(
+        "{} <b>Transfer {}</b>\n\n{} → {}\n{}",
+        emoji, status, source, target, message
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send negative transfer alert
+pub async fn send_negative_transfer_alert(
+    source: &str,
+    target: &str,
+    impact: f64,
+    verdict: &str,
+    action: &str,
+) {
+    let emoji = if verdict == "HighlyNegative" { "🚨" } else { "⚠️" };
+    let msg = format!(
+        "{} <b>Negative Transfer Detected</b>\n\n\
+        {} → {}\n\
+        Impact: <b>{:.1}%</b>\n\
+        Verdict: {}\n\
+        Action: {}",
+        emoji, source, target, impact * 100.0, verdict, action
+    );
+    let _ = send(&msg).await;
+}

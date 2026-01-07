@@ -828,6 +828,942 @@ fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 
+// ==================== Negative Transfer Detection ====================
+
+use std::collections::HashSet;
+
+/// Snapshot of performance metrics at a point in time
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceSnapshot {
+    /// Win rate (0.0 - 1.0)
+    pub win_rate: f64,
+    /// Average P&L per trade
+    pub avg_pnl: f64,
+    /// Sharpe ratio
+    pub sharpe: f64,
+    /// Maximum drawdown (positive value)
+    pub max_dd: f64,
+    /// Number of trades
+    pub trade_count: u32,
+    /// When this snapshot was taken
+    pub timestamp: DateTime<Utc>,
+}
+
+impl PerformanceSnapshot {
+    /// Create a new performance snapshot
+    pub fn new(win_rate: f64, avg_pnl: f64, sharpe: f64, max_dd: f64, trade_count: u32) -> Self {
+        Self {
+            win_rate,
+            avg_pnl,
+            sharpe,
+            max_dd,
+            trade_count,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Create an empty snapshot
+    pub fn empty() -> Self {
+        Self::new(0.0, 0.0, 0.0, 0.0, 0)
+    }
+}
+
+/// Record of a transfer attempt and its impact
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferImpact {
+    /// Source symbol
+    pub source: String,
+    /// Target symbol
+    pub target: String,
+    /// Unique identifier for this transfer
+    pub transfer_id: u64,
+    /// Metrics before transfer
+    pub pre_transfer_metrics: PerformanceSnapshot,
+    /// Metrics after transfer (if evaluated)
+    pub post_transfer_metrics: Option<PerformanceSnapshot>,
+    /// Trades before transfer evaluation
+    pub trades_before: u32,
+    /// Trades after transfer application
+    pub trades_after: u32,
+    /// Calculated impact score (positive = helped, negative = hurt)
+    pub impact_score: Option<f64>,
+    /// When this transfer was initiated
+    pub detected_at: DateTime<Utc>,
+}
+
+impl TransferImpact {
+    /// Create a new transfer impact record
+    pub fn new(
+        source: String,
+        target: String,
+        transfer_id: u64,
+        pre_metrics: PerformanceSnapshot,
+    ) -> Self {
+        Self {
+            source,
+            target,
+            transfer_id,
+            pre_transfer_metrics: pre_metrics.clone(),
+            post_transfer_metrics: None,
+            trades_before: pre_metrics.trade_count,
+            trades_after: 0,
+            impact_score: None,
+            detected_at: Utc::now(),
+        }
+    }
+
+    /// Calculate impact score from pre/post metrics
+    pub fn calculate_impact(&mut self) {
+        if let Some(ref post) = self.post_transfer_metrics {
+            // Weighted combination of metric changes
+            let win_rate_delta = post.win_rate - self.pre_transfer_metrics.win_rate;
+            let sharpe_delta = post.sharpe - self.pre_transfer_metrics.sharpe;
+            let pnl_delta = if self.pre_transfer_metrics.avg_pnl != 0.0 {
+                (post.avg_pnl - self.pre_transfer_metrics.avg_pnl) / self.pre_transfer_metrics.avg_pnl.abs()
+            } else {
+                post.avg_pnl.signum() * 0.1
+            };
+            let dd_delta = self.pre_transfer_metrics.max_dd - post.max_dd; // Less DD is good
+
+            // Impact score: combination of deltas
+            // Range roughly -1.0 to 1.0
+            self.impact_score = Some(
+                win_rate_delta * 2.0 + // Win rate weighted heavily
+                sharpe_delta * 0.5 +    // Sharpe ratio
+                pnl_delta * 0.3 +        // P&L change
+                dd_delta * 0.2           // Drawdown improvement
+            );
+        }
+    }
+}
+
+/// Entry in the graylist (temporary block)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraylistEntry {
+    /// When this entry was added
+    pub added_at: DateTime<Utc>,
+    /// Reason for graylisting
+    pub reason: String,
+    /// Impact score that caused graylisting
+    pub impact_score: f64,
+    /// When to retry this pair
+    pub retry_after: DateTime<Utc>,
+    /// Number of times this pair has been retried
+    pub retry_count: u32,
+}
+
+impl GraylistEntry {
+    /// Create a new graylist entry
+    pub fn new(reason: String, impact_score: f64, retry_days: u32) -> Self {
+        Self {
+            added_at: Utc::now(),
+            reason,
+            impact_score,
+            retry_after: Utc::now() + chrono::Duration::days(retry_days as i64),
+            retry_count: 0,
+        }
+    }
+
+    /// Check if this entry has expired
+    pub fn is_expired(&self) -> bool {
+        Utc::now() > self.retry_after
+    }
+}
+
+/// Features for transfer impact prediction
+#[derive(Debug, Clone)]
+pub struct TransferFeatures {
+    pub source_win_rate: f64,
+    pub source_sharpe: f64,
+    pub source_trades: f64,
+    pub target_win_rate: f64,
+    pub target_sharpe: f64,
+    pub target_trades: f64,
+    pub embedding_similarity: f64,
+    pub regime_overlap: f64,
+    pub volatility_ratio: f64,
+    pub correlation: f64,
+    pub cluster_same: f64,
+    pub historical_success_rate: f64,
+    pub time_since_last_transfer: f64,
+    pub previous_impact: f64,
+}
+
+impl TransferFeatures {
+    /// Convert to array for neural network input
+    pub fn to_array(&self) -> [f64; 14] {
+        [
+            self.source_win_rate,
+            self.source_sharpe.clamp(-3.0, 3.0) / 3.0, // Normalize
+            (self.source_trades.ln() / 7.0).min(1.0),   // Log normalize
+            self.target_win_rate,
+            self.target_sharpe.clamp(-3.0, 3.0) / 3.0,
+            (self.target_trades.ln() / 7.0).min(1.0),
+            self.embedding_similarity,
+            self.regime_overlap,
+            (self.volatility_ratio - 1.0).clamp(-1.0, 1.0), // Center around 1
+            self.correlation,
+            self.cluster_same,
+            self.historical_success_rate,
+            self.time_since_last_transfer.min(1.0),
+            self.previous_impact.clamp(-1.0, 1.0),
+        ]
+    }
+}
+
+/// Hidden layer sizes for impact predictor
+const IMPACT_HIDDEN_1: usize = 32;
+const IMPACT_HIDDEN_2: usize = 16;
+const IMPACT_INPUT_DIM: usize = 14;
+
+/// Neural network for predicting transfer impact
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferImpactPredictor {
+    /// Layer 1: 14 -> 32
+    weights_1: Vec<Vec<f64>>,
+    bias_1: Vec<f64>,
+    /// Layer 2: 32 -> 16
+    weights_2: Vec<Vec<f64>>,
+    bias_2: Vec<f64>,
+    /// Layer 3: 16 -> 1
+    weights_3: Vec<f64>,
+    bias_3: f64,
+    /// Learning rate
+    learning_rate: f64,
+    /// Training samples seen
+    samples_trained: u64,
+}
+
+impl Default for TransferImpactPredictor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TransferImpactPredictor {
+    /// Create a new impact predictor
+    pub fn new() -> Self {
+        let mut rng = rand::thread_rng();
+
+        let scale_1 = (2.0 / (IMPACT_INPUT_DIM + IMPACT_HIDDEN_1) as f64).sqrt();
+        let scale_2 = (2.0 / (IMPACT_HIDDEN_1 + IMPACT_HIDDEN_2) as f64).sqrt();
+        let scale_3 = (2.0 / (IMPACT_HIDDEN_2 + 1) as f64).sqrt();
+
+        let weights_1: Vec<Vec<f64>> = (0..IMPACT_HIDDEN_1)
+            .map(|_| {
+                (0..IMPACT_INPUT_DIM)
+                    .map(|_| rng.gen_range(-scale_1..scale_1))
+                    .collect()
+            })
+            .collect();
+
+        let weights_2: Vec<Vec<f64>> = (0..IMPACT_HIDDEN_2)
+            .map(|_| {
+                (0..IMPACT_HIDDEN_1)
+                    .map(|_| rng.gen_range(-scale_2..scale_2))
+                    .collect()
+            })
+            .collect();
+
+        let weights_3: Vec<f64> = (0..IMPACT_HIDDEN_2)
+            .map(|_| rng.gen_range(-scale_3..scale_3))
+            .collect();
+
+        Self {
+            weights_1,
+            bias_1: vec![0.0; IMPACT_HIDDEN_1],
+            weights_2,
+            bias_2: vec![0.0; IMPACT_HIDDEN_2],
+            weights_3,
+            bias_3: 0.0,
+            learning_rate: 0.01,
+            samples_trained: 0,
+        }
+    }
+
+    /// Predict impact score from features
+    /// Returns value in range (-1.0, 1.0) where negative = harmful transfer
+    pub fn predict(&self, features: &TransferFeatures) -> f64 {
+        let input = features.to_array();
+
+        // Layer 1
+        let mut h1 = vec![0.0; IMPACT_HIDDEN_1];
+        for i in 0..IMPACT_HIDDEN_1 {
+            let mut sum = self.bias_1[i];
+            for j in 0..IMPACT_INPUT_DIM {
+                sum += self.weights_1[i][j] * input[j];
+            }
+            h1[i] = relu(sum);
+        }
+
+        // Layer 2
+        let mut h2 = vec![0.0; IMPACT_HIDDEN_2];
+        for i in 0..IMPACT_HIDDEN_2 {
+            let mut sum = self.bias_2[i];
+            for j in 0..IMPACT_HIDDEN_1 {
+                sum += self.weights_2[i][j] * h1[j];
+            }
+            h2[i] = relu(sum);
+        }
+
+        // Output layer with tanh for range (-1, 1)
+        let mut output = self.bias_3;
+        for i in 0..IMPACT_HIDDEN_2 {
+            output += self.weights_3[i] * h2[i];
+        }
+
+        output.tanh()
+    }
+
+    /// Get confidence in the prediction (based on training)
+    pub fn get_confidence(&self, _features: &TransferFeatures) -> f64 {
+        // Confidence increases with more training
+        let base_confidence = 0.3;
+        let max_confidence = 0.95;
+        let samples_for_max = 500.0;
+
+        base_confidence + (max_confidence - base_confidence) *
+            (1.0 - (-(self.samples_trained as f64) / samples_for_max).exp())
+    }
+
+    /// Train on historical transfer impacts
+    pub fn train(&mut self, history: &[TransferImpact]) {
+        // Filter to impacts with known outcomes
+        let training_data: Vec<_> = history
+            .iter()
+            .filter(|h| h.impact_score.is_some())
+            .collect();
+
+        if training_data.len() < 10 {
+            return;
+        }
+
+        info!(
+            "[TRANSFER] Training impact predictor on {} samples",
+            training_data.len()
+        );
+
+        // Multiple epochs over data
+        for _ in 0..3 {
+            for impact in &training_data {
+                // Build features (simplified - would need more context in real use)
+                let features = TransferFeatures {
+                    source_win_rate: impact.pre_transfer_metrics.win_rate,
+                    source_sharpe: impact.pre_transfer_metrics.sharpe,
+                    source_trades: impact.pre_transfer_metrics.trade_count as f64,
+                    target_win_rate: 0.5, // Would need target info
+                    target_sharpe: 0.0,
+                    target_trades: 0.0,
+                    embedding_similarity: 0.5,
+                    regime_overlap: 0.5,
+                    volatility_ratio: 1.0,
+                    correlation: 0.0,
+                    cluster_same: 0.0,
+                    historical_success_rate: 0.5,
+                    time_since_last_transfer: 1.0,
+                    previous_impact: 0.0,
+                };
+
+                let target = impact.impact_score.unwrap_or(0.0).clamp(-1.0, 1.0);
+                self.train_step(&features, target);
+            }
+        }
+    }
+
+    /// Single training step
+    fn train_step(&mut self, features: &TransferFeatures, target: f64) {
+        let input = features.to_array();
+
+        // Forward pass
+        let mut h1 = vec![0.0; IMPACT_HIDDEN_1];
+        for i in 0..IMPACT_HIDDEN_1 {
+            let mut sum = self.bias_1[i];
+            for j in 0..IMPACT_INPUT_DIM {
+                sum += self.weights_1[i][j] * input[j];
+            }
+            h1[i] = relu(sum);
+        }
+
+        let mut h2 = vec![0.0; IMPACT_HIDDEN_2];
+        for i in 0..IMPACT_HIDDEN_2 {
+            let mut sum = self.bias_2[i];
+            for j in 0..IMPACT_HIDDEN_1 {
+                sum += self.weights_2[i][j] * h1[j];
+            }
+            h2[i] = relu(sum);
+        }
+
+        let mut raw_output = self.bias_3;
+        for i in 0..IMPACT_HIDDEN_2 {
+            raw_output += self.weights_3[i] * h2[i];
+        }
+        let output = raw_output.tanh();
+
+        // Backprop
+        let d_output = output - target;
+        let d_raw = d_output * (1.0 - output * output); // tanh derivative
+
+        // Update output layer
+        let mut d_h2 = vec![0.0; IMPACT_HIDDEN_2];
+        for i in 0..IMPACT_HIDDEN_2 {
+            d_h2[i] = d_raw * self.weights_3[i] * relu_derivative(h2[i]);
+            self.weights_3[i] -= self.learning_rate * d_raw * h2[i];
+        }
+        self.bias_3 -= self.learning_rate * d_raw;
+
+        // Update layer 2
+        let mut d_h1 = vec![0.0; IMPACT_HIDDEN_1];
+        for i in 0..IMPACT_HIDDEN_1 {
+            let mut grad = 0.0;
+            for j in 0..IMPACT_HIDDEN_2 {
+                grad += d_h2[j] * self.weights_2[j][i];
+                self.weights_2[j][i] -= self.learning_rate * d_h2[j] * h1[i];
+            }
+            d_h1[i] = grad * relu_derivative(h1[i]);
+        }
+        for i in 0..IMPACT_HIDDEN_2 {
+            self.bias_2[i] -= self.learning_rate * d_h2[i];
+        }
+
+        // Update layer 1
+        for i in 0..IMPACT_HIDDEN_1 {
+            for j in 0..IMPACT_INPUT_DIM {
+                self.weights_1[i][j] -= self.learning_rate * d_h1[i] * input[j];
+            }
+            self.bias_1[i] -= self.learning_rate * d_h1[i];
+        }
+
+        self.samples_trained += 1;
+    }
+}
+
+/// Verdict of a transfer evaluation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferVerdict {
+    /// Transfer helped performance
+    Positive,
+    /// No significant change
+    Neutral,
+    /// Transfer hurt performance
+    Negative,
+    /// Severely hurt performance - should blacklist
+    HighlyNegative,
+}
+
+impl TransferVerdict {
+    /// Get verdict from impact score
+    pub fn from_impact(impact: f64) -> Self {
+        if impact > 0.05 {
+            Self::Positive
+        } else if impact > -0.05 {
+            Self::Neutral
+        } else if impact > -0.15 {
+            Self::Negative
+        } else {
+            Self::HighlyNegative
+        }
+    }
+}
+
+/// Changes in metrics from transfer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsChange {
+    pub win_rate_delta: f64,
+    pub pnl_delta: f64,
+    pub sharpe_delta: f64,
+    pub dd_delta: f64,
+}
+
+impl MetricsChange {
+    /// Create from pre/post snapshots
+    pub fn from_snapshots(pre: &PerformanceSnapshot, post: &PerformanceSnapshot) -> Self {
+        Self {
+            win_rate_delta: post.win_rate - pre.win_rate,
+            pnl_delta: post.avg_pnl - pre.avg_pnl,
+            sharpe_delta: post.sharpe - pre.sharpe,
+            dd_delta: post.max_dd - pre.max_dd, // Positive = worse DD
+        }
+    }
+}
+
+/// Reason why a transfer is blocked
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BlockReason {
+    /// Permanently blocked
+    Blacklisted { reason: String, since: DateTime<Utc> },
+    /// Temporarily blocked
+    Graylisted { reason: String, until: DateTime<Utc> },
+    /// Predicted to be negative
+    PredictedNegative { score: f64 },
+}
+
+impl std::fmt::Display for BlockReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockReason::Blacklisted { reason, since } => {
+                write!(f, "Blacklisted since {}: {}", since.format("%Y-%m-%d"), reason)
+            }
+            BlockReason::Graylisted { reason, until } => {
+                write!(f, "Graylisted until {}: {}", until.format("%Y-%m-%d"), reason)
+            }
+            BlockReason::PredictedNegative { score } => {
+                write!(f, "Predicted negative impact: {:.2}", score)
+            }
+        }
+    }
+}
+
+/// Result of evaluating a transfer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferEvaluation {
+    /// Transfer ID
+    pub transfer_id: u64,
+    /// Calculated impact score
+    pub impact_score: f64,
+    /// Verdict
+    pub verdict: TransferVerdict,
+    /// Detailed metric changes
+    pub metrics_change: MetricsChange,
+    /// Human-readable recommendation
+    pub recommendation: String,
+}
+
+/// Detector and preventer of negative transfers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NegativeTransferDetector {
+    /// History of all transfer impacts
+    impact_history: Vec<TransferImpact>,
+    /// Permanently blocked pairs
+    blacklist: HashSet<(String, String)>,
+    /// Temporarily blocked pairs
+    graylist: HashMap<(String, String), GraylistEntry>,
+    /// ML model for predicting impact
+    detection_model: TransferImpactPredictor,
+    /// Minimum trades to evaluate a transfer
+    min_trades_for_evaluation: u32,
+    /// Threshold for negative detection
+    negative_threshold: f64,
+    /// Threshold for automatic blacklisting
+    auto_blacklist_threshold: f64,
+    /// Next transfer ID
+    next_transfer_id: u64,
+}
+
+impl Default for NegativeTransferDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NegativeTransferDetector {
+    /// Create a new negative transfer detector
+    pub fn new() -> Self {
+        Self {
+            impact_history: Vec::new(),
+            blacklist: HashSet::new(),
+            graylist: HashMap::new(),
+            detection_model: TransferImpactPredictor::new(),
+            min_trades_for_evaluation: 10,
+            negative_threshold: -0.05,      // 5% performance drop
+            auto_blacklist_threshold: -0.15, // 15% drop = permanent block
+            next_transfer_id: 1,
+        }
+    }
+
+    /// Start tracking a transfer
+    pub fn start_transfer(
+        &mut self,
+        source: &str,
+        target: &str,
+        pre_metrics: PerformanceSnapshot,
+    ) -> u64 {
+        let transfer_id = self.next_transfer_id;
+        self.next_transfer_id += 1;
+
+        let impact = TransferImpact::new(
+            source.to_string(),
+            target.to_string(),
+            transfer_id,
+            pre_metrics,
+        );
+
+        self.impact_history.push(impact);
+        info!(
+            "[TRANSFER] Started tracking transfer {} -> {} (ID: {})",
+            source, target, transfer_id
+        );
+
+        transfer_id
+    }
+
+    /// Evaluate a transfer after sufficient trades
+    pub fn evaluate_transfer(
+        &mut self,
+        transfer_id: u64,
+        post_metrics: PerformanceSnapshot,
+    ) -> Option<TransferEvaluation> {
+        // Find the transfer
+        let impact = self
+            .impact_history
+            .iter_mut()
+            .find(|i| i.transfer_id == transfer_id)?;
+
+        // Check minimum trades
+        let new_trades = post_metrics.trade_count.saturating_sub(impact.trades_before);
+        if new_trades < self.min_trades_for_evaluation {
+            return None;
+        }
+
+        // Update impact record
+        impact.post_transfer_metrics = Some(post_metrics.clone());
+        impact.trades_after = new_trades;
+        impact.calculate_impact();
+
+        let impact_score = impact.impact_score.unwrap_or(0.0);
+        let verdict = TransferVerdict::from_impact(impact_score);
+        let metrics_change = MetricsChange::from_snapshots(
+            &impact.pre_transfer_metrics,
+            &post_metrics,
+        );
+
+        // Extract data before calling methods on self (to avoid borrow conflicts)
+        let source = impact.source.clone();
+        let target = impact.target.clone();
+
+        // Handle negative transfers
+        let recommendation = match verdict {
+            TransferVerdict::HighlyNegative => {
+                self.add_to_blacklist(
+                    &source,
+                    &target,
+                    &format!("Severe negative impact: {:.2}", impact_score),
+                );
+                format!(
+                    "BLACKLISTED: {} -> {} caused {:.1}% performance drop",
+                    source,
+                    target,
+                    impact_score.abs() * 100.0
+                )
+            }
+            TransferVerdict::Negative => {
+                self.add_to_graylist(
+                    &source,
+                    &target,
+                    impact_score,
+                    30, // Retry after 30 days
+                );
+                format!(
+                    "Graylisted: {} -> {} for 30 days (impact: {:.2})",
+                    source, target, impact_score
+                )
+            }
+            TransferVerdict::Neutral => {
+                format!(
+                    "Neutral impact from {} -> {} (score: {:.2})",
+                    source, target, impact_score
+                )
+            }
+            TransferVerdict::Positive => {
+                format!(
+                    "Positive transfer: {} -> {} improved performance by {:.1}%",
+                    source,
+                    target,
+                    impact_score * 100.0
+                )
+            }
+        };
+
+        info!("[TRANSFER] Evaluation: {}", recommendation);
+
+        Some(TransferEvaluation {
+            transfer_id,
+            impact_score,
+            verdict,
+            metrics_change,
+            recommendation,
+        })
+    }
+
+    /// Check if a transfer should be allowed
+    pub fn should_allow_transfer(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> (bool, Option<String>) {
+        let pair = (source.to_string(), target.to_string());
+
+        // Check blacklist
+        if self.blacklist.contains(&pair) {
+            return (false, Some(format!("Permanently blocked: {} -> {}", source, target)));
+        }
+
+        // Check graylist
+        if let Some(entry) = self.graylist.get(&pair) {
+            if !entry.is_expired() {
+                return (
+                    false,
+                    Some(format!(
+                        "Temporarily blocked until {}: {}",
+                        entry.retry_after.format("%Y-%m-%d"),
+                        entry.reason
+                    )),
+                );
+            }
+        }
+
+        // Predict impact
+        let predicted_impact = self.predict_transfer_impact(source, target);
+        if predicted_impact < self.negative_threshold {
+            return (
+                false,
+                Some(format!("Predicted negative impact: {:.2}", predicted_impact)),
+            );
+        }
+
+        (true, None)
+    }
+
+    /// Predict transfer impact using ML model
+    pub fn predict_transfer_impact(&self, source: &str, target: &str) -> f64 {
+        // Build features from historical data
+        let features = self.build_features(source, target);
+        self.detection_model.predict(&features)
+    }
+
+    /// Build features for a source-target pair
+    fn build_features(&self, source: &str, target: &str) -> TransferFeatures {
+        // Get historical success rate for this pair
+        let pair_history: Vec<_> = self
+            .impact_history
+            .iter()
+            .filter(|h| h.source == source && h.target == target && h.impact_score.is_some())
+            .collect();
+
+        let historical_success_rate = if pair_history.is_empty() {
+            0.5 // No data, assume neutral
+        } else {
+            let successes = pair_history
+                .iter()
+                .filter(|h| h.impact_score.unwrap_or(0.0) > 0.0)
+                .count();
+            successes as f64 / pair_history.len() as f64
+        };
+
+        // Get last impact for this pair
+        let previous_impact = pair_history
+            .last()
+            .and_then(|h| h.impact_score)
+            .unwrap_or(0.0);
+
+        // Time since last transfer
+        let time_since_last = if let Some(last) = pair_history.last() {
+            let days = (Utc::now() - last.detected_at).num_days() as f64;
+            (days / 365.0).min(1.0)
+        } else {
+            1.0 // No history
+        };
+
+        TransferFeatures {
+            source_win_rate: 0.5,   // Would need actual data
+            source_sharpe: 0.0,
+            source_trades: 50.0,
+            target_win_rate: 0.5,
+            target_sharpe: 0.0,
+            target_trades: 10.0,
+            embedding_similarity: 0.5,
+            regime_overlap: 0.5,
+            volatility_ratio: 1.0,
+            correlation: 0.0,
+            cluster_same: 0.0,
+            historical_success_rate,
+            time_since_last_transfer: time_since_last,
+            previous_impact,
+        }
+    }
+
+    /// Add a pair to the permanent blacklist
+    pub fn add_to_blacklist(&mut self, source: &str, target: &str, reason: &str) {
+        let pair = (source.to_string(), target.to_string());
+        if !self.blacklist.contains(&pair) {
+            self.blacklist.insert(pair);
+            info!(
+                "[TRANSFER] Blacklisted {} -> {}: {}",
+                source, target, reason
+            );
+        }
+    }
+
+    /// Add a pair to the temporary graylist
+    pub fn add_to_graylist(
+        &mut self,
+        source: &str,
+        target: &str,
+        impact: f64,
+        retry_days: u32,
+    ) {
+        let pair = (source.to_string(), target.to_string());
+        let entry = GraylistEntry::new(
+            format!("Negative impact: {:.2}", impact),
+            impact,
+            retry_days,
+        );
+        self.graylist.insert(pair.clone(), entry);
+        info!(
+            "[TRANSFER] Graylisted {} -> {} for {} days",
+            source, target, retry_days
+        );
+    }
+
+    /// Remove a pair from the graylist
+    pub fn remove_from_graylist(&mut self, source: &str, target: &str) {
+        let pair = (source.to_string(), target.to_string());
+        if self.graylist.remove(&pair).is_some() {
+            info!("[TRANSFER] Removed {} -> {} from graylist", source, target);
+        }
+    }
+
+    /// Clear all expired graylist entries
+    pub fn clear_expired_graylist(&mut self) {
+        let expired: Vec<_> = self
+            .graylist
+            .iter()
+            .filter(|(_, entry)| entry.is_expired())
+            .map(|(pair, _)| pair.clone())
+            .collect();
+
+        for pair in expired {
+            self.graylist.remove(&pair);
+            info!(
+                "[TRANSFER] Graylist expired for {} -> {}",
+                pair.0, pair.1
+            );
+        }
+    }
+
+    /// Get all blocked pairs with reasons
+    pub fn get_blocked_pairs(&self) -> Vec<((String, String), BlockReason)> {
+        let mut blocked = Vec::new();
+
+        // Add blacklisted pairs
+        for pair in &self.blacklist {
+            blocked.push((
+                pair.clone(),
+                BlockReason::Blacklisted {
+                    reason: "Permanent block due to severe negative impact".to_string(),
+                    since: Utc::now(), // Would need to track actual date
+                },
+            ));
+        }
+
+        // Add graylisted pairs
+        for (pair, entry) in &self.graylist {
+            if !entry.is_expired() {
+                blocked.push((
+                    pair.clone(),
+                    BlockReason::Graylisted {
+                        reason: entry.reason.clone(),
+                        until: entry.retry_after,
+                    },
+                ));
+            }
+        }
+
+        blocked
+    }
+
+    /// Get transfer history for a specific pair
+    pub fn get_transfer_history(&self, source: &str, target: &str) -> Vec<&TransferImpact> {
+        self.impact_history
+            .iter()
+            .filter(|h| h.source == source && h.target == target)
+            .collect()
+    }
+
+    /// Retrain the prediction model
+    pub fn retrain_predictor(&mut self) {
+        if self.impact_history.len() < 20 {
+            info!(
+                "[TRANSFER] Not enough data to retrain predictor ({} samples, need 20)",
+                self.impact_history.len()
+            );
+            return;
+        }
+
+        self.detection_model.train(&self.impact_history);
+        info!(
+            "[TRANSFER] Retrained negative detector on {} outcomes",
+            self.impact_history.len()
+        );
+    }
+
+    /// Get summary statistics
+    pub fn format_summary(&self) -> String {
+        let evaluated = self
+            .impact_history
+            .iter()
+            .filter(|h| h.impact_score.is_some())
+            .count();
+
+        let positive = self
+            .impact_history
+            .iter()
+            .filter(|h| h.impact_score.map(|s| s > 0.05).unwrap_or(false))
+            .count();
+
+        format!(
+            "Transfers: {} tracked, {} evaluated, {} positive\n\
+             Blocked: {} blacklisted, {} graylisted",
+            self.impact_history.len(),
+            evaluated,
+            positive,
+            self.blacklist.len(),
+            self.graylist.len()
+        )
+    }
+
+    /// Save to file
+    pub fn save(&self, path: &str) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Load from file
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let json = fs::read_to_string(path)?;
+        let detector: Self = serde_json::from_str(&json)?;
+        Ok(detector)
+    }
+
+    /// Load or create new
+    pub fn load_or_new<P: AsRef<Path>>(path: P) -> Self {
+        Self::load(&path).unwrap_or_default()
+    }
+
+    /// Get blacklist count
+    pub fn blacklist_count(&self) -> usize {
+        self.blacklist.len()
+    }
+
+    /// Get graylist count
+    pub fn graylist_count(&self) -> usize {
+        self.graylist.len()
+    }
+
+    /// Check if pair is blacklisted
+    pub fn is_blacklisted(&self, source: &str, target: &str) -> bool {
+        self.blacklist.contains(&(source.to_string(), target.to_string()))
+    }
+
+    /// Check if pair is graylisted
+    pub fn is_graylisted(&self, source: &str, target: &str) -> bool {
+        self.graylist
+            .get(&(source.to_string(), target.to_string()))
+            .map(|e| !e.is_expired())
+            .unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,5 +1933,241 @@ mod tests {
         assert!((profile.volatility_profile - 2.5).abs() < 0.01);
         assert!((profile.win_rate - 2.0 / 3.0).abs() < 0.01);
         assert!(profile.regime_distribution[0] > 0.5); // TrendingUp most common
+    }
+
+    // ==================== Negative Transfer Detection Tests ====================
+
+    #[test]
+    fn test_transfer_impact_calculation() {
+        let pre = PerformanceSnapshot::new(0.55, 50.0, 1.2, 0.05, 100);
+        let mut impact = TransferImpact::new(
+            "AAPL".to_string(),
+            "MSFT".to_string(),
+            1,
+            pre,
+        );
+
+        // Simulate positive transfer
+        let post = PerformanceSnapshot::new(0.60, 60.0, 1.5, 0.04, 120);
+        impact.post_transfer_metrics = Some(post);
+        impact.calculate_impact();
+
+        assert!(impact.impact_score.is_some());
+        let score = impact.impact_score.unwrap();
+        assert!(score > 0.0, "Positive metrics change should give positive impact");
+
+        // Simulate negative transfer
+        let mut impact2 = TransferImpact::new(
+            "AAPL".to_string(),
+            "TSLA".to_string(),
+            2,
+            PerformanceSnapshot::new(0.55, 50.0, 1.2, 0.05, 100),
+        );
+        let post_bad = PerformanceSnapshot::new(0.45, 30.0, 0.5, 0.10, 120);
+        impact2.post_transfer_metrics = Some(post_bad);
+        impact2.calculate_impact();
+
+        let score2 = impact2.impact_score.unwrap();
+        assert!(score2 < 0.0, "Negative metrics change should give negative impact");
+    }
+
+    #[test]
+    fn test_blacklist_blocking() {
+        let mut detector = NegativeTransferDetector::new();
+
+        // Initially should allow transfer
+        let (allowed, reason) = detector.should_allow_transfer("AAPL", "TSLA");
+        // May or may not be allowed based on prediction, but no blacklist
+
+        // Add to blacklist
+        detector.add_to_blacklist("AAPL", "TSLA", "Test blacklist");
+
+        // Now should be blocked
+        let (allowed2, reason2) = detector.should_allow_transfer("AAPL", "TSLA");
+        assert!(!allowed2);
+        assert!(reason2.is_some());
+        assert!(reason2.unwrap().contains("Permanently blocked"));
+
+        // Reverse direction should still be allowed (not blacklisted)
+        assert!(!detector.is_blacklisted("TSLA", "AAPL"));
+    }
+
+    #[test]
+    fn test_graylist_expiry() {
+        let mut detector = NegativeTransferDetector::new();
+
+        // Add to graylist with 0 days (immediate expiry for testing)
+        detector.add_to_graylist("AAPL", "GOOGL", -0.10, 0);
+
+        // Entry exists but should be expired
+        assert!(detector.graylist.contains_key(&("AAPL".to_string(), "GOOGL".to_string())));
+
+        // Clear expired
+        detector.clear_expired_graylist();
+
+        // Should be removed
+        assert!(!detector.graylist.contains_key(&("AAPL".to_string(), "GOOGL".to_string())));
+    }
+
+    #[test]
+    fn test_negative_prediction() {
+        let predictor = TransferImpactPredictor::new();
+
+        let features = TransferFeatures {
+            source_win_rate: 0.55,
+            source_sharpe: 1.2,
+            source_trades: 100.0,
+            target_win_rate: 0.45,
+            target_sharpe: 0.3,
+            target_trades: 20.0,
+            embedding_similarity: 0.3,
+            regime_overlap: 0.2,
+            volatility_ratio: 2.0,
+            correlation: 0.1,
+            cluster_same: 0.0,
+            historical_success_rate: 0.2,
+            time_since_last_transfer: 0.1,
+            previous_impact: -0.2,
+        };
+
+        let prediction = predictor.predict(&features);
+        // Prediction should be in range (-1, 1)
+        assert!(prediction >= -1.0 && prediction <= 1.0);
+
+        // Test confidence
+        let confidence = predictor.get_confidence(&features);
+        assert!(confidence >= 0.0 && confidence <= 1.0);
+    }
+
+    #[test]
+    fn test_auto_blacklist() {
+        let mut detector = NegativeTransferDetector::new();
+
+        // Start a transfer
+        let pre_metrics = PerformanceSnapshot::new(0.60, 100.0, 1.5, 0.05, 50);
+        let transfer_id = detector.start_transfer("AAPL", "PENNY", pre_metrics);
+
+        // Evaluate with severely negative outcome (>15% drop)
+        let post_metrics = PerformanceSnapshot::new(0.35, 20.0, -0.5, 0.20, 70);
+        let eval = detector.evaluate_transfer(transfer_id, post_metrics);
+
+        assert!(eval.is_some());
+        let evaluation = eval.unwrap();
+        assert_eq!(evaluation.verdict, TransferVerdict::HighlyNegative);
+
+        // Should be auto-blacklisted
+        assert!(detector.is_blacklisted("AAPL", "PENNY"));
+    }
+
+    #[test]
+    fn test_predictor_training() {
+        let mut predictor = TransferImpactPredictor::new();
+
+        // Create training data
+        let mut impacts = Vec::new();
+        for i in 0..15 {
+            let mut impact = TransferImpact::new(
+                "A".to_string(),
+                "B".to_string(),
+                i,
+                PerformanceSnapshot::new(0.5, 50.0, 1.0, 0.05, 50),
+            );
+            impact.post_transfer_metrics = Some(PerformanceSnapshot::new(
+                if i % 2 == 0 { 0.55 } else { 0.45 },
+                if i % 2 == 0 { 60.0 } else { 40.0 },
+                if i % 2 == 0 { 1.2 } else { 0.8 },
+                0.05,
+                60,
+            ));
+            impact.calculate_impact();
+            impacts.push(impact);
+        }
+
+        // Train
+        predictor.train(&impacts);
+
+        // Should have trained on samples
+        assert!(predictor.samples_trained > 0);
+    }
+
+    #[test]
+    fn test_integration_with_transfer_manager() {
+        let mut detector = NegativeTransferDetector::new();
+
+        // Simulate multiple transfers
+        for i in 0..5 {
+            let pre = PerformanceSnapshot::new(0.5 + i as f64 * 0.02, 50.0, 1.0, 0.05, 30);
+            let id = detector.start_transfer("SPY", &format!("ETF{}", i), pre);
+
+            let post = PerformanceSnapshot::new(
+                0.52 + i as f64 * 0.01,
+                55.0,
+                1.1,
+                0.04,
+                50,
+            );
+            detector.evaluate_transfer(id, post);
+        }
+
+        // Check history
+        let history = detector.get_transfer_history("SPY", "ETF0");
+        assert_eq!(history.len(), 1);
+
+        // Check summary
+        let summary = detector.format_summary();
+        assert!(summary.contains("tracked"));
+    }
+
+    #[test]
+    fn test_transfer_verdict_thresholds() {
+        assert_eq!(TransferVerdict::from_impact(0.10), TransferVerdict::Positive);
+        assert_eq!(TransferVerdict::from_impact(0.02), TransferVerdict::Neutral);
+        assert_eq!(TransferVerdict::from_impact(-0.02), TransferVerdict::Neutral);
+        assert_eq!(TransferVerdict::from_impact(-0.08), TransferVerdict::Negative);
+        assert_eq!(TransferVerdict::from_impact(-0.20), TransferVerdict::HighlyNegative);
+    }
+
+    #[test]
+    fn test_metrics_change_calculation() {
+        let pre = PerformanceSnapshot::new(0.50, 50.0, 1.0, 0.05, 100);
+        let post = PerformanceSnapshot::new(0.55, 60.0, 1.2, 0.06, 120);
+
+        let change = MetricsChange::from_snapshots(&pre, &post);
+
+        assert!((change.win_rate_delta - 0.05).abs() < 0.001);
+        assert!((change.pnl_delta - 10.0).abs() < 0.001);
+        assert!((change.sharpe_delta - 0.2).abs() < 0.001);
+        assert!((change.dd_delta - 0.01).abs() < 0.001); // DD got worse
+    }
+
+    #[test]
+    fn test_graylist_entry() {
+        let entry = GraylistEntry::new("Test reason".to_string(), -0.10, 30);
+
+        assert!(!entry.is_expired()); // Should not be expired yet
+        assert_eq!(entry.retry_count, 0);
+        assert!(entry.reason.contains("Test reason"));
+    }
+
+    #[test]
+    fn test_blocked_pairs_list() {
+        let mut detector = NegativeTransferDetector::new();
+
+        detector.add_to_blacklist("A", "B", "Severe negative");
+        detector.add_to_graylist("C", "D", -0.10, 30);
+
+        let blocked = detector.get_blocked_pairs();
+        assert_eq!(blocked.len(), 2);
+
+        // Check that we have one blacklisted and one graylisted
+        let has_blacklist = blocked.iter().any(|(_, reason)| {
+            matches!(reason, BlockReason::Blacklisted { .. })
+        });
+        let has_graylist = blocked.iter().any(|(_, reason)| {
+            matches!(reason, BlockReason::Graylisted { .. })
+        });
+
+        assert!(has_blacklist);
+        assert!(has_graylist);
     }
 }

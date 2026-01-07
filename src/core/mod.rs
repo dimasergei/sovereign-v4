@@ -53,7 +53,12 @@ pub use monitor::{AGIMonitor, AGIMetrics, AGIReport, PerformanceMetrics, SystemH
 pub use sequence::{LSTMCell, SequenceEncoder, MarketFeatures, RegimePredictor};
 pub use embeddings::{VectorIndex, TradeEmbedding, TradeContext, EmbeddingModel, IndexType, cosine_similarity};
 pub use consolidation::{MemoryConsolidator, MemoryTier, Episode, EpisodeContext, Pattern, MemoryStats, ImportanceScorer, PatternExtractor};
-pub use transferability::{TransferabilityPredictor, TransferabilityScore, SymbolProfile, TransferOutcome};
+pub use transferability::{
+    TransferabilityPredictor, TransferabilityScore, SymbolProfile, TransferOutcome,
+    // Negative transfer detection
+    PerformanceSnapshot, TransferImpact, GraylistEntry, TransferImpactPredictor,
+    TransferVerdict, MetricsChange, BlockReason, TransferEvaluation, NegativeTransferDetector,
+};
 pub use selfmod::{
     SelfModificationEngine, Constitution, ConstitutionalGuard, RuleEngine,
     TradingRule, RuleCondition, RuleAction, RuleContext, RulePerformance,

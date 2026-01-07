@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use super::regime::Regime;
-use super::transferability::{TransferabilityPredictor, TransferOutcome};
+use super::transferability::{TransferabilityPredictor, TransferOutcome, NegativeTransferDetector};
 use super::foundation::FoundationTransfer;
 
 /// Number of features in the calibrator model
@@ -179,6 +179,9 @@ pub struct TransferManager {
     /// Foundation-based transfer for zero-shot learning
     #[serde(skip)]
     foundation_transfer: Option<Arc<Mutex<FoundationTransfer>>>,
+    /// Negative transfer detector for blacklist/graylist
+    #[serde(skip)]
+    negative_detector: Option<Arc<Mutex<NegativeTransferDetector>>>,
 }
 
 fn default_ml_threshold() -> f64 {
@@ -201,6 +204,7 @@ impl TransferManager {
             use_ml_predictions: false,
             ml_threshold: 0.6,
             foundation_transfer: None,
+            negative_detector: None,
         }
     }
 
@@ -213,6 +217,7 @@ impl TransferManager {
             use_ml_predictions: true,
             ml_threshold: 0.6,
             foundation_transfer: None,
+            negative_detector: None,
         }
     }
 
@@ -240,6 +245,21 @@ impl TransferManager {
     /// Check if foundation transfer is attached
     pub fn has_foundation_transfer(&self) -> bool {
         self.foundation_transfer.is_some()
+    }
+
+    /// Attach negative transfer detector for blocking harmful transfers
+    pub fn attach_negative_detector(&mut self, detector: Arc<Mutex<NegativeTransferDetector>>) {
+        self.negative_detector = Some(detector);
+    }
+
+    /// Check if negative transfer detector is attached
+    pub fn has_negative_detector(&self) -> bool {
+        self.negative_detector.is_some()
+    }
+
+    /// Get reference to negative transfer detector
+    pub fn get_negative_detector(&self) -> Option<&Arc<Mutex<NegativeTransferDetector>>> {
+        self.negative_detector.as_ref()
     }
 
     /// Get zero-shot transfer score from foundation model
@@ -384,12 +404,27 @@ impl TransferManager {
 
     /// Check if knowledge should be transferred from source to target
     ///
+    /// First checks negative transfer detector for blacklisted/graylisted pairs.
     /// When ML predictions enabled: Uses learned transferability score
     /// Otherwise uses hardcoded cluster rules:
     /// 1. Both symbols are in the same cluster
     /// 2. Source has >= MIN_SOURCE_TRADES_FOR_TRANSFER trades
     /// 3. Cluster win rate > MIN_WIN_RATE_FOR_TRANSFER
     pub fn should_transfer(&self, source: &str, target: &str) -> bool {
+        // Check negative transfer detector first (blacklist/graylist)
+        if let Some(ref detector) = self.negative_detector {
+            if let Ok(d) = detector.lock() {
+                let (allowed, reason) = d.should_allow_transfer(source, target);
+                if !allowed {
+                    info!(
+                        "[TRANSFER] Blocked {} -> {}: {}",
+                        source, target, reason.unwrap_or_default()
+                    );
+                    return false;
+                }
+            }
+        }
+
         // Try ML prediction first if available
         if self.use_ml_predictions {
             if let Some(ref predictor) = self.transferability_predictor {
