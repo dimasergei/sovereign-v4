@@ -9,6 +9,13 @@ port = 7496
 client_id = 1
 account_currency = "CAD"
 
+# IBKR connection settings
+# connection_mode: "tws" for native socket API, "gateway" for REST API
+[ibkr]
+connection_mode = "tws"
+account_id = ""  # Set your LIVE trading account ID
+gateway_url = "https://localhost:5000"  # Only used if connection_mode = "gateway"
+
 [capital]
 initial = 1000000
 currency = "CAD"

@@ -35,6 +35,7 @@ use crate::data::database::TradeDb;
 use crate::data::memory::TradeMemory;
 use crate::broker::alpaca::AlpacaBroker;
 use crate::broker::ibkr::IbkrBroker;
+use crate::broker::tws::TwsBroker;
 use crate::comms::telegram;
 use crate::config::Config;
 
@@ -743,6 +744,7 @@ impl AlertManager {
 enum BrokerType {
     Alpaca(AlpacaBroker),
     Ibkr(Arc<IbkrBroker>),
+    Tws(Arc<TwsBroker>),
 }
 
 #[tokio::main]
@@ -829,13 +831,28 @@ async fn main() -> Result<()> {
 
     // Initialize broker based on config
     let broker_type = if cfg.is_ibkr() {
-        let ibkr_cfg = cfg.ibkr_config().expect("IBKR config required");
-        let broker = IbkrBroker::new(
-            ibkr_cfg.gateway_url.clone(),
-            ibkr_cfg.account_id.clone(),
-        )?;
-        info!("Broker: IBKR Client Portal (account: {})", ibkr_cfg.account_id);
-        BrokerType::Ibkr(Arc::new(broker))
+        if cfg.is_ibkr_tws_mode() {
+            // TWS Socket API mode
+            let broker = TwsBroker::new(
+                cfg.get_ibkr_host(),
+                cfg.get_ibkr_port(),
+                cfg.get_ibkr_client_id(),
+                cfg.get_ibkr_account_id(),
+            );
+            info!("Broker: IBKR TWS Socket API ({}:{}, client_id={}, account={})",
+                cfg.get_ibkr_host(), cfg.get_ibkr_port(),
+                cfg.get_ibkr_client_id(), cfg.get_ibkr_account_id());
+            BrokerType::Tws(Arc::new(broker))
+        } else {
+            // Gateway REST API mode
+            let ibkr_cfg = cfg.ibkr_config().expect("IBKR config required");
+            let broker = IbkrBroker::new(
+                cfg.get_ibkr_gateway_url(),
+                ibkr_cfg.account_id.clone(),
+            )?;
+            info!("Broker: IBKR Client Portal (account: {})", ibkr_cfg.account_id);
+            BrokerType::Ibkr(Arc::new(broker))
+        }
     } else {
         let alpaca_cfg = cfg.alpaca.clone().expect("Alpaca config required");
         let broker = AlpacaBroker::new(
@@ -874,6 +891,22 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => warn!("Failed to get account info: {}", e),
+            }
+        }
+        BrokerType::Tws(broker) => {
+            // Connect to TWS first
+            if let Err(e) = broker.connect().await {
+                warn!("Failed to connect to TWS: {}", e);
+            } else {
+                match broker.get_account_summary().await {
+                    Ok(summary) => {
+                        info!("Account: ${:.2} net liquidation, ${:.2} available funds",
+                            summary.net_liquidation, summary.available_funds);
+                        initial_balance = Decimal::from_f64(summary.net_liquidation)
+                            .unwrap_or(dec!(100000));
+                    }
+                    Err(e) => warn!("Failed to get account info: {}", e),
+                }
             }
         }
     }
@@ -915,6 +948,26 @@ async fn main() -> Result<()> {
         BrokerType::Ibkr(broker) => {
             for sym in &symbols {
                 match broker.get_all_daily_bars(sym).await {
+                    Ok(bars) => {
+                        if let Some(agent) = agents.get_mut(sym) {
+                            for bar in &bars {
+                                let open = Decimal::from_f64(bar.open).unwrap_or(dec!(0));
+                                let high = Decimal::from_f64(bar.high).unwrap_or(dec!(0));
+                                let low = Decimal::from_f64(bar.low).unwrap_or(dec!(0));
+                                let close = Decimal::from_f64(bar.close).unwrap_or(dec!(0));
+                                agent.bootstrap_bar(open, high, low, close, bar.volume as u64);
+                            }
+                            info!("{}: Bootstrapped S/R from {} historical bars", sym, bars.len());
+                        }
+                    }
+                    Err(e) => warn!("{}: Failed to fetch historical bars: {}", sym, e),
+                }
+            }
+        }
+        BrokerType::Tws(broker) => {
+            for sym in &symbols {
+                let contract = broker.make_stock_contract(sym, "SMART", "USD");
+                match broker.get_historical_bars(&contract, "", "1 Y", "1 day", "TRADES", true).await {
                     Ok(bars) => {
                         if let Some(agent) = agents.get_mut(sym) {
                             for bar in &bars {
@@ -1186,6 +1239,9 @@ async fn main() -> Result<()> {
         BrokerType::Ibkr(broker) => {
             recover_ibkr_positions(broker, &mut portfolio, &mut agents).await;
         }
+        BrokerType::Tws(broker) => {
+            recover_tws_positions(broker, &mut portfolio, &mut agents).await;
+        }
     }
 
     // Send startup notification
@@ -1248,6 +1304,31 @@ async fn main() -> Result<()> {
                 &mut health,
                 &mut alert_manager,
                 &mut last_tickle,
+                telegram_enabled,
+                &transfer_manager,
+                &meta_learner,
+                &weakness_analyzer,
+                &causal_analyzer,
+                &world_model,
+                &counterfactual,
+                &agi_monitor,
+                &regime_predictor,
+                &vector_index,
+                &memory_consolidator,
+                &transferability_predictor,
+                &selfmod,
+                &code_deployer,
+                &foundation,
+            ).await
+        }
+        BrokerType::Tws(broker) => {
+            run_tws_loop(
+                broker,
+                cfg,
+                &mut agents,
+                &mut portfolio,
+                &mut health,
+                &mut alert_manager,
                 telegram_enabled,
                 &transfer_manager,
                 &meta_learner,
@@ -2178,6 +2259,383 @@ async fn execute_ibkr_signal(
             match broker.close_position(&sig.symbol).await {
                 Ok(order) => {
                     info!("COVER ORDER: {:?}", order.order_id);
+                    portfolio.remove_position(&sig.symbol);
+                    if telegram_enabled {
+                        let _ = telegram::send(&format!("COVER {} @ {:.2} - {}", sig.symbol, sig.price, sig.reason)).await;
+                    }
+                }
+                Err(e) => warn!("Cover failed: {}", e),
+            }
+        }
+        Signal::Hold => {}
+    }
+}
+
+/// Recover positions from TWS
+async fn recover_tws_positions(
+    broker: &TwsBroker,
+    portfolio: &mut Portfolio,
+    agents: &mut HashMap<String, SymbolAgent>,
+) {
+    match broker.get_positions().await {
+        Ok(positions) => {
+            if !positions.is_empty() {
+                info!("{}", SEP);
+                info!("RECOVERING {} EXISTING POSITION(S):", positions.len());
+                for pos in &positions {
+                    let symbol = pos.contract.symbol.clone();
+                    info!("  {} {:.0} shares @ ${:.2} | P&L: ${:.2}",
+                        symbol, pos.position.abs(), pos.avg_cost,
+                        pos.unrealized_pnl.unwrap_or(0.0));
+
+                    let side = if pos.position >= 0.0 { Side::Long } else { Side::Short };
+                    let qty = Decimal::from_f64(pos.position.abs()).unwrap_or(Decimal::ZERO);
+                    let entry_price = Decimal::from_f64(pos.avg_cost).unwrap_or(Decimal::ZERO);
+                    let market_value = qty * entry_price;
+
+                    portfolio.add_position(PortfolioPosition {
+                        symbol: symbol.clone(),
+                        side,
+                        quantity: qty,
+                        entry_price,
+                        current_price: entry_price,
+                        entry_time: Utc::now(),
+                        market_value,
+                        sector: Sector::from_symbol(&symbol),
+                    });
+
+                    if let Some(agent) = agents.get_mut(&symbol) {
+                        agent.set_position(Some(Position {
+                            side,
+                            entry_price,
+                            entry_time: Utc::now(),
+                            quantity: qty,
+                        }));
+                    }
+                }
+                info!("{}", SEP);
+            } else {
+                info!("No existing positions to recover");
+            }
+        }
+        Err(e) => warn!("Failed to get positions: {}", e),
+    }
+}
+
+/// Run the TWS event loop with polling
+async fn run_tws_loop(
+    broker: Arc<TwsBroker>,
+    cfg: Config,
+    agents: &mut HashMap<String, SymbolAgent>,
+    portfolio: &mut Portfolio,
+    health: &mut HealthMonitor,
+    alert_manager: &mut AlertManager,
+    telegram_enabled: bool,
+    transfer_manager: &Arc<Mutex<TransferManager>>,
+    meta_learner: &Arc<Mutex<MetaLearner>>,
+    weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
+    causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
+    world_model: &Arc<Mutex<WorldModel>>,
+    counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
+    agi_monitor: &Arc<Mutex<AGIMonitor>>,
+    regime_predictor: &Arc<Mutex<RegimePredictor>>,
+    vector_index: &Arc<Mutex<VectorIndex>>,
+    memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
+    transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
+    selfmod: &Arc<Mutex<SelfModificationEngine>>,
+    code_deployer: &Arc<Mutex<CodeDeployer>>,
+    foundation: &Arc<Mutex<TimeSeriesFoundation>>,
+) -> Result<()> {
+    let symbols: Vec<String> = cfg.universe.symbols.clone();
+    let mut last_health_check = std::time::Instant::now();
+    let mut last_hourly_snapshot = std::time::Instant::now();
+    let mut last_data_poll = std::time::Instant::now();
+    let mut bar_count = 0u64;
+    let mut last_summary_date: Option<chrono::NaiveDate> = None;
+
+    info!("TWS mode: Polling for market data every 60 seconds");
+    info!("Waiting for market data...");
+
+    loop {
+        // Health check every 10 seconds
+        if last_health_check.elapsed().as_secs() >= 10 {
+            last_health_check = std::time::Instant::now();
+            health.set_market_open(is_market_open());
+
+            // Poll for Telegram commands
+            if telegram_enabled {
+                process_telegram_commands(selfmod, code_deployer, causal_analyzer).await;
+            }
+
+            match health.check() {
+                HealthStatus::Healthy { gaps: _ } => alert_manager.reset(),
+                HealthStatus::MarketClosed => {}
+                HealthStatus::StaleData { seconds, gaps } => {
+                    warn!("HEALTH: No bars for {}s (gap #{})", seconds, gaps);
+                    if alert_manager.should_alert_gap() && telegram_enabled {
+                        let _ = telegram::send(&format!(
+                            "Data gap: {}s without bars (gap #{}) - Market: {}",
+                            seconds, gaps, if is_market_open() { "OPEN" } else { "CLOSED" }
+                        )).await;
+                    }
+                }
+            }
+        }
+
+        // Poll for new data every 60 seconds during market hours
+        if last_data_poll.elapsed().as_secs() >= 60 && is_market_open() {
+            last_data_poll = std::time::Instant::now();
+
+            // Get latest bar for each symbol using TWS historical data
+            for sym in &symbols {
+                let contract = broker.make_stock_contract(sym, "SMART", "USD");
+                match broker.get_historical_bars(&contract, "", "1 D", "1 day", "TRADES", true).await {
+                    Ok(bars) => {
+                        if let Some(bar) = bars.last() {
+                            bar_count += 1;
+                            health.record_bar();
+                            alert_manager.reset();
+
+                            process_bar_signal_tws(
+                                sym,
+                                bar.open,
+                                bar.high,
+                                bar.low,
+                                bar.close,
+                                bar.volume as u64,
+                                bar_count,
+                                agents,
+                                portfolio,
+                                &broker,
+                                telegram_enabled,
+                            ).await;
+                        }
+                    }
+                    Err(e) => warn!("{}: Failed to get latest bar: {}", sym, e),
+                }
+            }
+        }
+
+        // Hourly snapshot for AGI monitoring
+        if last_hourly_snapshot.elapsed().as_secs() >= 3600 {
+            last_hourly_snapshot = std::time::Instant::now();
+            let mut mon = agi_monitor.lock().unwrap();
+            mon.snapshot_hourly();
+        }
+
+        // Daily summary at 21:05 UTC (5 min after market close)
+        let now = Utc::now();
+        let today = now.date_naive();
+        if now.hour() == 21 && now.minute() >= 5 && now.minute() < 15 {
+            if last_summary_date != Some(today) {
+                last_summary_date = Some(today);
+
+                // Daily snapshot for AGI monitoring
+                {
+                    let mut mon = agi_monitor.lock().unwrap();
+                    mon.snapshot_daily();
+                }
+
+                // Save all state
+                save_calibrator(agents);
+                save_transfer(transfer_manager);
+                save_moe(agents);
+                save_meta(meta_learner);
+                save_weakness(weakness_analyzer);
+                save_causality(causal_analyzer);
+                save_worldmodel(world_model);
+                save_counterfactual(counterfactual);
+                save_monitor(agi_monitor);
+                save_sequence(regime_predictor);
+                save_embeddings(vector_index);
+                save_consolidation(memory_consolidator);
+                save_transferability(&transferability_predictor);
+                save_selfmod(selfmod);
+                save_codegen(code_deployer);
+                save_foundation(foundation);
+
+                // Run consolidation and analysis
+                run_consolidation(memory_consolidator);
+                run_analyze_and_propose(selfmod, weakness_analyzer, counterfactual);
+                run_code_generation(code_deployer, weakness_analyzer, counterfactual, memory_consolidator);
+                learn_from_transfers(transfer_manager);
+                discover_ml_clusters(transfer_manager);
+
+                if telegram_enabled {
+                    let sector_info = portfolio.sector_summary();
+                    telegram::send_daily_summary(
+                        portfolio.position_count(),
+                        portfolio.long_exposure_pct(),
+                        portfolio.short_exposure_pct(),
+                        portfolio.unrealized_pnl(),
+                        bar_count,
+                        &sector_info,
+                    ).await;
+                }
+            }
+        }
+
+        // Small sleep to prevent busy loop
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Process a bar and generate/execute signals (TWS version)
+async fn process_bar_signal_tws(
+    symbol: &str,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: u64,
+    bar_count: u64,
+    agents: &mut HashMap<String, SymbolAgent>,
+    portfolio: &mut Portfolio,
+    broker: &TwsBroker,
+    telegram_enabled: bool,
+) {
+    let open = Decimal::from_f64(open).unwrap_or(dec!(0));
+    let high = Decimal::from_f64(high).unwrap_or(dec!(0));
+    let low = Decimal::from_f64(low).unwrap_or(dec!(0));
+    let close = Decimal::from_f64(close).unwrap_or(dec!(0));
+
+    info!("{}", SEP);
+    info!("BAR #{}: {} | O={} H={} L={} C={} V={}",
+        bar_count, symbol, open, high, low, close, volume);
+
+    if let Some(agent) = agents.get_mut(symbol) {
+        let signal = agent.process_bar(Utc::now(), open, high, low, close, volume);
+
+        if let (Some(support), Some(resistance)) = (agent.support(), agent.resistance()) {
+            info!("S/R: Support={:.2} | Resistance={:.2}", support, resistance);
+        }
+        info!("Agent: {} bars processed, {} S/R levels tracked",
+            agent.bar_count(), agent.sr_level_count());
+        info!("Portfolio: {} | Positions: {}",
+            portfolio.exposure_summary(), portfolio.position_count());
+
+        if !is_market_open_for_symbol(symbol) {
+            info!("Signal: HOLD | Market closed for {}", symbol);
+            info!("{}", SEP);
+            return;
+        }
+
+        if let Some(sig) = signal {
+            if portfolio.should_execute(&sig) {
+                info!("{}", SEP);
+                info!("SIGNAL: {} {} @ {:.2} ({:.0}th percentile volume)",
+                    sig.signal, sig.symbol, sig.price, sig.volume_percentile);
+                info!("Reason: {}", sig.reason);
+                info!("{}", SEP);
+
+                let qty = portfolio.calculate_position_size(sig.price, sig.support, agent.atr());
+                execute_tws_signal(&sig, qty, agent, portfolio, broker, telegram_enabled).await;
+            } else {
+                info!("Signal: {} {} blocked by portfolio constraints", sig.signal, sig.symbol);
+            }
+        } else {
+            info!("Signal: HOLD | No opportunity");
+        }
+    }
+
+    info!("{}", SEP);
+}
+
+/// Execute a trading signal via TWS
+async fn execute_tws_signal(
+    sig: &AgentSignal,
+    qty: Decimal,
+    agent: &mut SymbolAgent,
+    portfolio: &mut Portfolio,
+    broker: &TwsBroker,
+    telegram_enabled: bool,
+) {
+    let contract = broker.make_stock_contract(&sig.symbol, "SMART", "USD");
+    let qty_f64 = qty.to_f64().unwrap_or(0.0);
+
+    match sig.signal {
+        Signal::Buy => {
+            match broker.place_market_order(&contract, "BUY", qty_f64).await {
+                Ok(order_id) => {
+                    info!("BUY ORDER: {} qty={}", order_id, qty);
+
+                    portfolio.add_position(PortfolioPosition {
+                        symbol: sig.symbol.clone(),
+                        side: Side::Long,
+                        quantity: qty,
+                        entry_price: sig.price,
+                        current_price: sig.price,
+                        entry_time: Utc::now(),
+                        market_value: qty * sig.price,
+                        sector: Sector::from_symbol(&sig.symbol),
+                    });
+
+                    if telegram_enabled {
+                        telegram::send_signal(
+                            "BUY", &sig.price.to_string(), "N/A", "N/A", 100,
+                        ).await;
+                    }
+                }
+                Err(e) => {
+                    warn!("Buy failed: {}", e);
+                    agent.close_position();
+                }
+            }
+        }
+        Signal::Sell => {
+            // Get current position quantity
+            let current_qty = portfolio.get_position(&sig.symbol)
+                .map(|p| p.quantity.to_f64().unwrap_or(0.0))
+                .unwrap_or(0.0);
+
+            match broker.place_market_order(&contract, "SELL", current_qty).await {
+                Ok(order_id) => {
+                    info!("SELL ORDER: {}", order_id);
+                    portfolio.remove_position(&sig.symbol);
+                    if telegram_enabled {
+                        let _ = telegram::send(&format!("SELL {} @ {:.2} - {}", sig.symbol, sig.price, sig.reason)).await;
+                    }
+                }
+                Err(e) => warn!("Sell failed: {}", e),
+            }
+        }
+        Signal::Short => {
+            match broker.place_market_order(&contract, "SELL", qty_f64).await {
+                Ok(order_id) => {
+                    info!("SHORT ORDER: {} qty={}", order_id, qty);
+
+                    portfolio.add_position(PortfolioPosition {
+                        symbol: sig.symbol.clone(),
+                        side: Side::Short,
+                        quantity: qty,
+                        entry_price: sig.price,
+                        current_price: sig.price,
+                        entry_time: Utc::now(),
+                        market_value: qty * sig.price,
+                        sector: Sector::from_symbol(&sig.symbol),
+                    });
+
+                    if telegram_enabled {
+                        telegram::send_signal(
+                            "SHORT", &sig.price.to_string(), "N/A", "N/A", 100,
+                        ).await;
+                    }
+                }
+                Err(e) => {
+                    warn!("Short failed: {}", e);
+                    agent.close_position();
+                }
+            }
+        }
+        Signal::Cover => {
+            // Get current position quantity
+            let current_qty = portfolio.get_position(&sig.symbol)
+                .map(|p| p.quantity.to_f64().unwrap_or(0.0))
+                .unwrap_or(0.0);
+
+            match broker.place_market_order(&contract, "BUY", current_qty).await {
+                Ok(order_id) => {
+                    info!("COVER ORDER: {}", order_id);
                     portfolio.remove_position(&sig.symbol);
                     if telegram_enabled {
                         let _ = telegram::send(&format!("COVER {} @ {:.2} - {}", sig.symbol, sig.price, sig.reason)).await;
