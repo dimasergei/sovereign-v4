@@ -939,6 +939,58 @@ impl TradeMemory {
         Ok(result)
     }
 
+    /// Get all closed trades for analysis
+    pub fn get_all_closed_trades(&self, limit: i32) -> Result<Vec<TradeContext>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT id, symbol, ticket, direction, entry_price, sr_level, sr_score,
+                    volume_percentile, atr, regime, entry_bar_count, opened_at,
+                    exit_price, profit, profit_pct, hit_tp, hit_sl, hold_bars,
+                    mae, mfe, closed_at
+             FROM trade_context
+             WHERE closed_at IS NOT NULL
+             ORDER BY closed_at DESC
+             LIMIT ?1"
+        )?;
+
+        let rows = stmt.query_map([limit], |row| {
+            Ok(TradeContext {
+                id: row.get(0)?,
+                symbol: row.get(1)?,
+                ticket: row.get::<_, i64>(2)? as u64,
+                direction: row.get(3)?,
+                entry_price: row.get(4)?,
+                sr_level: row.get(5)?,
+                sr_score: row.get(6)?,
+                volume_percentile: row.get(7)?,
+                atr: row.get(8)?,
+                regime: row.get(9)?,
+                entry_bar_count: row.get::<_, i64>(10)? as u64,
+                opened_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(11)?)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                exit_price: row.get(12)?,
+                profit: row.get(13)?,
+                profit_pct: row.get(14)?,
+                hit_tp: row.get::<_, Option<i32>>(15)?.map(|v| v != 0),
+                hit_sl: row.get::<_, Option<i32>>(16)?.map(|v| v != 0),
+                hold_bars: row.get(17)?,
+                mae: row.get(18)?,
+                mfe: row.get(19)?,
+                closed_at: row.get::<_, Option<String>>(20)?
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&Utc)),
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     /// Get volume percentile effectiveness
     pub fn get_volume_percentile_effectiveness(&self, symbol: &str) -> Result<Vec<(i32, f64, i32)>> {
         let conn = self.conn.lock().unwrap();

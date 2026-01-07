@@ -834,3 +834,120 @@ pub async fn send_learning_update(
     );
     let _ = send(&msg).await;
 }
+
+// ==================== Capital Commands ====================
+
+/// Send capital command help
+pub async fn send_capital_help() {
+    let msg = "💰 <b>Capital Commands</b>\n\n\
+        /capital - Show capital status and P&L\n\
+        /readiness - Check live trading readiness";
+    let _ = send(msg).await;
+}
+
+/// Format a monetary amount with commas
+fn format_money(amount: f64) -> String {
+    let abs_amount = amount.abs();
+    let sign = if amount < 0.0 { "-" } else { "" };
+
+    if abs_amount >= 1_000_000.0 {
+        format!("{}${:.2}M", sign, abs_amount / 1_000_000.0)
+    } else if abs_amount >= 1_000.0 {
+        let thousands = (abs_amount / 1_000.0) as u64;
+        let remainder = abs_amount % 1_000.0;
+        format!("{}${},{:06.2}", sign, thousands, remainder)
+    } else {
+        format!("{}${:.2}", sign, abs_amount)
+    }
+}
+
+/// Send capital status
+pub async fn send_capital_status(
+    starting_capital: f64,
+    currency: &str,
+    current_nav: f64,
+    total_pnl: f64,
+    total_pnl_pct: f64,
+    today_pnl: f64,
+    open_exposure: f64,
+    open_exposure_pct: f64,
+    available: f64,
+    margin_used: f64,
+) {
+    let pnl_emoji = if total_pnl >= 0.0 { "📈" } else { "📉" };
+    let today_emoji = if today_pnl >= 0.0 { "✅" } else { "❌" };
+
+    let msg = format!(
+        "💰 <b>Capital Status</b>\n\n\
+        Starting: {} {}\n\
+        Current NAV: {}\n\n\
+        {} Total P&L: {} ({:+.2}%)\n\
+        {} Today P&L: {}\n\n\
+        Open Exposure: {} ({:.1}%)\n\
+        Available: {}\n\
+        Margin Used: {}",
+        format_money(starting_capital), currency,
+        format_money(current_nav),
+        pnl_emoji, format_money(total_pnl), total_pnl_pct,
+        today_emoji, format_money(today_pnl),
+        format_money(open_exposure), open_exposure_pct,
+        format_money(available),
+        format_money(margin_used)
+    );
+    let _ = send(&msg).await;
+}
+
+// ==================== Readiness Commands ====================
+
+/// Send readiness check results
+pub async fn send_readiness_results(
+    criteria: &[(String, f64, f64, bool)],  // (name, current, required, passed)
+    all_passed: bool,
+) {
+    let overall_emoji = if all_passed { "✅" } else { "❌" };
+    let overall_status = if all_passed {
+        "READY FOR LIVE TRADING"
+    } else {
+        "NOT READY - Continue Paper Trading"
+    };
+
+    let mut msg = format!("{} <b>Readiness Check</b>\n\n", overall_emoji);
+
+    for (name, current, required, passed) in criteria {
+        let emoji = if *passed { "✅" } else { "❌" };
+        msg.push_str(&format!(
+            "{} {}: {:.2} (need {:.2})\n",
+            emoji, name, current, required
+        ));
+    }
+
+    msg.push_str(&format!("\n<b>{}</b>", overall_status));
+
+    let _ = send(&msg).await;
+}
+
+/// Send readiness check summary (quick version)
+pub async fn send_readiness_summary(
+    passed: usize,
+    total: usize,
+    blocking_criteria: &[String],
+) {
+    let all_passed = passed == total;
+    let emoji = if all_passed { "✅" } else { "⚠️" };
+
+    let mut msg = format!(
+        "{} <b>Readiness: {}/{}</b>\n\n",
+        emoji, passed, total
+    );
+
+    if !blocking_criteria.is_empty() {
+        msg.push_str("Blocking:\n");
+        for criteria in blocking_criteria.iter().take(5) {
+            msg.push_str(&format!("• {}\n", criteria));
+        }
+    } else {
+        msg.push_str("All criteria met! Ready for live trading.");
+    }
+
+    let _ = send(&msg).await;
+}

@@ -1,0 +1,54 @@
+# IBKR Paper Trading Configuration
+# Sovereign v4 AGI - $1M CAD Deployment
+
+[broker]
+type = "ibkr"
+host = "127.0.0.1"
+port = 7497
+client_id = 1
+account_currency = "CAD"
+
+[capital]
+initial = 1000000
+currency = "CAD"
+
+[universe]
+symbols = ["XAUUSD", "GLD", "SLV", "USO", "SPY", "QQQ"]
+
+[risk]
+max_position_pct = 0.5
+max_daily_dd_pct = 1.5
+max_total_dd_pct = 3.0
+max_exposure_pct = 10.0
+max_positions = 5
+min_confidence = 0.50
+
+[agi]
+enabled = true
+memory_enabled = true
+learning_enabled = true
+transfer_enabled = true
+self_mod_enabled = true
+causal_enabled = true
+world_model_enabled = true
+streaming_enabled = true
+auto_approve_threshold = 0.03
+require_backtest = true
+min_evidence_trades = 30
+
+[agi.constitution]
+max_position_pct = 0.5
+max_daily_dd_pct = 1.5
+max_total_dd_pct = 3.0
+forbidden = ["max_daily_dd_pct", "max_total_dd_pct", "constitution"]
+
+[telegram]
+enabled = true
+alert_on_trade = true
+alert_on_dd = true
+daily_summary = true
+
+[schedule]
+trading_start = "09:30"
+trading_end = "16:00"
+timezone = "America/Toronto"

@@ -61,6 +61,10 @@ path = "src/main.rs"
 name = "integration_test"
 path = "src/bin/integration_test.rs"
 
+[[bin]]
+name = "readiness_check"
+path = "src/bin/readiness_check.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
