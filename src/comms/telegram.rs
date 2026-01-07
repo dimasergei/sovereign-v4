@@ -477,3 +477,360 @@ pub async fn send_code_rollback(id: &str, success: bool, message: &str) {
     );
     let _ = send(&msg).await;
 }
+
+// ==================== Causal Commands ====================
+
+/// Send latent confounders list
+pub async fn send_causal_latents(latents: &[(String, String)], summary: &str) {
+    if latents.is_empty() {
+        let msg = format!("🔍 <b>Latent Confounders</b>\n\n{}", summary);
+        let _ = send(&msg).await;
+        return;
+    }
+
+    let mut msg = String::from("🔍 <b>Latent Confounders (Hidden Variables)</b>\n\n");
+    msg.push_str(&format!("{}\n\n", summary));
+
+    for (i, (a, b)) in latents.iter().take(10).enumerate() {
+        msg.push_str(&format!(
+            "{}. <b>{}</b> ↔ <b>{}</b>\n   Both influenced by unknown hidden factor\n\n",
+            i + 1, a, b
+        ));
+    }
+
+    if latents.len() > 10 {
+        msg.push_str(&format!("... and {} more", latents.len() - 10));
+    }
+
+    let _ = send(&msg).await;
+}
+
+/// Send PAG structure summary
+pub async fn send_causal_pag(summary: &str) {
+    let msg = format!(
+        "🕸️ <b>Partial Ancestral Graph (PAG)</b>\n\n\
+        <pre>{}</pre>\n\n\
+        Legend:\n\
+        → Definite direction\n\
+        ↔ Latent confounder\n\
+        ○ Uncertain endpoint",
+        summary
+    );
+    let _ = send(&msg).await;
+}
+
+// ==================== Transfer Blocking Commands ====================
+
+/// Send transfer command help
+pub async fn send_transfer_help() {
+    let msg = "🔄 <b>Transfer Commands</b>\n\n\
+        /transfer blocked - List blacklisted & graylisted pairs\n\
+        /transfer history - Show transfer impact history\n\
+        /transfer unblock &lt;source&gt; &lt;target&gt; - Remove from blacklist";
+    let _ = send(msg).await;
+}
+
+/// Send blocked transfer pairs (blacklist and graylist)
+pub async fn send_blocked_transfers(
+    blacklist: &[(String, String, String)],  // (source, target, reason)
+    graylist: &[(String, String, f64, String)],  // (source, target, impact, expires)
+) {
+    let mut msg = String::from("🚫 <b>Blocked Transfer Pairs</b>\n\n");
+
+    // Blacklist section
+    if blacklist.is_empty() {
+        msg.push_str("⛔ <b>Blacklist:</b> Empty\n\n");
+    } else {
+        msg.push_str(&format!("⛔ <b>Blacklist</b> ({} pairs):\n", blacklist.len()));
+        for (i, (source, target, reason)) in blacklist.iter().take(10).enumerate() {
+            msg.push_str(&format!(
+                "{}. {} → {}\n   {}\n",
+                i + 1, source, target, reason
+            ));
+        }
+        if blacklist.len() > 10 {
+            msg.push_str(&format!("... and {} more\n", blacklist.len() - 10));
+        }
+        msg.push('\n');
+    }
+
+    // Graylist section
+    if graylist.is_empty() {
+        msg.push_str("⏸️ <b>Graylist:</b> Empty");
+    } else {
+        msg.push_str(&format!("⏸️ <b>Graylist</b> ({} pairs):\n", graylist.len()));
+        for (i, (source, target, impact, expires)) in graylist.iter().take(10).enumerate() {
+            msg.push_str(&format!(
+                "{}. {} → {} ({:.1}%)\n   Expires: {}\n",
+                i + 1, source, target, impact * 100.0, expires
+            ));
+        }
+        if graylist.len() > 10 {
+            msg.push_str(&format!("... and {} more", graylist.len() - 10));
+        }
+    }
+
+    let _ = send(&msg).await;
+}
+
+/// Send transfer impact history
+pub async fn send_transfer_history(history: &[(String, String, f64, String, String)]) {
+    // (source, target, impact, verdict, date)
+    if history.is_empty() {
+        let _ = send("📜 <b>Transfer History</b>\n\nNo transfer evaluations yet.").await;
+        return;
+    }
+
+    let mut msg = String::from("📜 <b>Transfer History</b>\n\n");
+    for (i, (source, target, impact, verdict, date)) in history.iter().take(15).enumerate() {
+        let emoji = match verdict.as_str() {
+            "Positive" => "✅",
+            "Neutral" => "➖",
+            "Negative" => "⚠️",
+            "HighlyNegative" => "🚫",
+            _ => "❓",
+        };
+        msg.push_str(&format!(
+            "{}. {} {} → {}\n   Impact: {:.1}% | {}\n",
+            i + 1, emoji, source, target,
+            impact * 100.0, date
+        ));
+    }
+
+    if history.len() > 15 {
+        msg.push_str(&format!("\n... and {} more", history.len() - 15));
+    }
+
+    let _ = send(&msg).await;
+}
+
+/// Send transfer unblock confirmation
+pub async fn send_transfer_unblock(source: &str, target: &str, success: bool, message: &str) {
+    let emoji = if success { "✅" } else { "❌" };
+    let status = if success { "Unblocked" } else { "Unblock Failed" };
+    let msg = format!(
+        "{} <b>Transfer {}</b>\n\n{} → {}\n{}",
+        emoji, status, source, target, message
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send negative transfer alert
+pub async fn send_negative_transfer_alert(
+    source: &str,
+    target: &str,
+    impact: f64,
+    verdict: &str,
+    action: &str,
+) {
+    let emoji = if verdict == "HighlyNegative" { "🚨" } else { "⚠️" };
+    let msg = format!(
+        "{} <b>Negative Transfer Detected</b>\n\n\
+        {} → {}\n\
+        Impact: <b>{:.1}%</b>\n\
+        Verdict: {}\n\
+        Action: {}",
+        emoji, source, target, impact * 100.0, verdict, action
+    );
+    let _ = send(&msg).await;
+}
+
+// ==================== Sharded Memory Commands ====================
+
+/// Send memory command help
+pub async fn send_memory_help() {
+    let msg = "💾 <b>Memory Commands</b>\n\n\
+        /memory stats - Show sharded memory statistics\n\
+        /memory shards - Show per-shard information\n\
+        /memory compact - Trigger shard compaction\n\
+        /memory rebalance - Trigger shard rebalancing";
+    let _ = send(msg).await;
+}
+
+/// Send sharded memory statistics
+pub async fn send_memory_stats(
+    total_entries: u64,
+    num_shards: usize,
+    total_size_mb: f64,
+    avg_query_ms: f64,
+    cache_hit_rate: f64,
+    symbol_count: usize,
+    buffer_size: usize,
+) {
+    let msg = format!(
+        "💾 <b>Sharded Memory Stats</b>\n\n\
+        📊 Total Entries: {}\n\
+        🗂️ Shards: {}\n\
+        📦 Total Size: {:.1} MB\n\
+        ⚡ Avg Query: {:.2} ms\n\
+        🎯 Cache Hit Rate: {:.1}%\n\
+        🏷️ Symbols: {}\n\
+        ✏️ Write Buffer: {}",
+        format_number(total_entries),
+        num_shards,
+        total_size_mb,
+        avg_query_ms,
+        cache_hit_rate * 100.0,
+        symbol_count,
+        buffer_size
+    );
+    let _ = send(&msg).await;
+}
+
+/// Format large numbers with K/M/B suffixes
+fn format_number(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Send per-shard information
+pub async fn send_shard_info(shards: &[(usize, usize, f64)]) {
+    // (shard_id, entry_count, load_pct)
+    let mut msg = String::from("🗂️ <b>Shard Information</b>\n\n");
+
+    for (id, count, load_pct) in shards {
+        let bar = render_load_bar(*load_pct);
+        msg.push_str(&format!(
+            "Shard {}: {} {} ({:.1}%)\n",
+            id, bar, format_number(*count as u64), load_pct * 100.0
+        ));
+    }
+
+    let _ = send(&msg).await;
+}
+
+/// Render a load bar for shard visualization
+fn render_load_bar(load_pct: f64) -> String {
+    let width = 10;
+    let filled = ((load_pct * width as f64).round() as usize).min(width);
+    let empty = width - filled;
+
+    let fill_char = if load_pct > 0.9 {
+        "🔴"
+    } else if load_pct > 0.7 {
+        "🟡"
+    } else {
+        "🟢"
+    };
+
+    format!("[{}{}]", fill_char.repeat(filled), "░".repeat(empty))
+}
+
+/// Send compaction result
+pub async fn send_memory_compact(success: bool, message: &str) {
+    let emoji = if success { "✅" } else { "❌" };
+    let status = if success { "Compaction Complete" } else { "Compaction Failed" };
+    let msg = format!(
+        "{} <b>{}</b>\n\n{}",
+        emoji, status, message
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send rebalance result
+pub async fn send_memory_rebalance(success: bool, entries_moved: u32, message: &str) {
+    let emoji = if success { "⚖️" } else { "❌" };
+    let status = if success { "Rebalance Complete" } else { "Rebalance Failed" };
+    let msg = format!(
+        "{} <b>{}</b>\n\n\
+        Entries Moved: {}\n\
+        {}",
+        emoji, status, entries_moved, message
+    );
+    let _ = send(&msg).await;
+}
+
+// ==================== Streaming Commands ====================
+
+/// Send streaming command help
+pub async fn send_streaming_help() {
+    let msg = "📡 <b>Streaming Commands</b>\n\n\
+        /streaming stats - Show streaming statistics\n\
+        /streaming flush - Force flush all pending updates\n\
+        /streaming pause - Pause learning (buffer still accepts)\n\
+        /streaming resume - Resume learning";
+    let _ = send(msg).await;
+}
+
+/// Send streaming statistics
+pub async fn send_streaming_stats(
+    updates_processed: u64,
+    updates_pending: usize,
+    learning_updates: u64,
+    avg_latency_us: f64,
+    buffer_utilization: f64,
+    cache_size: usize,
+    is_paused: bool,
+) {
+    let status_emoji = if is_paused { "⏸️" } else { "▶️" };
+    let status_text = if is_paused { "PAUSED" } else { "RUNNING" };
+
+    let msg = format!(
+        "📡 <b>Streaming Stats</b> {} {}\n\n\
+        📥 Updates Processed: {}\n\
+        ⏳ Updates Pending: {}\n\
+        🧠 Learning Updates: {}\n\
+        ⚡ Avg Latency: {:.1} µs\n\
+        📊 Buffer: {:.1}%\n\
+        🗂️ Cache Size: {}",
+        status_emoji, status_text,
+        format_number(updates_processed),
+        updates_pending,
+        format_number(learning_updates),
+        avg_latency_us,
+        buffer_utilization * 100.0,
+        cache_size
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send streaming flush result
+pub async fn send_streaming_flush(success: bool, message: &str) {
+    let emoji = if success { "✅" } else { "❌" };
+    let status = if success { "Flush Complete" } else { "Flush Failed" };
+    let msg = format!(
+        "{} <b>{}</b>\n\n{}",
+        emoji, status, message
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send streaming pause/resume confirmation
+pub async fn send_streaming_state(paused: bool) {
+    let (emoji, status, desc) = if paused {
+        ("⏸️", "Learning Paused", "Buffer continues accepting updates")
+    } else {
+        ("▶️", "Learning Resumed", "Processing updates in background")
+    };
+
+    let msg = format!(
+        "{} <b>{}</b>\n\n{}",
+        emoji, status, desc
+    );
+    let _ = send(&msg).await;
+}
+
+/// Send online learning update notification
+pub async fn send_learning_update(
+    symbol: &str,
+    update_type: &str,
+    learning_count: u64,
+    accuracy: f64,
+) {
+    let msg = format!(
+        "🧠 <b>Online Learning</b>\n\n\
+        Symbol: {}\n\
+        Update: {}\n\
+        Total Learning Updates: {}\n\
+        Model Accuracy: {:.1}%",
+        symbol, update_type, learning_count, accuracy * 100.0
+    );
+    let _ = send(&msg).await;
+}

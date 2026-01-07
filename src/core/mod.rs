@@ -30,6 +30,8 @@ pub mod transferability;
 pub mod selfmod;
 pub mod codegen;
 pub mod foundation;
+pub mod sharded_memory;
+pub mod streaming;
 
 // Re-export commonly used types
 pub use agent::{SymbolAgent, AgentSignal, Signal, Side, Position, EntryContext};
@@ -53,7 +55,12 @@ pub use monitor::{AGIMonitor, AGIMetrics, AGIReport, PerformanceMetrics, SystemH
 pub use sequence::{LSTMCell, SequenceEncoder, MarketFeatures, RegimePredictor};
 pub use embeddings::{VectorIndex, TradeEmbedding, TradeContext, EmbeddingModel, IndexType, cosine_similarity};
 pub use consolidation::{MemoryConsolidator, MemoryTier, Episode, EpisodeContext, Pattern, MemoryStats, ImportanceScorer, PatternExtractor};
-pub use transferability::{TransferabilityPredictor, TransferabilityScore, SymbolProfile, TransferOutcome};
+pub use transferability::{
+    TransferabilityPredictor, TransferabilityScore, SymbolProfile, TransferOutcome,
+    // Negative transfer detection
+    PerformanceSnapshot, TransferImpact, GraylistEntry, TransferImpactPredictor,
+    TransferVerdict, MetricsChange, BlockReason, TransferEvaluation, NegativeTransferDetector,
+};
 pub use selfmod::{
     SelfModificationEngine, Constitution, ConstitutionalGuard, RuleEngine,
     TradingRule, RuleCondition, RuleAction, RuleContext, RulePerformance,
@@ -68,4 +75,18 @@ pub use foundation::{
     TimeSeriesFoundation, FoundationModelType, TimeSeriesTokenizer,
     FoundationWeights, TransformerLayer, MultiHeadAttention, FeedForward, LayerNorm,
     ForecastDistribution, FoundationTransfer,
+};
+pub use sharded_memory::{
+    ShardConfig, ShardKey, ShardingStrategy, ShardRouter,
+    MemoryShard, MemoryEntry, EntryType, MemoryQuery, QueryOrder,
+    ShardedMemory, GlobalIndex, WriteBuffer, QueryCache,
+    ImportanceUpdater, ShardedMemoryStats,
+};
+pub use streaming::{
+    StreamingUpdate, UpdateType, UpdatePayload, StreamBuffer,
+    OnlineLearner, WALEntry, WALOperation, WriteAheadLog,
+    StreamingMemory, RealTimeIndex, BloomFilter, FastRetrieval,
+    StreamingCoordinator, StreamingStats,
+    TradeContext as StreamingTradeContext, TradeOutcome as StreamingTradeOutcome,
+    Direction as StreamingDirection, PriceData, SignalData, ExitReason,
 };
