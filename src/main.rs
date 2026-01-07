@@ -25,8 +25,9 @@ mod data;
 mod comms;
 mod config;
 
-use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator};
+use crate::core::{SymbolAgent, AgentSignal, Signal, Side, Position, HealthMonitor, ConfidenceCalibrator, Calibrator, TransferManager, MixtureOfExperts, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, CounterfactualAnalyzer, AGIMonitor, RegimePredictor, VectorIndex, IndexType, MemoryConsolidator, TransferabilityPredictor, SelfModificationEngine, Constitution, CodeDeployer, TimeSeriesFoundation, FoundationModelType, FoundationTransfer};
 use crate::core::health::HealthStatus;
+use std::sync::Mutex;
 use crate::universe::{Universe, Sector};
 use crate::portfolio::{Portfolio, PortfolioPosition};
 use crate::data::alpaca_stream::{self, AlpacaMessage};
@@ -39,6 +40,21 @@ use crate::config::Config;
 
 const SEP: &str = "===========================================================";
 const CALIBRATOR_PATH: &str = "sovereign_calibrator.json";
+const TRANSFER_PATH: &str = "sovereign_transfer.json";
+const MOE_PATH: &str = "sovereign_moe.json";
+const META_PATH: &str = "sovereign_meta.json";
+const WEAKNESS_PATH: &str = "sovereign_weakness.json";
+const CAUSALITY_PATH: &str = "sovereign_causality.json";
+const WORLDMODEL_PATH: &str = "sovereign_worldmodel.json";
+const COUNTERFACTUAL_PATH: &str = "sovereign_counterfactual.json";
+const MONITOR_PATH: &str = "sovereign_monitor.json";
+const SEQUENCE_PATH: &str = "sovereign_sequence.json";
+const EMBEDDINGS_PATH: &str = "sovereign_embeddings.bin";
+const CONSOLIDATION_PATH: &str = "sovereign_consolidation.json";
+const TRANSFERABILITY_PATH: &str = "sovereign_transferability.json";
+const SELFMOD_PATH: &str = "sovereign_selfmod.json";
+const CODEGEN_PATH: &str = "sovereign_codegen.json";
+const FOUNDATION_PATH: &str = "sovereign_foundation.bin";
 
 /// Save the best calibrator from all agents (one with most updates)
 fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
@@ -54,6 +70,563 @@ fn save_calibrator(agents: &HashMap<String, SymbolAgent>) {
             } else {
                 info!("Calibrator: Saved {} updates to {}", cal.update_count(), CALIBRATOR_PATH);
             }
+        }
+    }
+}
+
+/// Save transfer manager state
+fn save_transfer(transfer_manager: &Arc<Mutex<TransferManager>>) {
+    let tm = transfer_manager.lock().unwrap();
+    if let Err(e) = tm.save(TRANSFER_PATH) {
+        warn!("Failed to save transfer state: {}", e);
+    } else {
+        info!("Transfer: Saved state - {}", tm.format_summary());
+    }
+}
+
+/// Save the best MoE from all agents (one with most trades)
+fn save_moe(agents: &HashMap<String, SymbolAgent>) {
+    // Find the agent with the most MoE trades
+    let best = agents.values()
+        .filter_map(|a| a.moe().map(|m| (a, m)))
+        .max_by_key(|(_, m)| m.total_trades());
+
+    if let Some((agent, moe)) = best {
+        if moe.total_trades() > 0 {
+            if let Err(e) = moe.save(MOE_PATH) {
+                warn!("Failed to save MoE: {}", e);
+            } else {
+                info!("MoE: Saved {} trades - {} (from {})",
+                    moe.total_trades(), moe.format_stats(), agent.symbol());
+            }
+        }
+    }
+}
+
+/// Save MetaLearner state
+fn save_meta(meta_learner: &Arc<Mutex<MetaLearner>>) {
+    let ml = meta_learner.lock().unwrap();
+    if let Err(e) = ml.save(META_PATH) {
+        warn!("Failed to save MetaLearner: {}", e);
+    } else {
+        info!("Meta: Saved - {}", ml.format_summary());
+    }
+}
+
+/// Save WeaknessAnalyzer state
+fn save_weakness(weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>) {
+    let wa = weakness_analyzer.lock().unwrap();
+    if let Err(e) = wa.save(WEAKNESS_PATH) {
+        warn!("Failed to save WeaknessAnalyzer: {}", e);
+    } else {
+        info!("Weakness: Saved - {} weaknesses identified", wa.weakness_count());
+    }
+}
+
+/// Save CausalAnalyzer state
+fn save_causality(causal_analyzer: &Arc<Mutex<CausalAnalyzer>>) {
+    let ca = causal_analyzer.lock().unwrap();
+    if let Err(e) = ca.save(CAUSALITY_PATH) {
+        warn!("Failed to save CausalAnalyzer: {}", e);
+    } else {
+        info!("Causal: Saved - {}", ca.format_summary());
+    }
+}
+
+/// Save WorldModel state
+fn save_worldmodel(world_model: &Arc<Mutex<WorldModel>>) {
+    let wm = world_model.lock().unwrap();
+    let symbols = wm.get_symbols();
+    // Serialize and save
+    match serde_json::to_string_pretty(&*wm) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(WORLDMODEL_PATH, json) {
+                warn!("Failed to save WorldModel: {}", e);
+            } else {
+                info!("WorldModel: Saved - {} symbols, equity {:.2}", symbols.len(), wm.get_equity());
+            }
+        }
+        Err(e) => warn!("Failed to serialize WorldModel: {}", e),
+    }
+}
+
+/// Load WorldModel from file
+fn load_worldmodel(initial_equity: f64) -> WorldModel {
+    match std::fs::read_to_string(WORLDMODEL_PATH) {
+        Ok(json) => {
+            match serde_json::from_str::<WorldModel>(&json) {
+                Ok(wm) => {
+                    info!("WorldModel: Loaded from {}", WORLDMODEL_PATH);
+                    wm
+                }
+                Err(e) => {
+                    warn!("Failed to parse WorldModel: {}, creating new", e);
+                    WorldModel::new(initial_equity)
+                }
+            }
+        }
+        Err(_) => {
+            info!("WorldModel: Creating new (no saved state)");
+            WorldModel::new(initial_equity)
+        }
+    }
+}
+
+/// Save CounterfactualAnalyzer state
+fn save_counterfactual(counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>) {
+    let cf = counterfactual.lock().unwrap();
+    if let Err(e) = cf.save(COUNTERFACTUAL_PATH) {
+        warn!("Failed to save CounterfactualAnalyzer: {}", e);
+    } else {
+        info!("Counterfactual: Saved - {}", cf.format_summary());
+    }
+}
+
+/// Save AGIMonitor state
+fn save_monitor(monitor: &Arc<Mutex<AGIMonitor>>) {
+    let mon = monitor.lock().unwrap();
+    if let Err(e) = mon.save(MONITOR_PATH) {
+        warn!("Failed to save AGIMonitor: {}", e);
+    } else {
+        info!("Monitor: Saved - {}", mon.format_summary());
+    }
+}
+
+/// Save RegimePredictor state
+fn save_sequence(regime_predictor: &Arc<Mutex<RegimePredictor>>) {
+    let rp = regime_predictor.lock().unwrap();
+    if let Err(e) = rp.save(SEQUENCE_PATH) {
+        warn!("Failed to save RegimePredictor: {}", e);
+    } else {
+        info!("Sequence: Saved - {} predictions, {:.1}% accuracy",
+            rp.prediction_count(),
+            rp.accuracy() * 100.0);
+    }
+}
+
+/// Save VectorIndex state (binary for efficiency)
+fn save_embeddings(vector_index: &Arc<Mutex<VectorIndex>>) {
+    let idx = vector_index.lock().unwrap();
+    if let Err(e) = idx.save(EMBEDDINGS_PATH) {
+        warn!("Failed to save VectorIndex: {}", e);
+    } else {
+        info!("Embeddings: Saved - {}", idx.format_summary());
+    }
+}
+
+/// Save MemoryConsolidator state
+fn save_consolidation(memory_consolidator: &Arc<Mutex<MemoryConsolidator>>) {
+    let mc = memory_consolidator.lock().unwrap();
+    if let Err(e) = mc.save(CONSOLIDATION_PATH) {
+        warn!("Failed to save MemoryConsolidator: {}", e);
+    } else {
+        info!("Consolidation: Saved - {}", mc.format_summary());
+    }
+}
+
+/// Run consolidation on the memory consolidator (extract patterns)
+fn run_consolidation(memory_consolidator: &Arc<Mutex<MemoryConsolidator>>) {
+    let mut mc = memory_consolidator.lock().unwrap();
+    let pre_patterns = mc.pattern_count();
+    mc.consolidate();
+    let post_patterns = mc.pattern_count();
+    info!(
+        "Consolidation: Extracted {} new patterns ({} -> {} total)",
+        post_patterns.saturating_sub(pre_patterns),
+        pre_patterns,
+        post_patterns
+    );
+}
+
+/// Save TransferabilityPredictor state
+fn save_transferability(transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>) {
+    let tp = transferability_predictor.lock().unwrap();
+    if let Err(e) = tp.save(TRANSFERABILITY_PATH) {
+        warn!("Failed to save TransferabilityPredictor: {}", e);
+    } else {
+        info!("Transferability: Saved - {}", tp.format_summary());
+    }
+}
+
+/// Save SelfModificationEngine state
+fn save_selfmod(selfmod: &Arc<Mutex<SelfModificationEngine>>) {
+    let engine = selfmod.lock().unwrap();
+    if let Err(e) = engine.save(SELFMOD_PATH) {
+        warn!("Failed to save SelfModificationEngine: {}", e);
+    } else {
+        info!("SelfMod: Saved - {} rules active, {} pending",
+            engine.rule_engine().active_count(),
+            engine.guard().pending_count()
+        );
+    }
+}
+
+/// Save CodeDeployer state
+fn save_codegen(code_deployer: &Arc<Mutex<CodeDeployer>>) {
+    let deployer = code_deployer.lock().unwrap();
+    if let Err(e) = deployer.save(CODEGEN_PATH) {
+        warn!("Failed to save CodeDeployer: {}", e);
+    } else {
+        info!("Codegen: Saved - {}", deployer.format_summary());
+    }
+}
+
+/// Save TimeSeriesFoundation model state
+fn save_foundation(foundation: &Arc<Mutex<TimeSeriesFoundation>>) {
+    let model = foundation.lock().unwrap();
+    if let Err(e) = model.save(FOUNDATION_PATH) {
+        warn!("Failed to save Foundation model: {}", e);
+    } else {
+        info!("Foundation: Saved - {} layers, {} dim, {} inferences",
+            model.num_layers(), model.embedding_dim(), model.inference_count());
+    }
+}
+
+/// Run daily code generation from weaknesses and insights
+fn run_code_generation(
+    code_deployer: &Arc<Mutex<CodeDeployer>>,
+    weakness_analyzer: &Arc<Mutex<crate::core::WeaknessAnalyzer>>,
+    counterfactual: &Arc<Mutex<crate::core::CounterfactualAnalyzer>>,
+    memory_consolidator: &Arc<Mutex<crate::core::MemoryConsolidator>>,
+) {
+    let mut deployer = code_deployer.lock().unwrap();
+    let wa = weakness_analyzer.lock().unwrap();
+    let cf = counterfactual.lock().unwrap();
+    let mc = memory_consolidator.lock().unwrap();
+
+    let mut proposal_count = 0;
+
+    // Generate signal filters from weaknesses
+    for weakness in wa.get_weaknesses() {
+        let code = deployer.generator_mut().generate_signal_filter(weakness);
+        match deployer.propose_code(code) {
+            Ok(id) => {
+                info!("[CODEGEN] Proposed filter from weakness: id={}", id);
+                proposal_count += 1;
+            }
+            Err(e) => {
+                warn!("[CODEGEN] Failed to propose filter: {}", e);
+            }
+        }
+    }
+
+    // Generate confidence adjusters from insights
+    for insight in cf.get_insights() {
+        let code = deployer.generator_mut().generate_confidence_adjuster(insight);
+        match deployer.propose_code(code) {
+            Ok(id) => {
+                info!("[CODEGEN] Proposed adjuster from insight: id={}", id);
+                proposal_count += 1;
+            }
+            Err(e) => {
+                warn!("[CODEGEN] Failed to propose adjuster: {}", e);
+            }
+        }
+    }
+
+    // Generate feature extractors from discovered patterns
+    for pattern in mc.get_patterns() {
+        let code = deployer.generator_mut().generate_feature_extractor(pattern);
+        match deployer.propose_code(code) {
+            Ok(id) => {
+                info!("[CODEGEN] Proposed feature from pattern: id={}", id);
+                proposal_count += 1;
+            }
+            Err(e) => {
+                warn!("[CODEGEN] Failed to propose feature: {}", e);
+            }
+        }
+    }
+
+    if proposal_count > 0 {
+        info!("[CODEGEN] Generated {} code proposals from daily analysis", proposal_count);
+    }
+}
+
+/// Run daily self-modification analysis and proposal generation
+fn run_analyze_and_propose(
+    selfmod: &Arc<Mutex<SelfModificationEngine>>,
+    weakness_analyzer: &Arc<Mutex<crate::core::WeaknessAnalyzer>>,
+    counterfactual: &Arc<Mutex<crate::core::CounterfactualAnalyzer>>,
+) {
+    let mut engine = selfmod.lock().unwrap();
+    let wa = weakness_analyzer.lock().unwrap();
+    let cf = counterfactual.lock().unwrap();
+
+    // Get weaknesses and insights for rule generation
+    let weaknesses = wa.get_weaknesses();
+    let insights = cf.get_insights();
+
+    let mut proposal_count = 0;
+
+    // Generate rules from weaknesses
+    for weakness in weaknesses {
+        if let Some(rule) = engine.generate_rule_from_weakness(weakness) {
+            info!("[SELF-MOD] Proposed rule from weakness: {}", rule.name);
+            proposal_count += 1;
+            // Apply the rule addition
+            let _ = engine.apply_rule_addition(rule);
+        }
+    }
+
+    // Generate threshold changes from insights
+    for insight in insights {
+        if let Some(mod_type) = engine.generate_threshold_change(insight) {
+            info!("[SELF-MOD] Proposed threshold change: {:?}", mod_type);
+            proposal_count += 1;
+        }
+    }
+
+    if proposal_count > 0 {
+        info!("[SELF-MOD] Generated {} proposals from daily analysis", proposal_count);
+    }
+}
+
+/// Run weekly learning from transfer outcomes
+fn learn_from_transfers(transfer_manager: &Arc<Mutex<TransferManager>>) {
+    let tm = transfer_manager.lock().unwrap();
+    tm.learn_from_outcomes();
+    info!("Transfer: Triggered learning from outcomes");
+}
+
+/// Discover and log ML-based clusters
+fn discover_ml_clusters(transfer_manager: &Arc<Mutex<TransferManager>>) {
+    let tm = transfer_manager.lock().unwrap();
+    let clusters = tm.discover_clusters_ml();
+    if clusters.is_empty() {
+        info!("Transfer: No ML clusters discovered (insufficient data)");
+    } else {
+        info!("Transfer: Discovered {} ML clusters:", clusters.len());
+        for (i, cluster) in clusters.iter().enumerate() {
+            info!("  Cluster {}: {} symbols - {:?}",
+                i + 1, cluster.len(), cluster.iter().take(5).cloned().collect::<Vec<_>>());
+        }
+    }
+}
+
+/// Process Telegram self-modification and codegen commands
+async fn process_telegram_commands(
+    selfmod: &Arc<Mutex<SelfModificationEngine>>,
+    code_deployer: &Arc<Mutex<CodeDeployer>>,
+) {
+    let commands = telegram::poll_commands().await;
+
+    for cmd in commands {
+        match cmd.command.as_str() {
+            "/pending" => {
+                let engine = selfmod.lock().unwrap();
+                let pending: Vec<(String, String, String)> = engine
+                    .get_pending()
+                    .iter()
+                    .map(|p| (
+                        p.id.to_string(),
+                        format!("{:?}", p.modification),
+                        p.reason.clone(),
+                    ))
+                    .collect();
+                drop(engine);
+                telegram::send_pending_mods(&pending).await;
+            }
+            "/rules" => {
+                let engine = selfmod.lock().unwrap();
+                let rules: Vec<(String, String, String, u32)> = engine
+                    .get_active_rules()
+                    .iter()
+                    .map(|r| (
+                        r.name.clone(),
+                        format!("{:?}", r.condition),
+                        format!("{:?}", r.action),
+                        r.performance.times_triggered,
+                    ))
+                    .collect();
+                drop(engine);
+                telegram::send_rules(&rules).await;
+            }
+            "/constitution" => {
+                let engine = selfmod.lock().unwrap();
+                let c = engine.guard().constitution();
+                telegram::send_constitution(
+                    c.max_position_size,
+                    c.max_daily_loss,
+                    c.max_drawdown,
+                    c.min_confidence_for_trade,
+                    c.max_active_rules as usize,
+                    c.forbidden_modifications.len(),
+                ).await;
+            }
+            "/approve" => {
+                if let Some(id_str) = cmd.args.first() {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        let mut engine = selfmod.lock().unwrap();
+                        match engine.approve_pending(id, "telegram") {
+                            Ok(()) => {
+                                drop(engine);
+                                telegram::send_approval(id_str, true, "Modification approved and applied.").await;
+                            }
+                            Err(e) => {
+                                drop(engine);
+                                telegram::send_approval(id_str, false, &format!("Error: {}", e)).await;
+                            }
+                        }
+                    } else {
+                        telegram::send_approval(id_str, false, "Invalid ID format").await;
+                    }
+                } else {
+                    telegram::send_approval("", false, "Usage: /approve <id>").await;
+                }
+            }
+            "/reject" => {
+                if let Some(id_str) = cmd.args.first() {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        let mut engine = selfmod.lock().unwrap();
+                        match engine.reject_pending(id, "rejected via telegram") {
+                            Ok(()) => {
+                                drop(engine);
+                                telegram::send_rejection(id_str, true, "Modification rejected.").await;
+                            }
+                            Err(e) => {
+                                drop(engine);
+                                telegram::send_rejection(id_str, false, &format!("Error: {}", e)).await;
+                            }
+                        }
+                    } else {
+                        telegram::send_rejection(id_str, false, "Invalid ID format").await;
+                    }
+                } else {
+                    telegram::send_rejection("", false, "Usage: /reject <id>").await;
+                }
+            }
+            "/rollback" => {
+                if let Some(id_str) = cmd.args.first() {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        let mut engine = selfmod.lock().unwrap();
+                        match engine.rollback_modification(id) {
+                            Ok(()) => {
+                                drop(engine);
+                                telegram::send_rollback(id_str, true, "Modification rolled back.").await;
+                            }
+                            Err(e) => {
+                                drop(engine);
+                                telegram::send_rollback(id_str, false, &format!("Error: {}", e)).await;
+                            }
+                        }
+                    } else {
+                        telegram::send_rollback(id_str, false, "Invalid ID format").await;
+                    }
+                } else {
+                    telegram::send_rollback("", false, "Usage: /rollback <id>").await;
+                }
+            }
+            "/selfmod" | "/selfmodhelp" => {
+                telegram::send_selfmod_help().await;
+            }
+            // ==================== Codegen Commands ====================
+            "/codegen" => {
+                let deployer = code_deployer.lock().unwrap();
+                telegram::send_codegen_status(
+                    deployer.active_count(),
+                    deployer.pending_count(),
+                    deployer.generator().history_count(),
+                ).await;
+            }
+            "/gencode" => {
+                let subcommand = cmd.args.first().map(|s| s.as_str()).unwrap_or("help");
+                match subcommand {
+                    "list" | "all" => {
+                        let deployer = code_deployer.lock().unwrap();
+                        let active: Vec<(u64, String, String, u32)> = deployer
+                            .get_active()
+                            .iter()
+                            .map(|c| (
+                                c.id,
+                                c.code_type.to_string(),
+                                c.description.clone(),
+                                c.performance.as_ref().map_or(0, |p| p.times_executed),
+                            ))
+                            .collect();
+                        drop(deployer);
+                        telegram::send_active_code(&active).await;
+                    }
+                    "pending" => {
+                        let deployer = code_deployer.lock().unwrap();
+                        let pending: Vec<(u64, String, String)> = deployer
+                            .get_pending()
+                            .iter()
+                            .map(|c| (
+                                c.id,
+                                c.code_type.to_string(),
+                                c.description.clone(),
+                            ))
+                            .collect();
+                        drop(deployer);
+                        telegram::send_pending_code(&pending).await;
+                    }
+                    "active" => {
+                        let deployer = code_deployer.lock().unwrap();
+                        let active: Vec<(u64, String, String, u32)> = deployer
+                            .get_active()
+                            .iter()
+                            .map(|c| (
+                                c.id,
+                                c.code_type.to_string(),
+                                c.description.clone(),
+                                c.performance.as_ref().map_or(0, |p| p.times_executed),
+                            ))
+                            .collect();
+                        drop(deployer);
+                        telegram::send_active_code(&active).await;
+                    }
+                    "deploy" => {
+                        if let Some(id_str) = cmd.args.get(1) {
+                            if let Ok(id) = id_str.parse::<u64>() {
+                                let mut deployer = code_deployer.lock().unwrap();
+                                match deployer.deploy(id) {
+                                    Ok(()) => {
+                                        drop(deployer);
+                                        telegram::send_code_deploy(id_str, true, "Code deployed successfully.").await;
+                                    }
+                                    Err(e) => {
+                                        drop(deployer);
+                                        telegram::send_code_deploy(id_str, false, &format!("Error: {:?}", e)).await;
+                                    }
+                                }
+                            } else {
+                                telegram::send_code_deploy(id_str, false, "Invalid ID format").await;
+                            }
+                        } else {
+                            telegram::send_code_deploy("", false, "Usage: /gencode deploy <id>").await;
+                        }
+                    }
+                    "rollback" => {
+                        if let Some(id_str) = cmd.args.get(1) {
+                            if let Ok(id) = id_str.parse::<u64>() {
+                                let mut deployer = code_deployer.lock().unwrap();
+                                match deployer.rollback(id) {
+                                    Ok(()) => {
+                                        drop(deployer);
+                                        telegram::send_code_rollback(id_str, true, "Code rolled back.").await;
+                                    }
+                                    Err(e) => {
+                                        drop(deployer);
+                                        telegram::send_code_rollback(id_str, false, &format!("Error: {:?}", e)).await;
+                                    }
+                                }
+                            } else {
+                                telegram::send_code_rollback(id_str, false, "Invalid ID format").await;
+                            }
+                        } else {
+                            telegram::send_code_rollback("", false, "Usage: /gencode rollback <id>").await;
+                        }
+                    }
+                    _ => {
+                        telegram::send_codegen_help().await;
+                    }
+                }
+            }
+            "/codegenhelp" => {
+                telegram::send_codegen_help().await;
+            }
+            _ => {}
         }
     }
 }
@@ -265,6 +838,18 @@ async fn main() -> Result<()> {
     }
     info!("Agents: {} independent traders ready", agents.len());
 
+    // Load MetaLearner for rapid adaptation (must be before calibrator init)
+    let meta_learner = Arc::new(Mutex::new(MetaLearner::load_or_new(META_PATH)));
+    {
+        let ml = meta_learner.lock().unwrap();
+        info!("Meta: Loaded - {}", ml.format_summary());
+    }
+
+    // Attach MetaLearner to all agents
+    for agent in agents.values_mut() {
+        agent.attach_meta_learner(Arc::clone(&meta_learner));
+    }
+
     // Load learned calibrator weights if available
     let calibrator = ConfidenceCalibrator::load_or_new(CALIBRATOR_PATH);
     if calibrator.update_count() > 0 {
@@ -274,6 +859,224 @@ async fn main() -> Result<()> {
         }
     } else {
         info!("Calibrator: Starting fresh (no saved weights found)");
+    }
+
+    // Load transferability predictor for ML-based transfer decisions
+    let transferability_predictor = Arc::new(Mutex::new(
+        TransferabilityPredictor::load_or_new(TRANSFERABILITY_PATH)
+    ));
+    {
+        let tp = transferability_predictor.lock().unwrap();
+        info!("Transferability: Loaded - {}", tp.format_summary());
+    }
+
+    // Load transfer manager for cross-symbol knowledge transfer
+    let transfer_manager = Arc::new(Mutex::new(TransferManager::load_or_new(TRANSFER_PATH)));
+    {
+        let mut tm = transfer_manager.lock().unwrap();
+        // Attach ML predictor to transfer manager
+        tm.attach_predictor(Arc::clone(&transferability_predictor));
+        info!("Transfer: {} (ML predictions enabled)", tm.format_summary());
+    }
+
+    // Attach transfer manager to all agents and try cluster initialization
+    for agent in agents.values_mut() {
+        agent.attach_transfer_manager(Arc::clone(&transfer_manager));
+        agent.maybe_init_from_cluster();
+    }
+
+    // Load MoE for regime-specialized calibration
+    let moe = MixtureOfExperts::load_or_new(MOE_PATH);
+    if moe.total_trades() > 0 {
+        info!("MoE: Loaded with {} trades - {}", moe.total_trades(), moe.format_stats());
+        for agent in agents.values_mut() {
+            agent.attach_moe(moe.clone());
+            agent.enable_moe();
+        }
+    } else {
+        info!("MoE: Starting fresh (no saved state found), attaching empty MoE");
+        for agent in agents.values_mut() {
+            agent.attach_moe(MixtureOfExperts::new());
+            agent.enable_moe();
+        }
+    }
+
+    // Load WeaknessAnalyzer for self-directed improvement
+    let weakness_analyzer = Arc::new(Mutex::new(WeaknessAnalyzer::load_or_new(WEAKNESS_PATH)));
+    {
+        let mut wa = weakness_analyzer.lock().unwrap();
+        // Set memory reference and symbols for live analysis
+        wa.set_memory(Arc::clone(&memory));
+        wa.set_symbols(symbols.clone());
+        info!("Weakness: Loaded - {} weaknesses identified", wa.weakness_count());
+    }
+
+    // Attach WeaknessAnalyzer to all agents
+    for agent in agents.values_mut() {
+        agent.attach_weakness_analyzer(Arc::clone(&weakness_analyzer));
+    }
+
+    // Load CausalAnalyzer for understanding market relationships
+    let causal_analyzer = Arc::new(Mutex::new(CausalAnalyzer::load_or_new(CAUSALITY_PATH)));
+    {
+        let ca = causal_analyzer.lock().unwrap();
+        info!("Causal: Loaded - {}", ca.format_summary());
+    }
+
+    // Attach CausalAnalyzer to all agents
+    for agent in agents.values_mut() {
+        agent.attach_causal_analyzer(Arc::clone(&causal_analyzer));
+    }
+
+    // Load WorldModel for forward planning
+    let initial_equity_f64 = initial_balance.to_f64().unwrap_or(100000.0);
+    let world_model = Arc::new(Mutex::new(load_worldmodel(initial_equity_f64)));
+    {
+        let wm = world_model.lock().unwrap();
+        info!("WorldModel: Loaded - {} symbols, equity {:.2}", wm.get_symbols().len(), wm.get_equity());
+    }
+
+    // Attach WorldModel to all agents
+    for agent in agents.values_mut() {
+        agent.attach_world_model(Arc::clone(&world_model));
+    }
+
+    // Load CounterfactualAnalyzer for learning from alternative decisions
+    let counterfactual = Arc::new(Mutex::new(
+        CounterfactualAnalyzer::load_or_new(COUNTERFACTUAL_PATH, Arc::clone(&memory))
+    ));
+    {
+        let cf = counterfactual.lock().unwrap();
+        info!("Counterfactual: Loaded - {}", cf.format_summary());
+    }
+
+    // Attach CounterfactualAnalyzer to all agents
+    for agent in agents.values_mut() {
+        agent.attach_counterfactual_analyzer(Arc::clone(&counterfactual));
+    }
+
+    // Load AGI Monitor for comprehensive system monitoring
+    let agi_monitor = Arc::new(Mutex::new(AGIMonitor::load_or_new(MONITOR_PATH)));
+    {
+        let mut mon = agi_monitor.lock().unwrap();
+        // Attach all components
+        mon.attach_memory(Arc::clone(&memory));
+        mon.attach_calibrator(calibrator.clone());
+        mon.attach_moe(moe.clone());
+        mon.attach_meta_learner(Arc::clone(&meta_learner));
+        mon.attach_transfer_manager(Arc::clone(&transfer_manager));
+        mon.attach_weakness_analyzer(Arc::clone(&weakness_analyzer));
+        mon.attach_causal_analyzer(Arc::clone(&causal_analyzer));
+        mon.attach_world_model(Arc::clone(&world_model));
+        mon.attach_counterfactual(Arc::clone(&counterfactual));
+        info!("Monitor: Loaded - {}", mon.format_summary());
+    }
+
+    // Load RegimePredictor for LSTM-based regime transition prediction
+    let regime_predictor = Arc::new(Mutex::new(RegimePredictor::load_or_new(SEQUENCE_PATH)));
+    {
+        let rp = regime_predictor.lock().unwrap();
+        info!("Sequence: Loaded - {} predictions, {:.1}% accuracy",
+            rp.prediction_count(),
+            rp.accuracy() * 100.0);
+    }
+
+    // Attach RegimePredictor to all agents
+    for agent in agents.values_mut() {
+        agent.attach_regime_predictor(Arc::clone(&regime_predictor));
+    }
+
+    // Load VectorIndex for similarity-based trade retrieval
+    let vector_index = Arc::new(Mutex::new(
+        VectorIndex::load_or_new(EMBEDDINGS_PATH, IndexType::HNSW { m: 16, ef_construction: 200 })
+    ));
+    {
+        let idx = vector_index.lock().unwrap();
+        info!("Embeddings: Loaded - {}", idx.format_summary());
+    }
+
+    // Attach VectorIndex to all agents
+    for agent in agents.values_mut() {
+        agent.attach_vector_index(Arc::clone(&vector_index));
+    }
+
+    // Load MemoryConsolidator for hierarchical memory and pattern extraction
+    let memory_consolidator = Arc::new(Mutex::new(
+        MemoryConsolidator::load_or_new(CONSOLIDATION_PATH, Arc::clone(&vector_index))
+    ));
+    {
+        let mc = memory_consolidator.lock().unwrap();
+        info!("Consolidation: Loaded - {}", mc.format_summary());
+    }
+
+    // Attach MemoryConsolidator to all agents
+    for agent in agents.values_mut() {
+        agent.attach_memory_consolidator(Arc::clone(&memory_consolidator));
+    }
+
+    // Load SelfModificationEngine with conservative constitution
+    let constitution = Constitution::default();
+    let selfmod = Arc::new(Mutex::new(
+        SelfModificationEngine::load_or_new(SELFMOD_PATH, constitution)
+    ));
+    {
+        let engine = selfmod.lock().unwrap();
+        info!("SelfMod: Loaded - {} rules active, {} pending, {} applied",
+            engine.rule_engine().active_count(),
+            engine.guard().pending_count(),
+            engine.applied_count()
+        );
+    }
+
+    // Attach SelfModificationEngine to all agents
+    for agent in agents.values_mut() {
+        agent.attach_self_mod(Arc::clone(&selfmod));
+    }
+
+    // Load CodeDeployer for generated code management
+    let code_deployer = Arc::new(Mutex::new(
+        CodeDeployer::load_or_new(CODEGEN_PATH, "/tmp/sovereign_sandbox")
+    ));
+    {
+        let deployer = code_deployer.lock().unwrap();
+        info!("Codegen: Loaded - {}", deployer.format_summary());
+    }
+
+    // Attach CodeDeployer to all agents
+    for agent in agents.values_mut() {
+        agent.attach_code_deployer(Arc::clone(&code_deployer));
+    }
+
+    // Load or create TimeSeriesFoundation model (small model: 4 layers, 128 dim for efficiency)
+    let foundation = Arc::new(Mutex::new(
+        TimeSeriesFoundation::load(FOUNDATION_PATH)
+            .unwrap_or_else(|_| {
+                info!("Foundation: Creating new model (4 layers, 128 dim)");
+                // Use with_config for custom dimensions: model_type, embedding_dim, context_length, num_layers, num_heads, vocab_size, patch_size
+                TimeSeriesFoundation::with_config(FoundationModelType::Custom, 128, 512, 4, 8, 1024, 16)
+            })
+    ));
+    {
+        let model = foundation.lock().unwrap();
+        info!("Foundation: Loaded - {} layers, {} dim, context {} bars",
+            model.num_layers(), model.embedding_dim(), model.context_length());
+    }
+
+    // Create FoundationTransfer for zero-shot transfer learning
+    let foundation_transfer = Arc::new(Mutex::new(
+        FoundationTransfer::new(Arc::clone(&foundation))
+    ));
+
+    // Attach Foundation and FoundationTransfer to all agents
+    for agent in agents.values_mut() {
+        agent.attach_foundation(Arc::clone(&foundation));
+        agent.attach_foundation_transfer(Arc::clone(&foundation_transfer));
+    }
+
+    // Attach FoundationTransfer to TransferManager
+    {
+        let mut tm = transfer_manager.lock().unwrap();
+        tm.attach_foundation_transfer(Arc::clone(&foundation_transfer));
     }
 
     // Initialize portfolio
@@ -324,6 +1127,20 @@ async fn main() -> Result<()> {
                 &mut health,
                 &mut alert_manager,
                 telegram_enabled,
+                &transfer_manager,
+                &meta_learner,
+                &weakness_analyzer,
+                &causal_analyzer,
+                &world_model,
+                &counterfactual,
+                &agi_monitor,
+                &regime_predictor,
+                &vector_index,
+                &memory_consolidator,
+                &transferability_predictor,
+                &selfmod,
+                &code_deployer,
+                &foundation,
             ).await
         }
         BrokerType::Ibkr(broker) => {
@@ -336,6 +1153,20 @@ async fn main() -> Result<()> {
                 &mut alert_manager,
                 &mut last_tickle,
                 telegram_enabled,
+                &transfer_manager,
+                &meta_learner,
+                &weakness_analyzer,
+                &causal_analyzer,
+                &world_model,
+                &counterfactual,
+                &agi_monitor,
+                &regime_predictor,
+                &vector_index,
+                &memory_consolidator,
+                &transferability_predictor,
+                &selfmod,
+                &code_deployer,
+                &foundation,
             ).await
         }
     }
@@ -450,6 +1281,20 @@ async fn run_alpaca_loop(
     health: &mut HealthMonitor,
     alert_manager: &mut AlertManager,
     telegram_enabled: bool,
+    transfer_manager: &Arc<Mutex<TransferManager>>,
+    meta_learner: &Arc<Mutex<MetaLearner>>,
+    weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
+    causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
+    world_model: &Arc<Mutex<WorldModel>>,
+    counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
+    agi_monitor: &Arc<Mutex<AGIMonitor>>,
+    regime_predictor: &Arc<Mutex<RegimePredictor>>,
+    vector_index: &Arc<Mutex<VectorIndex>>,
+    memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
+    transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
+    selfmod: &Arc<Mutex<SelfModificationEngine>>,
+    code_deployer: &Arc<Mutex<CodeDeployer>>,
+    foundation: &Arc<Mutex<TimeSeriesFoundation>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AlpacaMessage>(100);
 
@@ -459,6 +1304,7 @@ async fn run_alpaca_loop(
     let symbols_clone: Vec<String> = cfg.universe.symbols.clone();
 
     let mut last_health_check = std::time::Instant::now();
+    let mut last_hourly_snapshot = std::time::Instant::now();
     let mut bar_count = 0u64;
     let mut tick_count = 0u64;
     let mut last_summary_date: Option<chrono::NaiveDate> = None;
@@ -482,6 +1328,11 @@ async fn run_alpaca_loop(
         if last_health_check.elapsed().as_secs() >= 10 {
             last_health_check = std::time::Instant::now();
             health.set_market_open(is_market_open());
+
+            // Poll for Telegram commands
+            if telegram_enabled {
+                process_telegram_commands(selfmod, code_deployer).await;
+            }
 
             match health.check() {
                 HealthStatus::Healthy { gaps: _ } => alert_manager.reset(),
@@ -545,6 +1396,13 @@ async fn run_alpaca_loop(
             Err(_) => {}
         }
 
+        // Hourly snapshot for AGI monitoring
+        if last_hourly_snapshot.elapsed().as_secs() >= 3600 {
+            last_hourly_snapshot = std::time::Instant::now();
+            let mut mon = agi_monitor.lock().unwrap();
+            mon.snapshot_hourly();
+        }
+
         // Daily summary at 21:05 UTC (5 min after market close)
         let now = Utc::now();
         let today = now.date_naive();
@@ -552,8 +1410,91 @@ async fn run_alpaca_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights
+                // Daily snapshot for AGI monitoring
+                {
+                    let mut mon = agi_monitor.lock().unwrap();
+                    mon.snapshot_daily();
+                }
+
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, Counterfactual, Monitor, Foundation
                 save_calibrator(agents);
+                save_transfer(transfer_manager);
+                save_moe(agents);
+                save_meta(meta_learner);
+                save_weakness(weakness_analyzer);
+                save_causality(causal_analyzer);
+                save_worldmodel(world_model);
+                save_counterfactual(counterfactual);
+                save_monitor(agi_monitor);
+                save_sequence(regime_predictor);
+                save_embeddings(vector_index);
+                save_consolidation(memory_consolidator);
+                save_transferability(&transferability_predictor);
+                save_selfmod(selfmod);
+                save_codegen(code_deployer);
+                save_foundation(foundation);
+
+                // Run pattern consolidation
+                run_consolidation(memory_consolidator);
+
+                // Run daily self-modification analysis
+                run_analyze_and_propose(selfmod, weakness_analyzer, counterfactual);
+
+                // Run daily code generation from weaknesses and insights
+                run_code_generation(code_deployer, weakness_analyzer, counterfactual, memory_consolidator);
+
+                // Run weekly ML transfer learning and cluster discovery
+                learn_from_transfers(transfer_manager);
+                discover_ml_clusters(transfer_manager);
+
+                // Run periodic weakness analysis on trade history
+                {
+                    let mut wa = weakness_analyzer.lock().unwrap();
+                    // Get trade history from all agents to analyze weaknesses
+                    // (WeaknessAnalyzer accumulates from record_trade calls)
+                    let weaknesses = wa.analyze_all();
+                    if !weaknesses.is_empty() {
+                        info!("[WEAKNESS] Identified {} weakness patterns:", weaknesses.len());
+                        for w in weaknesses.iter().take(5) {
+                            info!("  - {:?}: {:.1}% severity - {}", w.weakness_type, w.severity * 100.0, w.suggested_action);
+                        }
+                    }
+                }
+
+                // Run counterfactual analysis on recent trades
+                {
+                    let mut cf = counterfactual.lock().unwrap();
+                    let insights = cf.analyze_all_recent(50);
+                    if !insights.is_empty() {
+                        info!("[COUNTERFACTUAL] Identified {} patterns:", insights.len());
+                        for insight in insights.iter().take(5) {
+                            info!("  - {:?}: {} trades, ${:.2} avg improvement - {}",
+                                insight.insight_type, insight.evidence_count, insight.avg_improvement, insight.description);
+                        }
+                    }
+                    // Log recommendations
+                    let recommendations = cf.get_recommendations();
+                    if !recommendations.is_empty() {
+                        info!("[COUNTERFACTUAL] Top recommendations:");
+                        for rec in recommendations.iter().take(3) {
+                            info!("  - {}", rec);
+                        }
+                    }
+                }
+
+                // Run weekly causal discovery on Sundays
+                if now.weekday() == Weekday::Sun {
+                    let mut ca = causal_analyzer.lock().unwrap();
+                    let new_relationships = ca.discover_relationships();
+                    if !new_relationships.is_empty() {
+                        info!("[CAUSAL] Discovered {} new relationships:", new_relationships.len());
+                        for rel in new_relationships.iter().take(5) {
+                            info!("  - {}", rel.description());
+                        }
+                    }
+                    // Prune old relationships (older than 90 days)
+                    ca.graph_mut().prune_old(90);
+                }
 
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();
@@ -583,9 +1524,24 @@ async fn run_ibkr_loop(
     alert_manager: &mut AlertManager,
     last_tickle: &mut std::time::Instant,
     telegram_enabled: bool,
+    transfer_manager: &Arc<Mutex<TransferManager>>,
+    meta_learner: &Arc<Mutex<MetaLearner>>,
+    weakness_analyzer: &Arc<Mutex<WeaknessAnalyzer>>,
+    causal_analyzer: &Arc<Mutex<CausalAnalyzer>>,
+    world_model: &Arc<Mutex<WorldModel>>,
+    counterfactual: &Arc<Mutex<CounterfactualAnalyzer>>,
+    agi_monitor: &Arc<Mutex<AGIMonitor>>,
+    regime_predictor: &Arc<Mutex<RegimePredictor>>,
+    vector_index: &Arc<Mutex<VectorIndex>>,
+    memory_consolidator: &Arc<Mutex<MemoryConsolidator>>,
+    transferability_predictor: &Arc<Mutex<TransferabilityPredictor>>,
+    selfmod: &Arc<Mutex<SelfModificationEngine>>,
+    code_deployer: &Arc<Mutex<CodeDeployer>>,
+    foundation: &Arc<Mutex<TimeSeriesFoundation>>,
 ) -> Result<()> {
     let symbols: Vec<String> = cfg.universe.symbols.clone();
     let mut last_health_check = std::time::Instant::now();
+    let mut last_hourly_snapshot = std::time::Instant::now();
     let mut last_data_poll = std::time::Instant::now();
     let mut bar_count = 0u64;
     let mut last_summary_date: Option<chrono::NaiveDate> = None;
@@ -606,6 +1562,11 @@ async fn run_ibkr_loop(
         if last_health_check.elapsed().as_secs() >= 10 {
             last_health_check = std::time::Instant::now();
             health.set_market_open(is_market_open());
+
+            // Poll for Telegram commands
+            if telegram_enabled {
+                process_telegram_commands(selfmod, code_deployer).await;
+            }
 
             match health.check() {
                 HealthStatus::Healthy { gaps: _ } => alert_manager.reset(),
@@ -655,6 +1616,13 @@ async fn run_ibkr_loop(
             }
         }
 
+        // Hourly snapshot for AGI monitoring
+        if last_hourly_snapshot.elapsed().as_secs() >= 3600 {
+            last_hourly_snapshot = std::time::Instant::now();
+            let mut mon = agi_monitor.lock().unwrap();
+            mon.snapshot_hourly();
+        }
+
         // Daily summary at 21:05 UTC (5 min after market close)
         let now = Utc::now();
         let today = now.date_naive();
@@ -662,8 +1630,89 @@ async fn run_ibkr_loop(
             if last_summary_date != Some(today) {
                 last_summary_date = Some(today);
 
-                // Save learned calibrator weights
+                // Daily snapshot for AGI monitoring
+                {
+                    let mut mon = agi_monitor.lock().unwrap();
+                    mon.snapshot_daily();
+                }
+
+                // Save learned calibrator weights, transfer state, MoE, MetaLearner, WeaknessAnalyzer, CausalAnalyzer, WorldModel, Counterfactual, Monitor, Foundation
                 save_calibrator(agents);
+                save_transfer(transfer_manager);
+                save_moe(agents);
+                save_meta(meta_learner);
+                save_weakness(weakness_analyzer);
+                save_causality(causal_analyzer);
+                save_worldmodel(world_model);
+                save_counterfactual(counterfactual);
+                save_monitor(agi_monitor);
+                save_sequence(regime_predictor);
+                save_embeddings(vector_index);
+                save_consolidation(memory_consolidator);
+                save_transferability(&transferability_predictor);
+                save_selfmod(selfmod);
+                save_codegen(code_deployer);
+                save_foundation(foundation);
+
+                // Run pattern consolidation
+                run_consolidation(memory_consolidator);
+
+                // Run daily self-modification analysis
+                run_analyze_and_propose(selfmod, weakness_analyzer, counterfactual);
+
+                // Run daily code generation from weaknesses and insights
+                run_code_generation(code_deployer, weakness_analyzer, counterfactual, memory_consolidator);
+
+                // Run weekly ML transfer learning and cluster discovery
+                learn_from_transfers(transfer_manager);
+                discover_ml_clusters(transfer_manager);
+
+                // Run periodic weakness analysis on trade history
+                {
+                    let mut wa = weakness_analyzer.lock().unwrap();
+                    let weaknesses = wa.analyze_all();
+                    if !weaknesses.is_empty() {
+                        info!("[WEAKNESS] Identified {} weakness patterns:", weaknesses.len());
+                        for w in weaknesses.iter().take(5) {
+                            info!("  - {:?}: {:.1}% severity - {}", w.weakness_type, w.severity * 100.0, w.suggested_action);
+                        }
+                    }
+                }
+
+                // Run counterfactual analysis on recent trades
+                {
+                    let mut cf = counterfactual.lock().unwrap();
+                    let insights = cf.analyze_all_recent(50);
+                    if !insights.is_empty() {
+                        info!("[COUNTERFACTUAL] Identified {} patterns:", insights.len());
+                        for insight in insights.iter().take(5) {
+                            info!("  - {:?}: {} trades, ${:.2} avg improvement - {}",
+                                insight.insight_type, insight.evidence_count, insight.avg_improvement, insight.description);
+                        }
+                    }
+                    // Log recommendations
+                    let recommendations = cf.get_recommendations();
+                    if !recommendations.is_empty() {
+                        info!("[COUNTERFACTUAL] Top recommendations:");
+                        for rec in recommendations.iter().take(3) {
+                            info!("  - {}", rec);
+                        }
+                    }
+                }
+
+                // Run weekly causal discovery on Sundays
+                if now.weekday() == Weekday::Sun {
+                    let mut ca = causal_analyzer.lock().unwrap();
+                    let new_relationships = ca.discover_relationships();
+                    if !new_relationships.is_empty() {
+                        info!("[CAUSAL] Discovered {} new relationships:", new_relationships.len());
+                        for rel in new_relationships.iter().take(5) {
+                            info!("  - {}", rel.description());
+                        }
+                    }
+                    // Prune old relationships (older than 90 days)
+                    ca.graph_mut().prune_old(90);
+                }
 
                 if telegram_enabled {
                     let sector_info = portfolio.sector_summary();

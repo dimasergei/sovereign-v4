@@ -26,8 +26,22 @@ use tracing::info;
 use super::sr::{SRLevels, default_granularity, granularity_from_atr};
 use super::capitulation::VolumeTracker;
 use super::regime::{Regime, RegimeDetector};
-use super::learner::ConfidenceCalibrator;
+use super::learner::{Calibrator, ConfidenceCalibrator, TradeOutcome, NUM_FEATURES};
+use super::transfer::TransferManager;
+use super::moe::MixtureOfExperts;
+use super::metalearner::{MetaLearner, calculate_accuracy};
+use super::weakness::WeaknessAnalyzer;
+use super::causality::CausalAnalyzer;
+use super::worldmodel::{WorldModel, PositionDirection};
+use super::counterfactual::CounterfactualAnalyzer;
+use super::sequence::{MarketFeatures, RegimePredictor};
+use super::embeddings::{VectorIndex, TradeContext as EmbeddingTradeContext, EMBEDDING_DIM};
+use super::consolidation::{MemoryConsolidator, EpisodeContext};
+use super::selfmod::{SelfModificationEngine, RuleContext, RuleAction};
+use super::codegen::{CodeDeployer, EvalContext as CodegenEvalContext};
+use super::foundation::{TimeSeriesFoundation, FoundationTransfer, ForecastDistribution};
 use crate::data::memory::{TradeMemory, MarketRegime};
+use std::sync::Mutex;
 
 /// Trading signal from an agent
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +128,12 @@ pub struct EntryContext {
     pub mfe: f64,
 }
 
+/// Minimum trades required before considering EWC consolidation
+const EWC_MIN_TRADES: usize = 10;
+
+/// Minimum win rate required for EWC consolidation (consider weights worth protecting)
+const EWC_MIN_WIN_RATE: f64 = 0.55;
+
 /// Independent trading agent for a single symbol
 ///
 /// Each agent:
@@ -125,6 +145,8 @@ pub struct EntryContext {
 /// - Records trade context for AGI learning (when memory is attached)
 /// - Detects market regime using HMM (TrendingUp, TrendingDown, Ranging, Volatile)
 /// - Uses learned confidence calibrator for adaptive trade filtering
+/// - Applies Elastic Weight Consolidation (EWC) to prevent catastrophic forgetting
+/// - Supports Mixture of Experts (MoE) for regime-specialized calibration
 pub struct SymbolAgent {
     /// Symbol this agent is trading
     symbol: String,
@@ -136,6 +158,10 @@ pub struct SymbolAgent {
     regime_detector: RegimeDetector,
     /// Learned confidence calibrator
     calibrator: ConfidenceCalibrator,
+    /// Mixture of Experts for regime-specialized calibration (optional)
+    moe: Option<MixtureOfExperts>,
+    /// Whether to use MoE for confidence prediction
+    use_moe: bool,
     /// Current position (if any)
     position: Option<Position>,
     /// Last known price
@@ -154,6 +180,66 @@ pub struct SymbolAgent {
     pending_entry: Option<EntryContext>,
     /// Next ticket number for trade identification
     next_ticket: u64,
+    /// Recent trade outcomes for EWC Fisher computation
+    recent_trades: Vec<TradeOutcome>,
+    /// Shared transfer manager for cross-symbol knowledge transfer
+    transfer_manager: Option<Arc<Mutex<TransferManager>>>,
+
+    // Meta-learning adaptation tracking
+    /// Weights before adapting to new regime
+    pre_adaptation_weights: Option<[f64; NUM_FEATURES]>,
+    /// Bias before adapting to new regime
+    pre_adaptation_bias: Option<f64>,
+    /// Trades in current regime (for post-adaptation accuracy)
+    trades_in_current_regime: Vec<TradeOutcome>,
+    /// Minimum trades before reporting adaptation
+    meta_adaptation_threshold: u32,
+
+    // Weakness identification and improvement
+    /// Shared weakness analyzer for self-improvement
+    weakness_analyzer: Option<Arc<Mutex<WeaknessAnalyzer>>>,
+
+    // Causal reasoning
+    /// Shared causal analyzer for understanding market relationships
+    causal_analyzer: Option<Arc<Mutex<CausalAnalyzer>>>,
+
+    // World model for forward planning
+    /// Shared world model for market dynamics simulation
+    world_model: Option<Arc<Mutex<WorldModel>>>,
+
+    // Counterfactual analysis
+    /// Shared counterfactual analyzer for learning from "what ifs"
+    counterfactual: Option<Arc<Mutex<CounterfactualAnalyzer>>>,
+
+    // Sequence modeling for regime prediction
+    /// Shared regime predictor for anticipating regime changes
+    regime_predictor: Option<Arc<Mutex<RegimePredictor>>>,
+
+    // Vector embeddings for similarity-based retrieval
+    /// Shared vector index for finding similar historical trades
+    vector_index: Option<Arc<Mutex<VectorIndex>>>,
+
+    // Hierarchical memory consolidation
+    /// Shared memory consolidator for pattern extraction
+    memory_consolidator: Option<Arc<Mutex<MemoryConsolidator>>>,
+
+    // Autonomous self-modification
+    /// Shared self-modification engine for rule learning
+    self_mod: Option<Arc<Mutex<SelfModificationEngine>>>,
+
+    // Code self-modification
+    /// Shared code deployer for generated code execution
+    code_deployer: Option<Arc<Mutex<CodeDeployer>>>,
+
+    // Foundation model integration
+    /// Shared foundation model for time-series understanding
+    foundation: Option<Arc<Mutex<TimeSeriesFoundation>>>,
+    /// Shared foundation transfer for zero-shot transfer learning
+    foundation_transfer: Option<Arc<Mutex<FoundationTransfer>>>,
+    /// Cached price history for foundation model encoding
+    price_history: Vec<f64>,
+    /// Maximum price history length for foundation encoding
+    max_price_history: usize,
 }
 
 impl SymbolAgent {
@@ -174,6 +260,8 @@ impl SymbolAgent {
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
             calibrator: ConfidenceCalibrator::new(),
+            moe: None,
+            use_moe: false,
             position: None,
             last_price: initial_price,
             last_volume: 0,
@@ -183,6 +271,25 @@ impl SymbolAgent {
             memory: None,
             pending_entry: None,
             next_ticket: 1,
+            recent_trades: Vec::new(),
+            transfer_manager: None,
+            pre_adaptation_weights: None,
+            pre_adaptation_bias: None,
+            trades_in_current_regime: Vec::new(),
+            meta_adaptation_threshold: 10,
+            weakness_analyzer: None,
+            causal_analyzer: None,
+            world_model: None,
+            counterfactual: None,
+            regime_predictor: None,
+            vector_index: None,
+            memory_consolidator: None,
+            self_mod: None,
+            code_deployer: None,
+            foundation: None,
+            foundation_transfer: None,
+            price_history: Vec::with_capacity(512),
+            max_price_history: 512,
         }
     }
 
@@ -197,6 +304,8 @@ impl SymbolAgent {
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
             calibrator: ConfidenceCalibrator::new(),
+            moe: None,
+            use_moe: false,
             position: None,
             last_price: initial_price,
             last_volume: 0,
@@ -206,6 +315,25 @@ impl SymbolAgent {
             memory: Some(memory),
             pending_entry: None,
             next_ticket: 1,
+            recent_trades: Vec::new(),
+            transfer_manager: None,
+            pre_adaptation_weights: None,
+            pre_adaptation_bias: None,
+            trades_in_current_regime: Vec::new(),
+            meta_adaptation_threshold: 10,
+            weakness_analyzer: None,
+            causal_analyzer: None,
+            world_model: None,
+            counterfactual: None,
+            regime_predictor: None,
+            vector_index: None,
+            memory_consolidator: None,
+            self_mod: None,
+            code_deployer: None,
+            foundation: None,
+            foundation_transfer: None,
+            price_history: Vec::with_capacity(512),
+            max_price_history: 512,
         }
     }
 
@@ -225,6 +353,8 @@ impl SymbolAgent {
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
             calibrator: ConfidenceCalibrator::new(),
+            moe: None,
+            use_moe: false,
             position: None,
             last_price: Decimal::ZERO,
             last_volume: 0,
@@ -234,6 +364,25 @@ impl SymbolAgent {
             memory: None,
             pending_entry: None,
             next_ticket: 1,
+            recent_trades: Vec::new(),
+            transfer_manager: None,
+            pre_adaptation_weights: None,
+            pre_adaptation_bias: None,
+            trades_in_current_regime: Vec::new(),
+            meta_adaptation_threshold: 10,
+            weakness_analyzer: None,
+            causal_analyzer: None,
+            world_model: None,
+            counterfactual: None,
+            regime_predictor: None,
+            vector_index: None,
+            memory_consolidator: None,
+            self_mod: None,
+            code_deployer: None,
+            foundation: None,
+            foundation_transfer: None,
+            price_history: Vec::with_capacity(512),
+            max_price_history: 512,
         }
     }
 
@@ -245,6 +394,8 @@ impl SymbolAgent {
             volume: VolumeTracker::new(),
             regime_detector: RegimeDetector::new(),
             calibrator: ConfidenceCalibrator::new(),
+            moe: None,
+            use_moe: false,
             position: None,
             last_price: Decimal::ZERO,
             last_volume: 0,
@@ -254,12 +405,113 @@ impl SymbolAgent {
             memory: None,
             pending_entry: None,
             next_ticket: 1,
+            recent_trades: Vec::new(),
+            transfer_manager: None,
+            pre_adaptation_weights: None,
+            pre_adaptation_bias: None,
+            trades_in_current_regime: Vec::new(),
+            meta_adaptation_threshold: 10,
+            weakness_analyzer: None,
+            causal_analyzer: None,
+            world_model: None,
+            counterfactual: None,
+            regime_predictor: None,
+            vector_index: None,
+            memory_consolidator: None,
+            self_mod: None,
+            code_deployer: None,
+            foundation: None,
+            foundation_transfer: None,
+            price_history: Vec::with_capacity(512),
+            max_price_history: 512,
         }
     }
 
     /// Attach memory for AGI learning
     pub fn attach_memory(&mut self, memory: Arc<TradeMemory>) {
         self.memory = Some(memory);
+    }
+
+    /// Attach transfer manager for cross-symbol knowledge transfer
+    pub fn attach_transfer_manager(&mut self, tm: Arc<Mutex<TransferManager>>) {
+        self.transfer_manager = Some(tm);
+    }
+
+    /// Attach Mixture of Experts for regime-specialized calibration
+    pub fn attach_moe(&mut self, moe: MixtureOfExperts) {
+        self.moe = Some(moe);
+    }
+
+    /// Enable MoE for confidence prediction
+    pub fn enable_moe(&mut self) {
+        self.use_moe = true;
+    }
+
+    /// Disable MoE (fall back to single calibrator)
+    pub fn disable_moe(&mut self) {
+        self.use_moe = false;
+    }
+
+    /// Check if MoE is enabled
+    pub fn is_moe_enabled(&self) -> bool {
+        self.use_moe && self.moe.is_some()
+    }
+
+    /// Get reference to MoE
+    pub fn moe(&self) -> Option<&MixtureOfExperts> {
+        self.moe.as_ref()
+    }
+
+    /// Get mutable reference to MoE
+    pub fn moe_mut(&mut self) -> Option<&mut MixtureOfExperts> {
+        self.moe.as_mut()
+    }
+
+    /// Set MoE (for loading from persistence)
+    pub fn set_moe(&mut self, moe: Option<MixtureOfExperts>) {
+        self.moe = moe;
+    }
+
+    /// Initialize calibrator from meta-learner and/or cluster prior if available
+    ///
+    /// Priority order:
+    /// 1. Meta-learner initialization (rapid adaptation foundation)
+    /// 2. Cluster prior refinement (symbol-specific patterns)
+    ///
+    /// If this symbol's cluster has learned weights (>= 20 trades) and
+    /// this calibrator has < 10 updates, initialize from cluster prior.
+    pub fn maybe_init_from_cluster(&mut self) {
+        // Only initialize if calibrator is fresh
+        if self.calibrator.update_count() >= 10 {
+            return;
+        }
+
+        // Step 1: Initialize from meta-learner first (base initialization)
+        // This gives weights that have been shown to adapt quickly
+        self.calibrator.init_from_meta();
+
+        // Step 2: Refine with cluster prior if available
+        let Some(ref tm) = self.transfer_manager else {
+            return;
+        };
+
+        let tm_lock = tm.lock().unwrap();
+        if let Some(prior_weights) = tm_lock.get_cluster_prior(&self.symbol) {
+            let cluster = super::transfer::get_cluster(&self.symbol);
+            let stats = tm_lock.get_cluster_stats(cluster);
+            let (trade_count, win_rate) = stats
+                .map(|s| (s.trade_count, s.win_rate()))
+                .unwrap_or((0, 0.5));
+
+            self.calibrator.set_weights(prior_weights);
+            info!(
+                "[TRANSFER] {} initialized from {} cluster ({} trades, {:.0}% win rate)",
+                self.symbol,
+                cluster.name(),
+                trade_count,
+                win_rate * 100.0
+            );
+        }
     }
 
     /// Get the symbol this agent is trading
@@ -334,6 +586,18 @@ impl SymbolAgent {
                 let new_regime = self.regime_detector.current_regime();
                 let _ = memory.start_regime(&self.symbol, new_regime.as_str());
             }
+
+            // 4a. Report meta-learning adaptation from the previous regime
+            self.maybe_report_meta_adaptation();
+
+            // 4b. Prepare for new regime (store pre-adaptation weights)
+            self.prepare_for_new_regime();
+
+            // 4c. EWC consolidation on regime change if performance was good
+            self.maybe_consolidate_ewc();
+
+            // 4d. MoE expert consolidation for the previous regime
+            self.maybe_consolidate_moe_expert();
         }
 
         // 5. Track bars for ATR calculation
@@ -346,6 +610,11 @@ impl SymbolAgent {
         self.last_price = close;
         self.last_volume = volume;
         self.bar_count += 1;
+
+        // 6a. Update price history for foundation model
+        if let Some(close_f) = close.to_f64() {
+            self.update_price_history(close_f);
+        }
 
         // 7. Not ready yet - need more data
         if !self.is_ready() {
@@ -407,6 +676,32 @@ impl SymbolAgent {
                             return None;
                         }
 
+                        // Check weakness analyzer for known weak patterns
+                        let sr_score = self.sr.score_at(s);
+                        if let Some(reason) = self.should_skip_for_weakness(sr_score, volume_percentile) {
+                            info!(
+                                "[WEAKNESS] {} Skipping BUY: {}",
+                                self.symbol, reason
+                            );
+                            return None;
+                        }
+
+                        // SELF-MOD: Evaluate rules for this trade
+                        let (actions, skip_trade) = self.evaluate_self_mod_rules(
+                            sr_score,
+                            volume_percentile,
+                            combined_confidence,
+                            true, // is_long
+                            time,
+                        );
+                        if skip_trade {
+                            return None;
+                        }
+                        let (modified_conviction, _size_factor) = self.apply_self_mod_actions(&actions, conviction);
+                        if modified_conviction == 0 {
+                            return None;
+                        }
+
                         let signal = AgentSignal {
                             symbol: self.symbol.clone(),
                             signal: Signal::Buy,
@@ -418,7 +713,7 @@ impl SymbolAgent {
                             support,
                             resistance,
                             volume_percentile,
-                            conviction,
+                            conviction: modified_conviction,
                         };
 
                         self.position = Some(Position {
@@ -447,6 +742,32 @@ impl SymbolAgent {
                             return None;
                         }
 
+                        // Check weakness analyzer for known weak patterns
+                        let sr_score = self.sr.score_at(r);
+                        if let Some(reason) = self.should_skip_for_weakness(sr_score, volume_percentile) {
+                            info!(
+                                "[WEAKNESS] {} Skipping SHORT: {}",
+                                self.symbol, reason
+                            );
+                            return None;
+                        }
+
+                        // SELF-MOD: Evaluate rules for this trade
+                        let (actions, skip_trade) = self.evaluate_self_mod_rules(
+                            sr_score,
+                            volume_percentile,
+                            combined_confidence,
+                            false, // is_long (this is a short)
+                            time,
+                        );
+                        if skip_trade {
+                            return None;
+                        }
+                        let (modified_conviction, _size_factor) = self.apply_self_mod_actions(&actions, conviction);
+                        if modified_conviction == 0 {
+                            return None;
+                        }
+
                         let signal = AgentSignal {
                             symbol: self.symbol.clone(),
                             signal: Signal::Short,
@@ -458,7 +779,7 @@ impl SymbolAgent {
                             support,
                             resistance,
                             volume_percentile,
-                            conviction,
+                            conviction: modified_conviction,
                         };
 
                         self.position = Some(Position {
@@ -492,6 +813,32 @@ impl SymbolAgent {
                                 return None;
                             }
 
+                            // Check weakness analyzer for known weak patterns
+                            let sr_score = self.sr.score_at(s);
+                            if let Some(reason) = self.should_skip_for_weakness(sr_score, volume_percentile) {
+                                info!(
+                                    "[WEAKNESS] {} Skipping BUY (elevated): {}",
+                                    self.symbol, reason
+                                );
+                                return None;
+                            }
+
+                            // SELF-MOD: Evaluate rules for this trade
+                            let (actions, skip_trade) = self.evaluate_self_mod_rules(
+                                sr_score,
+                                volume_percentile,
+                                combined_confidence,
+                                true, // is_long
+                                time,
+                            );
+                            if skip_trade {
+                                return None;
+                            }
+                            let (modified_conviction, _size_factor) = self.apply_self_mod_actions(&actions, conviction);
+                            if modified_conviction == 0 {
+                                return None;
+                            }
+
                             let signal = AgentSignal {
                                 symbol: self.symbol.clone(),
                                 signal: Signal::Buy,
@@ -503,7 +850,7 @@ impl SymbolAgent {
                                 support,
                                 resistance,
                                 volume_percentile,
-                                conviction,
+                                conviction: modified_conviction,
                             };
 
                             self.position = Some(Position {
@@ -847,11 +1194,133 @@ impl SymbolAgent {
             0.01, // Learning rate
         );
 
+        // Update MoE if enabled (routes to appropriate expert)
+        // Calculate regime probs first to avoid borrow conflict
+        let regime_probs = self.get_predicted_regime_probs_for_gating();
+
+        if let Some(ref mut moe) = self.moe {
+            moe.update(
+                entry.sr_score,
+                entry.volume_percentile,
+                &regime_for_learner,
+                was_winner,
+                0.01, // Learning rate
+            );
+
+            // Update gating weights based on PREDICTED regime probabilities (soft gating)
+            // This uses LSTM-predicted probabilities for forward-looking blending,
+            // not just the current HMM-detected regime
+            moe.update_gating(&regime_probs);
+        }
+
+        // Track trade outcome for EWC Fisher computation
+        let trade_outcome = TradeOutcome {
+            sr_score: entry.sr_score,
+            volume_pct: entry.volume_percentile,
+            regime: regime_for_learner,
+            won: was_winner,
+        };
+        self.recent_trades.push(trade_outcome.clone());
+
+        // Keep only the most recent trades (cap at 100)
+        if self.recent_trades.len() > 100 {
+            self.recent_trades.remove(0);
+        }
+
+        // Track trade in current regime for meta-learning
+        self.track_trade_in_regime(trade_outcome);
+
+        // Update transfer manager for cross-symbol knowledge transfer
+        if let Some(ref tm) = self.transfer_manager {
+            let mut tm_lock = tm.lock().unwrap();
+            tm_lock.update_cluster(&self.symbol, self.calibrator.get_weights(), was_winner);
+
+            // Also update ML profile for transferability prediction
+            let volatility = entry.atr
+                .and_then(|atr| {
+                    let price_f = entry.entry_price.to_f64().unwrap_or(1.0);
+                    if price_f > 0.0 {
+                        Some(atr.to_f64().unwrap_or(0.0) / price_f * 100.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1.0);
+
+            // Use regime confidence as trend indicator
+            let trend_strength = self.regime_detector.confidence();
+
+            tm_lock.update_profile(
+                &self.symbol,
+                volatility,
+                trend_strength,
+                &regime_for_learner,
+                was_winner,
+            );
+        }
+
         let outcome = if was_winner { "winning" } else { "losing" };
         info!(
             "[LEARNER] {} Updated after {} trade (sr_score: {}, vol: {:.0}%, regime: {:?})",
             self.symbol, outcome, entry.sr_score, entry.volume_percentile, regime_for_learner
         );
+
+        // Add trade to vector index for similarity-based retrieval
+        if self.has_vector_index() {
+            let atr_pct = self.atr()
+                .and_then(|atr| {
+                    let price_f = entry.entry_price.to_f64().unwrap_or(1.0);
+                    if price_f > 0.0 {
+                        Some(atr.to_f64().unwrap_or(0.0) / price_f * 100.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1.0);
+
+            let entry_price_f = entry.entry_price.to_f64().unwrap_or(1.0);
+            let sr_level_f = entry.sr_level.to_f64().unwrap_or(0.0);
+            let distance_to_sr_pct = if entry_price_f > 0.0 {
+                ((entry_price_f - sr_level_f).abs() / entry_price_f * 100.0).min(5.0)
+            } else {
+                1.0
+            };
+
+            let is_long = self.position.as_ref().map(|p| p.side == Side::Long).unwrap_or(true);
+
+            self.add_trade_to_index(
+                entry.sr_score,
+                entry.volume_percentile,
+                atr_pct,
+                distance_to_sr_pct,
+                is_long,
+                hold_bars.max(0) as u32,
+                was_winner,
+                profit.to_f64().unwrap_or(0.0),
+            );
+
+            // Also add to memory consolidator for pattern extraction
+            if self.has_memory_consolidator() {
+                let embedding = self.generate_query_embedding(
+                    entry.sr_score,
+                    entry.volume_percentile,
+                    atr_pct,
+                    distance_to_sr_pct,
+                    is_long,
+                );
+                self.add_episode_to_consolidator(
+                    entry.sr_score,
+                    entry.volume_percentile,
+                    atr_pct,
+                    distance_to_sr_pct,
+                    is_long,
+                    hold_bars.max(0) as u32,
+                    was_winner,
+                    profit.to_f64().unwrap_or(0.0),
+                    embedding,
+                );
+            }
+        }
     }
 
     /// Get S/R confidence based on historical effectiveness
@@ -923,23 +1392,155 @@ impl SymbolAgent {
         0.50
     }
 
-    /// Get combined confidence from S/R, regime, and learned calibrator
+    /// Get combined confidence from S/R, regime, and learned calibrator/MoE
     ///
     /// Base confidence: 70% S/R confidence, 30% regime confidence
-    /// Final: 60% base confidence + 40% calibrator prediction
+    /// Final: 60% base confidence + 40% calibrator/MoE prediction
+    ///
+    /// If MoE is enabled, uses blended expert predictions instead of single calibrator.
     pub fn get_combined_confidence(&self, sr_level: Decimal) -> f64 {
         let sr_conf = self.get_sr_confidence(sr_level);
         let regime_conf = self.get_regime_confidence();
         let base_confidence = (sr_conf * 0.7) + (regime_conf * 0.3);
 
-        // Get calibrator prediction
+        // Get calibrator/MoE prediction
         let sr_score = self.sr.score_at(sr_level);
         let volume_pct = self.volume.percentile(self.last_volume);
         let regime = self.regime_detector.current_regime();
-        let calibrated = self.calibrator.predict(sr_score, volume_pct, &regime);
+
+        let calibrated = if self.is_moe_enabled() {
+            // Use MoE blended prediction
+            let moe = self.moe.as_ref().unwrap();
+            let pred = moe.predict(sr_score, volume_pct, &regime);
+            info!(
+                "[MOE] {} Using MoE prediction: {:.1}%",
+                self.symbol, pred * 100.0
+            );
+            pred
+        } else {
+            // Use single calibrator
+            self.calibrator.predict(sr_score, volume_pct, &regime)
+        };
 
         // Blend base and calibrated confidence
-        let combined = (base_confidence * 0.6) + (calibrated * 0.4);
+        let mut combined = (base_confidence * 0.6) + (calibrated * 0.4);
+
+        // Apply similarity-based adjustment from vector index
+        if self.has_vector_index() {
+            // Calculate ATR percentage and distance to SR for similarity query
+            let atr_pct = self.atr()
+                .and_then(|atr| {
+                    let price_f = self.last_price.to_f64().unwrap_or(1.0);
+                    if price_f > 0.0 {
+                        Some(atr.to_f64().unwrap_or(0.0) / price_f * 100.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1.0);
+
+            let sr_price_f = sr_level.to_f64().unwrap_or(0.0);
+            let last_price_f = self.last_price.to_f64().unwrap_or(1.0);
+            let distance_to_sr_pct = if last_price_f > 0.0 {
+                ((last_price_f - sr_price_f).abs() / last_price_f * 100.0).min(5.0)
+            } else {
+                1.0
+            };
+
+            // For now, assume long direction (can be refined based on signal type)
+            let is_long = sr_price_f < last_price_f; // Price above SR = likely long setup
+
+            if let Some((similar_win_rate, avg_pnl)) = self.get_similar_trade_performance(
+                sr_score,
+                volume_pct,
+                atr_pct,
+                distance_to_sr_pct,
+                is_long,
+            ) {
+                // Blend: 50% calculated confidence + 50% similar trade win rate
+                let similarity_adjusted = combined * 0.5 + similar_win_rate * 0.5;
+
+                info!(
+                    "[SIMILARITY] {} Adjusted confidence: {:.1}% -> {:.1}% (similar: {:.1}% win, ${:.2} avg)",
+                    self.symbol, combined * 100.0, similarity_adjusted * 100.0,
+                    similar_win_rate * 100.0, avg_pnl
+                );
+
+                combined = similarity_adjusted;
+            }
+        }
+
+        // Apply pattern-based adjustment from memory consolidator
+        if self.has_memory_consolidator() {
+            // Calculate ATR percentage and distance to SR for pattern query
+            let atr_pct = self.atr()
+                .and_then(|atr| {
+                    let price_f = self.last_price.to_f64().unwrap_or(1.0);
+                    if price_f > 0.0 {
+                        Some(atr.to_f64().unwrap_or(0.0) / price_f * 100.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1.0);
+
+            let sr_price_f = sr_level.to_f64().unwrap_or(0.0);
+            let last_price_f = self.last_price.to_f64().unwrap_or(1.0);
+            let distance_to_sr_pct = if last_price_f > 0.0 {
+                ((last_price_f - sr_price_f).abs() / last_price_f * 100.0).min(5.0)
+            } else {
+                1.0
+            };
+
+            let is_long = sr_price_f < last_price_f;
+
+            if let Some((pattern_win_rate, pattern_avg_pnl, pattern_name)) = self.get_pattern_prediction(
+                sr_score,
+                volume_pct,
+                atr_pct,
+                distance_to_sr_pct,
+                is_long,
+            ) {
+                // Blend: 70% current + 30% pattern (patterns are more abstract)
+                let pattern_adjusted = combined * 0.7 + pattern_win_rate * 0.3;
+
+                info!(
+                    "[PATTERN] {} Matched '{}': {:.1}% -> {:.1}% (pattern: {:.1}% win, ${:.2} avg)",
+                    self.symbol, pattern_name, combined * 100.0, pattern_adjusted * 100.0,
+                    pattern_win_rate * 100.0, pattern_avg_pnl
+                );
+
+                combined = pattern_adjusted;
+            }
+        }
+
+        // Apply causal intervention adjustment
+        if let Some(ref ca) = self.causal_analyzer {
+            let sr_price_f = sr_level.to_f64().unwrap_or(0.0);
+            let last_price_f = self.last_price.to_f64().unwrap_or(1.0);
+            let is_long = sr_price_f < last_price_f;
+
+            if let Ok(ca_lock) = ca.lock() {
+                let intervention_adjusted = ca_lock.get_intervention_adjusted_confidence(
+                    &self.symbol,
+                    is_long,
+                    combined,
+                );
+
+                if (intervention_adjusted - combined).abs() > 0.01 {
+                    info!(
+                        "[CAUSAL] {} Intervention analysis: {:.1}% -> {:.1}% (entry effect)",
+                        self.symbol, combined * 100.0, intervention_adjusted * 100.0
+                    );
+                    combined = intervention_adjusted;
+                }
+            }
+        }
+
+        // Apply foundation model adjustment (direction and regime)
+        if self.has_foundation() {
+            combined = self.get_foundation_confidence_adjustment(combined);
+        }
 
         info!(
             "[MEMORY] {} Combined: {:.1}% (base: {:.1}%, calibrated: {:.1}%)",
@@ -967,6 +1568,1278 @@ impl SymbolAgent {
     /// Set calibrator (for loading from persistence)
     pub fn set_calibrator(&mut self, calibrator: ConfidenceCalibrator) {
         self.calibrator = calibrator;
+    }
+
+    // =========================================================================
+    // EWC (ELASTIC WEIGHT CONSOLIDATION) METHODS
+    // =========================================================================
+
+    /// Check if EWC consolidation should happen and perform it
+    ///
+    /// Consolidation occurs when:
+    /// 1. We have enough recent trades (>= EWC_MIN_TRADES)
+    /// 2. Recent win rate is good (>= EWC_MIN_WIN_RATE)
+    ///
+    /// This protects learned weights that produced good results in the
+    /// current regime from being forgotten when adapting to a new regime.
+    fn maybe_consolidate_ewc(&mut self) {
+        // Need enough trades to compute meaningful Fisher Information
+        if self.recent_trades.len() < EWC_MIN_TRADES {
+            info!(
+                "[EWC] {} Skipping consolidation: only {} trades (need {})",
+                self.symbol, self.recent_trades.len(), EWC_MIN_TRADES
+            );
+            return;
+        }
+
+        // Calculate recent win rate
+        let wins = self.recent_trades.iter().filter(|t| t.won).count();
+        let win_rate = wins as f64 / self.recent_trades.len() as f64;
+
+        if win_rate < EWC_MIN_WIN_RATE {
+            info!(
+                "[EWC] {} Skipping consolidation: win rate {:.1}% < {:.1}%",
+                self.symbol, win_rate * 100.0, EWC_MIN_WIN_RATE * 100.0
+            );
+            return;
+        }
+
+        // Good performance - consolidate weights
+        info!(
+            "[EWC] {} Consolidating: {} trades, {:.1}% win rate",
+            self.symbol, self.recent_trades.len(), win_rate * 100.0
+        );
+
+        // Compute Fisher Information from recent trades
+        self.calibrator.compute_fisher(&self.recent_trades);
+
+        // Store current weights as optimal
+        self.calibrator.consolidate();
+
+        // Clear recent trades for next regime
+        self.recent_trades.clear();
+    }
+
+    /// Consolidate MoE expert for the previous regime
+    ///
+    /// When regime changes, consolidate the expert that was active to protect
+    /// its learned weights. Filter recent trades by the previous regime.
+    fn maybe_consolidate_moe_expert(&mut self) {
+        let Some(ref mut moe) = self.moe else {
+            return;
+        };
+
+        let Some(prev_regime) = self.regime_detector.previous_regime() else {
+            return;
+        };
+
+        // Filter trades from the previous regime
+        let regime_trades: Vec<_> = self.recent_trades
+            .iter()
+            .filter(|t| t.regime == prev_regime)
+            .cloned()
+            .collect();
+
+        // Need enough trades from this regime
+        if regime_trades.len() < EWC_MIN_TRADES {
+            info!(
+                "[MOE] {} Skipping {} expert consolidation: only {} trades",
+                self.symbol, prev_regime, regime_trades.len()
+            );
+            return;
+        }
+
+        // Check win rate for this regime's trades
+        let wins = regime_trades.iter().filter(|t| t.won).count();
+        let win_rate = wins as f64 / regime_trades.len() as f64;
+
+        if win_rate < EWC_MIN_WIN_RATE {
+            info!(
+                "[MOE] {} Skipping {} expert consolidation: win rate {:.1}%",
+                self.symbol, prev_regime, win_rate * 100.0
+            );
+            return;
+        }
+
+        // Consolidate the expert for the previous regime
+        info!(
+            "[MOE] {} Consolidating {} expert: {} trades, {:.1}% win rate",
+            self.symbol, prev_regime, regime_trades.len(), win_rate * 100.0
+        );
+        moe.consolidate_expert(&prev_regime, &regime_trades);
+    }
+
+    /// Get count of recent trades tracked for EWC
+    pub fn recent_trade_count(&self) -> usize {
+        self.recent_trades.len()
+    }
+
+    /// Check if calibrator has been consolidated (EWC is active)
+    pub fn is_ewc_active(&self) -> bool {
+        self.calibrator.is_consolidated()
+    }
+
+    // ==================== Meta-Learning Methods ====================
+
+    /// Prepare for a new regime by storing pre-adaptation state
+    ///
+    /// Called when regime changes to capture the starting point for adaptation.
+    fn prepare_for_new_regime(&mut self) {
+        // Store current weights as pre-adaptation baseline
+        self.pre_adaptation_weights = Some(*self.calibrator.get_weights());
+        self.pre_adaptation_bias = Some(self.calibrator.get_bias());
+
+        // Clear trades from previous regime
+        self.trades_in_current_regime.clear();
+
+        info!(
+            "[META] {} Prepared for new regime: {} (tracking adaptation)",
+            self.symbol,
+            self.regime_detector.current_regime()
+        );
+    }
+
+    /// Report meta-learning adaptation to the MetaLearner
+    ///
+    /// Called on regime change to report how well we adapted in the previous regime.
+    fn maybe_report_meta_adaptation(&mut self) {
+        // Need pre-adaptation weights to report
+        let Some(pre_weights) = self.pre_adaptation_weights else {
+            return;
+        };
+        let Some(pre_bias) = self.pre_adaptation_bias else {
+            return;
+        };
+
+        // Need enough trades in current regime
+        if self.trades_in_current_regime.len() < self.meta_adaptation_threshold as usize {
+            info!(
+                "[META] {} Skipping adaptation report: only {} trades (need {})",
+                self.symbol,
+                self.trades_in_current_regime.len(),
+                self.meta_adaptation_threshold
+            );
+            return;
+        }
+
+        // Get previous regime for reporting
+        let Some(prev_regime) = self.regime_detector.previous_regime() else {
+            return;
+        };
+
+        // Calculate pre-adaptation accuracy (using pre-weights on current regime's trades)
+        let pre_accuracy = calculate_accuracy(
+            &pre_weights,
+            pre_bias,
+            &self.trades_in_current_regime,
+        );
+
+        // Calculate post-adaptation accuracy (using current weights)
+        let post_accuracy = calculate_accuracy(
+            self.calibrator.get_weights(),
+            self.calibrator.get_bias(),
+            &self.trades_in_current_regime,
+        );
+
+        // Report to calibrator's meta-learner
+        self.calibrator.report_adaptation(
+            &pre_weights,
+            pre_bias,
+            pre_accuracy,
+            post_accuracy,
+            self.trades_in_current_regime.len() as u32,
+            &prev_regime,
+        );
+
+        info!(
+            "[META] {} Reported {} adaptation: {:.1}% -> {:.1}% ({} trades)",
+            self.symbol,
+            prev_regime,
+            pre_accuracy * 100.0,
+            post_accuracy * 100.0,
+            self.trades_in_current_regime.len()
+        );
+    }
+
+    /// Track a trade in the current regime (for meta-learning)
+    fn track_trade_in_regime(&mut self, trade: TradeOutcome) {
+        self.trades_in_current_regime.push(trade);
+
+        // Keep only last 100 trades per regime
+        if self.trades_in_current_regime.len() > 100 {
+            self.trades_in_current_regime.remove(0);
+        }
+    }
+
+    /// Attach meta-learner to calibrator
+    pub fn attach_meta_learner(&mut self, ml: Arc<Mutex<MetaLearner>>) {
+        self.calibrator.attach_meta_learner(ml);
+    }
+
+    /// Check if meta-learner is attached
+    pub fn has_meta_learner(&self) -> bool {
+        self.calibrator.has_meta_learner()
+    }
+
+    // ==================== Weakness Analyzer Methods ====================
+
+    /// Attach weakness analyzer for self-directed improvement
+    pub fn attach_weakness_analyzer(&mut self, wa: Arc<Mutex<WeaknessAnalyzer>>) {
+        self.weakness_analyzer = Some(wa);
+    }
+
+    /// Check if weakness analyzer is attached
+    pub fn has_weakness_analyzer(&self) -> bool {
+        self.weakness_analyzer.is_some()
+    }
+
+    /// Get reference to weakness analyzer
+    pub fn weakness_analyzer(&self) -> Option<&Arc<Mutex<WeaknessAnalyzer>>> {
+        self.weakness_analyzer.as_ref()
+    }
+
+    /// Check if trade should be skipped due to weakness patterns
+    ///
+    /// Returns Some(reason) if trade should be skipped, None otherwise.
+    fn should_skip_for_weakness(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+    ) -> Option<String> {
+        let Some(ref wa) = self.weakness_analyzer else {
+            return None;
+        };
+
+        let wa_lock = wa.lock().unwrap();
+        let regime = self.regime_detector.current_regime();
+
+        wa_lock.should_skip_trade(
+            &regime,
+            sr_score,
+            volume_percentile,
+            &self.symbol,
+        )
+    }
+
+    /// Get position size multiplier based on weakness patterns
+    ///
+    /// Returns a multiplier (0.0-1.0) to reduce position size when
+    /// trading in conditions where we've historically performed poorly.
+    pub fn get_weakness_position_multiplier(&self) -> f64 {
+        let Some(ref wa) = self.weakness_analyzer else {
+            return 1.0;
+        };
+
+        let wa_lock = wa.lock().unwrap();
+        let regime = self.regime_detector.current_regime();
+
+        wa_lock.get_position_size_multiplier(&regime, &self.symbol)
+    }
+
+    // ==================== Causal Analyzer Methods ====================
+
+    /// Attach causal analyzer for understanding market relationships
+    pub fn attach_causal_analyzer(&mut self, ca: Arc<Mutex<CausalAnalyzer>>) {
+        self.causal_analyzer = Some(ca);
+    }
+
+    /// Check if causal analyzer is attached
+    pub fn has_causal_analyzer(&self) -> bool {
+        self.causal_analyzer.is_some()
+    }
+
+    /// Get reference to causal analyzer
+    pub fn causal_analyzer(&self) -> Option<&Arc<Mutex<CausalAnalyzer>>> {
+        self.causal_analyzer.as_ref()
+    }
+
+    /// Update causal analyzer with current price
+    pub fn update_causal_prices(&self, price: f64) {
+        if let Some(ref ca) = self.causal_analyzer {
+            let mut ca_lock = ca.lock().unwrap();
+            ca_lock.update_prices(&self.symbol, price);
+        }
+    }
+
+    /// Get causal context for logging/debugging
+    pub fn get_causal_context(&self) -> String {
+        let Some(ref ca) = self.causal_analyzer else {
+            return format!("{}: no causal analyzer", self.symbol);
+        };
+
+        let ca_lock = ca.lock().unwrap();
+        ca_lock.get_causal_context(&self.symbol)
+    }
+
+    /// Get confidence adjustment based on causal alignment
+    ///
+    /// Returns a value in [-0.15, +0.15] to adjust confidence:
+    /// - Positive if leading indicators agree with trade direction
+    /// - Negative if leading indicators disagree
+    /// - Zero if no causal information available
+    pub fn get_causal_confidence_adjustment(&self, is_long: bool) -> f64 {
+        let Some(ref ca) = self.causal_analyzer else {
+            return 0.0;
+        };
+
+        let ca_lock = ca.lock().unwrap();
+        ca_lock.get_causal_confidence_adjustment(&self.symbol, is_long)
+    }
+
+    /// Get predicted regime from causal factors
+    pub fn predict_regime_from_causes(&self) -> Option<Regime> {
+        let Some(ref ca) = self.causal_analyzer else {
+            return None;
+        };
+
+        let ca_lock = ca.lock().unwrap();
+        ca_lock.predict_regime_from_causes(&self.symbol)
+    }
+
+    // ==================== World Model Methods ====================
+
+    /// Attach world model for forward planning
+    pub fn attach_world_model(&mut self, wm: Arc<Mutex<WorldModel>>) {
+        self.world_model = Some(wm);
+    }
+
+    /// Check if world model is attached
+    pub fn has_world_model(&self) -> bool {
+        self.world_model.is_some()
+    }
+
+    /// Get reference to world model
+    pub fn world_model(&self) -> Option<&Arc<Mutex<WorldModel>>> {
+        self.world_model.as_ref()
+    }
+
+    /// Update world model with current price and regime
+    pub fn update_world_model(&self, price: Decimal, regime: Regime) {
+        if let Some(ref wm) = self.world_model {
+            let mut wm_lock = wm.lock().unwrap();
+            let mut prices = std::collections::HashMap::new();
+            prices.insert(self.symbol.clone(), price);
+            let mut regimes = std::collections::HashMap::new();
+            regimes.insert(self.symbol.clone(), regime);
+            wm_lock.update_state(prices, regimes);
+        }
+    }
+
+    /// Get world model confidence adjustment for a trade direction
+    ///
+    /// Returns a value in [0.5, 1.5] to adjust position size:
+    /// - > 1.0 if world model predicts favorable conditions
+    /// - < 1.0 if world model predicts unfavorable conditions
+    pub fn get_world_model_confidence(&self, is_long: bool) -> f64 {
+        let Some(ref wm) = self.world_model else {
+            return 1.0;
+        };
+
+        let wm_lock = wm.lock().unwrap();
+        let direction = if is_long {
+            PositionDirection::Long
+        } else {
+            PositionDirection::Short
+        };
+
+        wm_lock.get_prediction_confidence(&self.symbol, direction)
+    }
+
+    /// Get expected value from world model for a trade direction
+    ///
+    /// Returns the expected profit/loss based on Monte Carlo simulation
+    pub fn get_world_model_expected_value(&self, is_long: bool, horizon: usize) -> f64 {
+        let Some(ref wm) = self.world_model else {
+            return 0.0;
+        };
+
+        let wm_lock = wm.lock().unwrap();
+        let direction = if is_long {
+            PositionDirection::Long
+        } else {
+            PositionDirection::Short
+        };
+
+        wm_lock.get_expected_value(&self.symbol, direction, horizon)
+    }
+
+    /// Get price forecast from world model
+    pub fn get_price_forecast(&self, steps_ahead: usize) -> Option<super::worldmodel::PriceForecast> {
+        let Some(ref wm) = self.world_model else {
+            return None;
+        };
+
+        let wm_lock = wm.lock().unwrap();
+        wm_lock.forecast_price(&self.symbol, steps_ahead, 500)
+    }
+
+    // ==================== Counterfactual Analyzer Methods ====================
+
+    /// Attach counterfactual analyzer for learning from alternative decisions
+    pub fn attach_counterfactual_analyzer(&mut self, cf: Arc<Mutex<CounterfactualAnalyzer>>) {
+        self.counterfactual = Some(cf);
+    }
+
+    /// Check if counterfactual analyzer is attached
+    pub fn has_counterfactual_analyzer(&self) -> bool {
+        self.counterfactual.is_some()
+    }
+
+    /// Get reference to counterfactual analyzer
+    pub fn counterfactual_analyzer(&self) -> Option<&Arc<Mutex<CounterfactualAnalyzer>>> {
+        self.counterfactual.as_ref()
+    }
+
+    /// Get counterfactual recommendations for current setup
+    ///
+    /// Returns a recommendation string if there's a strong signal from historical analysis
+    pub fn get_counterfactual_recommendation(&self, _sr_score: i32, _volume_percentile: f64) -> Option<String> {
+        let Some(ref cf) = self.counterfactual else {
+            return None;
+        };
+
+        let cf_lock = cf.lock().unwrap();
+        let recommendations = cf_lock.get_recommendations();
+
+        // Return the first relevant recommendation
+        recommendations.first().cloned()
+    }
+
+    // ==================== Sequence/Regime Prediction Methods ====================
+
+    /// Attach regime predictor for anticipating regime changes
+    pub fn attach_regime_predictor(&mut self, predictor: Arc<Mutex<RegimePredictor>>) {
+        self.regime_predictor = Some(predictor);
+    }
+
+    /// Check if regime predictor is attached
+    pub fn has_regime_predictor(&self) -> bool {
+        self.regime_predictor.is_some()
+    }
+
+    /// Get reference to regime predictor
+    pub fn regime_predictor(&self) -> Option<&Arc<Mutex<RegimePredictor>>> {
+        self.regime_predictor.as_ref()
+    }
+
+    /// Push market features to the regime predictor
+    ///
+    /// Should be called on each bar to build the sequence
+    pub fn push_market_features(&self, return_1bar: f64, volatility: f64, sr_score: i32, volume_percentile: f64) {
+        if let Some(ref predictor) = self.regime_predictor {
+            if let Ok(mut pred) = predictor.lock() {
+                let features = MarketFeatures::new(
+                    return_1bar,
+                    volatility,
+                    self.regime_detector.current_regime().clone(),
+                    sr_score,
+                    volume_percentile,
+                );
+                pred.push_features(features);
+            }
+        }
+    }
+
+    /// Predict if a regime change is coming
+    ///
+    /// Returns the predicted regime and confidence if a change is likely
+    pub fn predict_regime_change(&self) -> Option<(Regime, f64)> {
+        let Some(ref predictor) = self.regime_predictor else {
+            return None;
+        };
+
+        let Ok(mut pred) = predictor.lock() else {
+            return None;
+        };
+
+        let current_regime = self.regime_detector.current_regime();
+        pred.predict_regime_change(&current_regime)
+    }
+
+    /// Get regime probabilities from the predictor
+    ///
+    /// Returns [TrendingUp, TrendingDown, Ranging, Volatile] probabilities
+    pub fn get_regime_probabilities(&self) -> Option<[f64; 4]> {
+        let Some(ref predictor) = self.regime_predictor else {
+            return None;
+        };
+
+        let Ok(mut pred) = predictor.lock() else {
+            return None;
+        };
+
+        if !pred.is_ready() {
+            return None;
+        }
+
+        // Use current state for prediction
+        let features = MarketFeatures::new(
+            0.0, // Will be overwritten by sequence
+            0.0,
+            self.regime_detector.current_regime().clone(),
+            0,
+            50.0,
+        );
+        Some(pred.predict_next_regime(features))
+    }
+
+    /// Update regime predictor with actual regime (for learning)
+    pub fn update_regime_predictor(&self) {
+        if let Some(ref predictor) = self.regime_predictor {
+            if let Ok(mut pred) = predictor.lock() {
+                let regime = self.regime_detector.current_regime();
+                pred.update(&regime);
+            }
+        }
+    }
+
+    /// Check if regime change is predicted and should reduce position size
+    ///
+    /// Returns a scaling factor (0.0 to 1.0) for position sizing
+    pub fn get_regime_transition_factor(&self) -> f64 {
+        if let Some((_, confidence)) = self.predict_regime_change() {
+            // If regime change is predicted, reduce position size proportionally
+            // Higher confidence in change = lower position size
+            (1.0 - confidence).max(0.3) // Never go below 30%
+        } else {
+            1.0 // Full position if no change predicted
+        }
+    }
+
+    /// Get regime probabilities for MoE soft gating
+    ///
+    /// Uses LSTM-predicted probabilities if available for forward-looking blending,
+    /// falling back to current HMM regime probabilities if predictor is not ready.
+    ///
+    /// This enables the MoE to proactively weight experts based on where the
+    /// market is predicted to go, not just where it currently is.
+    fn get_predicted_regime_probs_for_gating(&self) -> [f64; 4] {
+        // Try to get LSTM-predicted regime probabilities
+        if let Some(ref predictor) = self.regime_predictor {
+            if let Ok(mut pred) = predictor.lock() {
+                if pred.is_ready() {
+                    // Build current features for prediction
+                    let features = MarketFeatures::new(
+                        0.0, // Will use sequence buffer
+                        0.0,
+                        self.regime_detector.current_regime().clone(),
+                        0,
+                        50.0,
+                    );
+                    let predicted = pred.predict_next_regime(features);
+
+                    // Blend predicted with current for stability (70% predicted, 30% current)
+                    let current = self.regime_detector.regime_probabilities();
+                    let mut blended = [0.0; 4];
+                    for i in 0..4 {
+                        blended[i] = predicted[i] * 0.7 + current[i] * 0.3;
+                    }
+
+                    info!(
+                        "[SEQUENCE] {} MoE gating: predicted [{:.2}, {:.2}, {:.2}, {:.2}], current [{:.2}, {:.2}, {:.2}, {:.2}]",
+                        self.symbol,
+                        predicted[0], predicted[1], predicted[2], predicted[3],
+                        current[0], current[1], current[2], current[3]
+                    );
+
+                    return blended;
+                }
+            }
+        }
+
+        // Fallback to current HMM regime probabilities
+        self.regime_detector.regime_probabilities()
+    }
+
+    /// Update MoE gating with predicted regime probabilities
+    ///
+    /// Call this periodically (e.g., on each bar) to keep MoE gating
+    /// aligned with predicted regime transitions.
+    pub fn update_moe_gating_from_prediction(&mut self) {
+        // Calculate regime probs first to avoid borrow conflict
+        let regime_probs = self.get_predicted_regime_probs_for_gating();
+
+        if let Some(ref mut moe) = self.moe {
+            moe.update_gating(&regime_probs);
+        }
+    }
+
+    // =========================================================================
+    // VECTOR EMBEDDINGS FOR SIMILARITY-BASED RETRIEVAL
+    // =========================================================================
+
+    /// Attach vector index for similarity-based trade retrieval
+    pub fn attach_vector_index(&mut self, index: Arc<Mutex<VectorIndex>>) {
+        self.vector_index = Some(index);
+    }
+
+    /// Check if vector index is attached
+    pub fn has_vector_index(&self) -> bool {
+        self.vector_index.is_some()
+    }
+
+    /// Get reference to vector index
+    pub fn vector_index(&self) -> Option<&Arc<Mutex<VectorIndex>>> {
+        self.vector_index.as_ref()
+    }
+
+    /// Add a trade to the vector index
+    ///
+    /// Should be called after recording trade exit to memory
+    pub fn add_trade_to_index(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+        hold_duration: u32,
+        won: bool,
+        pnl: f64,
+    ) {
+        if let Some(ref index) = self.vector_index {
+            if let Ok(mut idx) = index.lock() {
+                let context = EmbeddingTradeContext::new(
+                    sr_score,
+                    volume_percentile,
+                    atr_pct,
+                    distance_to_sr_pct,
+                    self.regime_detector.current_regime().clone(),
+                    is_long,
+                    hold_duration,
+                    won,
+                    self.symbol.clone(),
+                    pnl,
+                );
+                let id = idx.add(&context);
+                info!(
+                    "[EMBEDDINGS] {} Added trade {} to index ({} total)",
+                    self.symbol, id, idx.len()
+                );
+            }
+        }
+    }
+
+    /// Get similar trade performance from vector index
+    ///
+    /// Returns (win_rate, avg_pnl) of similar historical trades
+    /// Returns None if no vector index or insufficient similar trades
+    pub fn get_similar_trade_performance(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> Option<(f64, f64)> {
+        let index = self.vector_index.as_ref()?;
+        let idx = index.lock().ok()?;
+
+        if idx.len() < 10 {
+            return None; // Need minimum data
+        }
+
+        // Create query context (hold_duration and won are unknown for current setup)
+        let query = EmbeddingTradeContext::new(
+            sr_score,
+            volume_percentile,
+            atr_pct,
+            distance_to_sr_pct,
+            self.regime_detector.current_regime().clone(),
+            is_long,
+            0,    // Unknown
+            true, // Placeholder
+            self.symbol.clone(),
+            0.0, // Unknown
+        );
+
+        // Find 20 most similar trades
+        let (avg_pnl, wins, losses) = idx.get_similar_outcomes(&query, 20);
+        let total = wins + losses;
+
+        if total < 10 {
+            return None; // Need minimum similar trades
+        }
+
+        let win_rate = wins as f64 / total as f64;
+
+        info!(
+            "[SIMILARITY] {} Found {} similar trades: {:.1}% win rate, ${:.2} avg PnL",
+            self.symbol, total, win_rate * 100.0, avg_pnl
+        );
+
+        Some((win_rate, avg_pnl))
+    }
+
+    /// Get confidence adjustment based on similar historical trades
+    ///
+    /// Returns a multiplier (0.5 to 1.5) based on how similar trades performed
+    pub fn get_similarity_confidence_factor(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> f64 {
+        if let Some((win_rate, _avg_pnl)) = self.get_similar_trade_performance(
+            sr_score,
+            volume_percentile,
+            atr_pct,
+            distance_to_sr_pct,
+            is_long,
+        ) {
+            // Scale win_rate to confidence factor:
+            // 0% win rate -> 0.5x (reduce confidence)
+            // 50% win rate -> 1.0x (neutral)
+            // 100% win rate -> 1.5x (boost confidence)
+            0.5 + win_rate
+        } else {
+            1.0 // No adjustment if no similar trades found
+        }
+    }
+
+    // =========================================================================
+    // HIERARCHICAL MEMORY CONSOLIDATION
+    // =========================================================================
+
+    /// Attach memory consolidator for pattern extraction
+    pub fn attach_memory_consolidator(&mut self, consolidator: Arc<Mutex<MemoryConsolidator>>) {
+        self.memory_consolidator = Some(consolidator);
+    }
+
+    /// Check if memory consolidator is attached
+    pub fn has_memory_consolidator(&self) -> bool {
+        self.memory_consolidator.is_some()
+    }
+
+    /// Get reference to memory consolidator
+    pub fn memory_consolidator(&self) -> Option<&Arc<Mutex<MemoryConsolidator>>> {
+        self.memory_consolidator.as_ref()
+    }
+
+    /// Add a trade episode to the memory consolidator
+    ///
+    /// Should be called alongside add_trade_to_index
+    pub fn add_episode_to_consolidator(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+        hold_duration: u32,
+        won: bool,
+        pnl: f64,
+        embedding: Vec<f64>,
+    ) {
+        if let Some(ref consolidator) = self.memory_consolidator {
+            if let Ok(mut mc) = consolidator.lock() {
+                let context = EpisodeContext::new(
+                    self.symbol.clone(),
+                    sr_score,
+                    volume_percentile,
+                    atr_pct,
+                    distance_to_sr_pct,
+                    self.regime_detector.current_regime().clone(),
+                    is_long,
+                    hold_duration,
+                    won,
+                    pnl,
+                );
+                mc.add_episode(context, embedding);
+                info!(
+                    "[CONSOLIDATION] {} Added episode ({} working, {} episodic)",
+                    self.symbol, mc.get_memory_stats().working_count, mc.get_memory_stats().episodic_count
+                );
+            }
+        }
+    }
+
+    /// Get pattern-based prediction from memory consolidator
+    ///
+    /// Returns (win_rate, avg_pnl, pattern_name) if a matching pattern is found
+    pub fn get_pattern_prediction(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> Option<(f64, f64, String)> {
+        let consolidator = self.memory_consolidator.as_ref()?;
+        let mc = consolidator.lock().ok()?;
+
+        // Generate query embedding
+        let embedding = self.generate_query_embedding(
+            sr_score,
+            volume_percentile,
+            atr_pct,
+            distance_to_sr_pct,
+            is_long,
+        );
+
+        mc.get_pattern_prediction(&embedding)
+    }
+
+    /// Generate an embedding for a query context
+    fn generate_query_embedding(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> Vec<f64> {
+        // Create a simple normalized embedding from features
+        // This matches the approach used in TradeContext::to_features()
+        let mut embedding = vec![0.0; EMBEDDING_DIM];
+
+        // sr_score: normalize from [-10, 0] to [0, 1]
+        embedding[0] = (sr_score as f64 + 10.0) / 10.0;
+
+        // volume_percentile: normalize from [0, 100] to [0, 1]
+        embedding[1] = volume_percentile / 100.0;
+
+        // atr_pct: normalize from [0, 5] to [0, 1]
+        embedding[2] = (atr_pct / 5.0).min(1.0);
+
+        // distance_to_sr_pct: normalize from [0, 5] to [0, 1]
+        embedding[3] = (distance_to_sr_pct / 5.0).min(1.0);
+
+        // regime: one-hot encoding (positions 4-7)
+        let regime = self.regime_detector.current_regime();
+        match regime {
+            Regime::TrendingUp => embedding[4] = 1.0,
+            Regime::TrendingDown => embedding[5] = 1.0,
+            Regime::Ranging => embedding[6] = 1.0,
+            Regime::Volatile => embedding[7] = 1.0,
+        }
+
+        // is_long: binary
+        embedding[8] = if is_long { 1.0 } else { 0.0 };
+
+        // Normalize the embedding vector
+        let magnitude: f64 = embedding.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if magnitude > 0.0 {
+            for val in &mut embedding {
+                *val /= magnitude;
+            }
+        }
+
+        embedding
+    }
+
+    /// Get pattern-based confidence factor
+    ///
+    /// Returns a multiplier (0.5 to 1.5) based on matching pattern performance
+    pub fn get_pattern_confidence_factor(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> f64 {
+        if let Some((win_rate, avg_pnl, pattern_name)) = self.get_pattern_prediction(
+            sr_score,
+            volume_percentile,
+            atr_pct,
+            distance_to_sr_pct,
+            is_long,
+        ) {
+            info!(
+                "[PATTERN] {} Matched '{}': {:.1}% win rate, ${:.2} avg PnL",
+                self.symbol, pattern_name, win_rate * 100.0, avg_pnl
+            );
+
+            // Scale win_rate to confidence factor (same as similarity)
+            0.5 + win_rate
+        } else {
+            1.0 // No adjustment if no pattern found
+        }
+    }
+
+    // =========================================================================
+    // AUTONOMOUS SELF-MODIFICATION
+    // =========================================================================
+
+    /// Attach self-modification engine
+    pub fn attach_self_mod(&mut self, self_mod: Arc<Mutex<SelfModificationEngine>>) {
+        self.self_mod = Some(self_mod);
+    }
+
+    /// Check if self-modification engine is attached
+    pub fn has_self_mod(&self) -> bool {
+        self.self_mod.is_some()
+    }
+
+    /// Attach code deployer for generated code execution
+    pub fn attach_code_deployer(&mut self, deployer: Arc<Mutex<CodeDeployer>>) {
+        self.code_deployer = Some(deployer);
+    }
+
+    /// Check if code deployer is attached
+    pub fn has_code_deployer(&self) -> bool {
+        self.code_deployer.is_some()
+    }
+
+    /// Execute code deployer filters for a potential trade
+    /// Returns true if trade is allowed (all filters pass)
+    pub fn execute_code_filters(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        confidence: f64,
+        atr_pct: f64,
+        distance_to_sr_pct: f64,
+        is_long: bool,
+    ) -> bool {
+        if let Some(ref deployer_lock) = self.code_deployer {
+            if let Ok(deployer) = deployer_lock.lock() {
+                let ctx = CodegenEvalContext::from_trade_context(
+                    sr_score,
+                    volume_percentile,
+                    confidence,
+                    atr_pct,
+                    distance_to_sr_pct,
+                    is_long,
+                    0.0,  // current_pnl (not applicable for entry)
+                    0,    // bars_held (not applicable for entry)
+                    self.regime_detector.current_regime(),
+                );
+                return deployer.execute_filters(&ctx);
+            }
+        }
+        true // If no deployer, allow trade
+    }
+
+    /// Apply code deployer confidence adjusters
+    pub fn apply_code_adjusters(&self, base_confidence: f64, sr_score: i32, volume_percentile: f64) -> f64 {
+        if let Some(ref deployer_lock) = self.code_deployer {
+            if let Ok(deployer) = deployer_lock.lock() {
+                let mut ctx = CodegenEvalContext::new(self.regime_detector.current_regime());
+                ctx.set("confidence", base_confidence);
+                ctx.set("sr_score", sr_score as f64);
+                ctx.set("volume_percentile", volume_percentile);
+                ctx.set("volume_pct", volume_percentile);
+                return deployer.execute_adjusters(base_confidence, &ctx);
+            }
+        }
+        base_confidence
+    }
+
+    /// Check code deployer exit rules
+    /// Returns Some(reason) if exit should trigger
+    pub fn check_code_exit_rules(&self, current_pnl: f64, bars_held: u32, is_long: bool) -> Option<String> {
+        if let Some(ref deployer_lock) = self.code_deployer {
+            if let Ok(deployer) = deployer_lock.lock() {
+                let mut ctx = CodegenEvalContext::new(self.regime_detector.current_regime());
+                ctx.set("current_pnl", current_pnl);
+                ctx.set("bars_held", bars_held as f64);
+                ctx.set("is_long", if is_long { 1.0 } else { 0.0 });
+                return deployer.check_exit_rules(&ctx);
+            }
+        }
+        None
+    }
+
+    /// Evaluate self-modification rules for a potential trade
+    ///
+    /// Returns the actions to apply and whether to skip the trade entirely
+    pub fn evaluate_self_mod_rules(
+        &self,
+        sr_score: i32,
+        volume_percentile: f64,
+        confidence: f64,
+        is_long: bool,
+        time: DateTime<Utc>,
+    ) -> (Vec<RuleAction>, bool) {
+        let mut actions = Vec::new();
+        let mut skip_trade = false;
+
+        if let Some(ref engine_lock) = self.self_mod {
+            if let Ok(engine) = engine_lock.lock() {
+                // Build RuleContext from current state
+                let mut context = RuleContext::new(&self.symbol, self.regime_detector.current_regime());
+                context.sr_score = sr_score;
+                context.volume_percentile = volume_percentile;
+                context.confidence = confidence;
+                context.is_long = is_long;
+                context.time = time;
+
+                // Add active weaknesses if available
+                if let Some(ref wa_lock) = self.weakness_analyzer {
+                    if let Ok(wa) = wa_lock.lock() {
+                        for weakness in wa.get_weaknesses() {
+                            context.active_weaknesses.insert(format!("{:?}", weakness.weakness_type));
+                        }
+                    }
+                }
+
+                // Evaluate rules through the engine
+                let triggered_actions = engine.rule_engine().evaluate(&context);
+
+                for action in triggered_actions {
+                    info!(
+                        "[SELF-MOD] {} Action triggered: {:?}",
+                        self.symbol, action
+                    );
+
+                    match &action {
+                        RuleAction::SkipTrade { reason } => {
+                            info!("[SELF-MOD] {} Skipping trade: {}", self.symbol, reason);
+                            skip_trade = true;
+                        }
+                        _ => {
+                            actions.push(action.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        (actions, skip_trade)
+    }
+
+    /// Apply self-modification rule actions to a signal
+    ///
+    /// Returns the modified conviction and any size adjustment factor
+    pub fn apply_self_mod_actions(&self, actions: &[RuleAction], conviction: u8) -> (u8, f64) {
+        let mut modified_conviction = conviction;
+        let mut size_factor = 1.0;
+
+        for action in actions {
+            match action {
+                RuleAction::ReduceSize { multiplier, reason } => {
+                    size_factor *= multiplier;
+                    info!(
+                        "[SELF-MOD] {} Reducing size by {:.1}x: {}",
+                        self.symbol, multiplier, reason
+                    );
+                }
+                RuleAction::IncreaseSize { multiplier, reason } => {
+                    size_factor *= multiplier;
+                    info!(
+                        "[SELF-MOD] {} Increasing size by {:.1}x: {}",
+                        self.symbol, multiplier, reason
+                    );
+                }
+                RuleAction::RequireConfirmation { from } => {
+                    // Require confirmation - reduce conviction to prompt review
+                    info!(
+                        "[SELF-MOD] {} Confirmation required from: {}",
+                        self.symbol, from
+                    );
+                    modified_conviction = modified_conviction.saturating_sub(20);
+                }
+                RuleAction::AdjustConfidence { delta } => {
+                    let new_conv = (modified_conviction as f64 + delta * 100.0).clamp(0.0, 100.0) as u8;
+                    info!(
+                        "[SELF-MOD] {} Adjusting confidence by {:.0}%: {} -> {}",
+                        self.symbol, delta * 100.0, modified_conviction, new_conv
+                    );
+                    modified_conviction = new_conv;
+                }
+                RuleAction::Log { message } => {
+                    info!("[SELF-MOD] {} Log: {}", self.symbol, message);
+                }
+                _ => {}
+            }
+        }
+
+        (modified_conviction, size_factor)
+    }
+
+    // ==================== Foundation Model Integration ====================
+
+    /// Attach foundation model for time-series understanding
+    pub fn attach_foundation(&mut self, foundation: Arc<Mutex<TimeSeriesFoundation>>) {
+        self.foundation = Some(foundation);
+    }
+
+    /// Check if foundation model is attached
+    pub fn has_foundation(&self) -> bool {
+        self.foundation.is_some()
+    }
+
+    /// Attach foundation transfer for zero-shot transfer learning
+    pub fn attach_foundation_transfer(&mut self, transfer: Arc<Mutex<FoundationTransfer>>) {
+        self.foundation_transfer = Some(transfer);
+    }
+
+    /// Check if foundation transfer is attached
+    pub fn has_foundation_transfer(&self) -> bool {
+        self.foundation_transfer.is_some()
+    }
+
+    /// Update price history for foundation model encoding
+    fn update_price_history(&mut self, close: f64) {
+        if self.price_history.len() >= self.max_price_history {
+            self.price_history.remove(0);
+        }
+        self.price_history.push(close);
+    }
+
+    /// Get foundation model embedding for current price history
+    pub fn get_foundation_embedding(&self) -> Option<Vec<f64>> {
+        if !self.has_foundation() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref foundation_lock) = self.foundation {
+            if let Ok(mut foundation) = foundation_lock.lock() {
+                return Some(foundation.encode(&self.price_history));
+            }
+        }
+        None
+    }
+
+    /// Get foundation model forecast for current price history
+    pub fn get_foundation_forecast(&self, horizon: usize) -> Option<Vec<f64>> {
+        if !self.has_foundation() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref foundation_lock) = self.foundation {
+            if let Ok(mut foundation) = foundation_lock.lock() {
+                return Some(foundation.forecast(&self.price_history, horizon));
+            }
+        }
+        None
+    }
+
+    /// Get foundation model forecast distribution for uncertainty quantification
+    pub fn get_foundation_forecast_distribution(
+        &self,
+        horizon: usize,
+        num_samples: usize,
+    ) -> Option<ForecastDistribution> {
+        if !self.has_foundation() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref foundation_lock) = self.foundation {
+            if let Ok(mut foundation) = foundation_lock.lock() {
+                return Some(foundation.forecast_distribution(&self.price_history, horizon, num_samples));
+            }
+        }
+        None
+    }
+
+    /// Get foundation model regime prediction (zero-shot)
+    pub fn get_foundation_regime(&self) -> Option<(Regime, f64)> {
+        if !self.has_foundation() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref foundation_lock) = self.foundation {
+            if let Ok(mut foundation) = foundation_lock.lock() {
+                return Some(foundation.zero_shot_regime(&self.price_history));
+            }
+        }
+        None
+    }
+
+    /// Get foundation model direction prediction (zero-shot)
+    pub fn get_foundation_direction(&self) -> Option<(bool, f64)> {
+        if !self.has_foundation() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref foundation_lock) = self.foundation {
+            if let Ok(mut foundation) = foundation_lock.lock() {
+                return Some(foundation.zero_shot_direction(&self.price_history));
+            }
+        }
+        None
+    }
+
+    /// Get zero-shot transfer score from foundation model
+    pub fn get_foundation_transfer_score(&self, target_symbol: &str) -> Option<f64> {
+        if !self.has_foundation_transfer() || self.price_history.len() < 32 {
+            return None;
+        }
+
+        if let Some(ref transfer_lock) = self.foundation_transfer {
+            if let Ok(mut transfer) = transfer_lock.lock() {
+                // First ensure we have an embedding for our symbol
+                transfer.compute_symbol_embedding(&self.symbol, &self.price_history);
+                // Then get transfer score
+                return Some(transfer.zero_shot_transfer(&self.symbol, target_symbol));
+            }
+        }
+        None
+    }
+
+    /// Get foundation-based combined regime (blends HMM and foundation)
+    pub fn get_blended_regime(&self) -> (Regime, f64) {
+        let hmm_regime = self.regime_detector.current_regime();
+        let hmm_confidence = self.regime_detector.confidence();
+
+        // If no foundation or not enough data, return HMM only
+        if let Some((foundation_regime, foundation_confidence)) = self.get_foundation_regime() {
+            // Blend: 60% HMM + 40% foundation (HMM has more temporal context)
+            let blended_confidence = hmm_confidence * 0.6 + foundation_confidence * 0.4;
+
+            // Use regime with higher confidence
+            if foundation_confidence > hmm_confidence && foundation_confidence > 0.6 {
+                info!(
+                    "[FOUNDATION] {} Regime override: {} ({:.1}%) -> {} ({:.1}%)",
+                    self.symbol, hmm_regime, hmm_confidence * 100.0,
+                    foundation_regime, foundation_confidence * 100.0
+                );
+                (foundation_regime, blended_confidence)
+            } else {
+                (hmm_regime, blended_confidence)
+            }
+        } else {
+            (hmm_regime, hmm_confidence)
+        }
+    }
+
+    /// Get foundation-adjusted confidence for trading decisions
+    pub fn get_foundation_confidence_adjustment(&self, base_confidence: f64) -> f64 {
+        // Check direction prediction
+        if let Some((is_bullish, direction_confidence)) = self.get_foundation_direction() {
+            let sr_price_f = self.sr.get_support(self.last_price)
+                .unwrap_or(self.last_price)
+                .to_f64()
+                .unwrap_or(0.0);
+            let last_price_f = self.last_price.to_f64().unwrap_or(1.0);
+            let is_long = sr_price_f < last_price_f;
+
+            // If foundation agrees with our direction, boost confidence
+            let direction_agrees = (is_long && is_bullish) || (!is_long && !is_bullish);
+
+            if direction_agrees && direction_confidence > 0.6 {
+                // Boost confidence proportionally to foundation conviction
+                let boost = (direction_confidence - 0.5) * 0.2; // Max +10% boost
+                let adjusted = (base_confidence + boost).min(1.0);
+                info!(
+                    "[FOUNDATION] {} Direction agrees ({}): {:.1}% -> {:.1}%",
+                    self.symbol,
+                    if is_bullish { "bullish" } else { "bearish" },
+                    base_confidence * 100.0,
+                    adjusted * 100.0
+                );
+                return adjusted;
+            } else if !direction_agrees && direction_confidence > 0.7 {
+                // Reduce confidence if foundation strongly disagrees
+                let penalty = (direction_confidence - 0.5) * 0.15; // Max -7.5% penalty
+                let adjusted = (base_confidence - penalty).max(0.0);
+                info!(
+                    "[FOUNDATION] {} Direction disagrees ({}): {:.1}% -> {:.1}%",
+                    self.symbol,
+                    if is_bullish { "bullish" } else { "bearish" },
+                    base_confidence * 100.0,
+                    adjusted * 100.0
+                );
+                return adjusted;
+            }
+        }
+
+        base_confidence
     }
 }
 
